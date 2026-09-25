@@ -344,6 +344,6 @@ server.listen(PORT, '127.0.0.1', () => {
     } else {
         console.log('TURN relay: not configured — remote viewers use free Cloudflare STUN punch-through. Set CF_TURN_KEY_ID/CF_TURN_KEY_TOKEN to add a relay fallback.');
     }
-    console.log('Remote viewers: connect to the same Tailscale network and use the HTTPS URL shown by tailscale serve status, with /streaming/ appended.');
+    console.log('Public viewers: open https://stream.rydius.in after the Cloudflare Tunnel has been configured. Tailscale Serve is the private fallback.');
     console.log('Keep this window open while streaming.');
 });
