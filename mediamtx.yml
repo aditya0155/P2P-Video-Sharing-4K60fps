@@ -1,0 +1,85 @@
+###############################################
+# MediaMTX configuration for the Windows laptop host.
+# OBS publishes on loopback; WebRTC serves viewers over the Tailscale interface.
+###############################################
+
+# Logging
+logLevel: info
+logDestinations: [stdout]
+
+# Metrics API
+api: yes
+apiAddress: 127.0.0.1:8888
+
+# Outgoing packet queue per reader. The MediaMTX default is 512; 1024 is the
+# value recommended in the official "decrease packet loss" guide, while still
+# keeping worst-case queueing delay on a congested viewer link about half of a
+# 2048-packet queue (queue depth translates directly into added live latency).
+writeQueueSize: 1024
+
+# Enlarge per-socket UDP receive buffers so publisher bursts and viewer RTCP
+# feedback (NACK / transport-cc) are not dropped by the OS when the WebRTC or
+# SRT sockets get a burst of packets. MediaMTX recommends raising this to
+# decrease packet loss; 0 would keep the small OS default.
+udpReadBufferSize: 1048576
+
+# High-bitrate timeouts
+readTimeout: 10s
+writeTimeout: 10s
+
+###############################################
+# Ingest Protocols (OBS Studio)
+###############################################
+
+rtsp: no
+hls: no
+moq: no
+
+# RTMP Ingest from local OBS Studio: rtmp://127.0.0.1/live
+rtmp: yes
+rtmpAddress: 127.0.0.1:1935
+
+# Optional SRT ingest from OBS on this laptop only.
+srt: yes
+srtAddress: 127.0.0.1:8890
+
+###############################################
+# Egress Protocols (WebRTC WHEP to Viewers)
+###############################################
+
+# WebRTC signaling HTTP server (reverse proxied by server.js to port 3000)
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+
+# WebRTC media UDP port (RTP packets)
+webrtcLocalUDPAddress: 0.0.0.0:8189
+webrtcLocalTCPAddress: 0.0.0.0:8189
+
+# Automatically query local network adapters (LAN, Wi-Fi, Tailscale VPN)
+webrtcIPsFromInterfaces: yes
+
+# WHIP ingest is available on /live/whip while WebRTC is enabled.
+webrtcHandshakeTimeout: 10s
+
+# ICE servers: Cloudflare's public STUN only (no account, no credentials, no
+# card). It gives MediaMTX a server-reflexive (public) candidate so remote
+# viewers can hole-punch a direct path instead of needing a TURN relay. A real
+# binding request to stun.cloudflare.com:3478 was verified answered from this
+# hotspot with a public mapped address. Google STUN was historically
+# unreachable from this network and stays out. TURN relay remains optional and
+# is served to VIEWERS by server.js (/stream-api/turn) when CF_TURN_KEY_* is
+# configured — nothing to change here for that.
+webrtcICEServers2:
+  - url: stun:stun.cloudflare.com:3478
+
+###############################################
+# Stream Paths
+###############################################
+paths:
+  live:
+    # Instant publisher reconnect when OBS starts/stops
+    overridePublisher: yes
+    publishUser:
+    publishPass:
+    readUser:
+    readPass:

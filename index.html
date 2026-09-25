@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#080812">
+<title>Rydius Stream — Low-Latency WebRTC Live Stream</title>
+    <meta name="description" content="Watch a live screen share with real-time WebRTC playback and stream diagnostics.">
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <!-- Custom CSS -->
+<link rel="stylesheet" href="/streaming/style.css?v=2.8.0">
+</head>
+<body>
+    <!-- Ambient Background -->
+    <div class="ambient-bg" id="ambient-bg">
+        <div class="ambient-orb ambient-orb-1"></div>
+        <div class="ambient-orb ambient-orb-2"></div>
+        <div class="ambient-orb ambient-orb-3"></div>
+    </div>
+    <div class="noise-overlay" id="noise-overlay"></div>
+
+    <div class="app-container" id="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-left">
+                <div class="stream-title-group">
+                    <h1 class="stream-title">Rydius Stream</h1>
+                    <span class="stream-codec" id="stream-summary">Waiting for stream</span>
+                </div>
+            </div>
+
+            <div class="header-right">
+                <!-- GPU Performance Mode Toggle -->
+                <button class="perf-toggle-btn" id="perf-toggle-btn" title="Reduce decorative visual effects" aria-pressed="false">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i>
+                    <span id="perf-toggle-label">Reduce effects</span>
+                </button>
+
+                <!-- Status Badge -->
+                <div class="status-badge offline" id="status-badge" role="status" aria-live="polite">
+                    <span class="status-dot"></span>
+                    <span class="status-text" id="status-text">OFFLINE</span>
+                </div>
+
+                <!-- Viewer count is not exposed by the current stream service. -->
+                <div class="viewer-count" title="Viewer count is unavailable">
+                    <i class="fa-solid fa-eye"></i>
+                    <span id="viewer-num" aria-label="Viewer count unavailable">—</span>
+                    <span class="viewer-label">viewers</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Left Panel: Player and Details -->
+            <section class="player-section">
+                <!-- Video Container -->
+                <div class="video-container" id="video-container">
+                    <video id="stream-player" autoplay playsinline muted aria-label="Live screen share"></video>
+
+                    <!-- Gesture Action Indicator (Ripple Flash) -->
+                    <div class="action-feedback" id="action-feedback" aria-hidden="true">
+                        <i class="fa-solid fa-play"></i>
+                    </div>
+
+                    <!-- Volume Toast HUD -->
+                    <div class="volume-toast" id="volume-toast" role="status" aria-live="polite">
+                        <i class="fa-solid fa-volume-high"></i>
+                        <span id="volume-toast-text">100%</span>
+                    </div>
+
+                    <!-- Floating Unmute Overlay -->
+                    <div class="unmute-overlay" id="unmute-overlay">
+                        <button class="unmute-btn" id="unmute-overlay-btn">
+                            <i class="fa-solid fa-volume-xmark"></i>
+                            <span>Click to Unmute</span>
+                        </button>
+                    </div>
+
+                    <!-- Loader State -->
+                    <div class="player-loader" id="player-loader" role="status" aria-live="polite" aria-hidden="true">
+                        <div class="spinner-container">
+                            <div class="spinner-ring spinner-ring-outer"></div>
+                            <div class="spinner-ring spinner-ring-inner"></div>
+                            <div class="spinner-icon"><i class="fa-solid fa-signal"></i></div>
+                        </div>
+                        <span class="loader-message">Connecting to Stream<span class="loading-dots"></span></span>
+                    </div>
+
+                    <!-- Offline State Overlay -->
+                    <div class="player-offline-overlay" id="offline-overlay" role="status" aria-live="polite" aria-hidden="false">
+                        <div class="offline-bg-effects">
+                            <div class="radar-ring radar-ring-1"></div>
+                            <div class="radar-ring radar-ring-2"></div>
+                            <div class="radar-ring radar-ring-3"></div>
+                        </div>
+                        <div class="offline-content">
+                            <i class="fa-solid fa-tower-broadcast signal-icon"></i>
+                            <h2>Stream is Offline</h2>
+                            <p>Waiting for host to start broadcasting from OBS Studio...</p>
+                            <div class="offline-pulse-bar">
+                                <span></span><span></span><span></span><span></span><span></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Telemetry HUD Overlay -->
+                    <div class="telemetry-hud" id="telemetry-hud" role="region" aria-label="Stream telemetry" aria-hidden="true">
+                        <div class="hud-header">
+                            <span><i class="fa-solid fa-gauge-high"></i> Stream Telemetry</span>
+                            <button class="hud-close" id="hud-close-btn">&times;</button>
+                        </div>
+
+                        <!-- Real-time Bitrate Sparkline Canvas -->
+                        <div class="hud-chart-container">
+                            <div class="hud-chart-label">Bitrate Throughput (60s)</div>
+                            <canvas id="hud-bitrate-canvas" width="268" height="42"></canvas>
+                        </div>
+
+                        <!-- Audio Level Visualizer -->
+                        <div class="hud-audio-container">
+                            <div class="hud-chart-label">Audio Playout Level</div>
+                            <div class="hud-audio-bar">
+                                <div class="hud-audio-level" id="hud-audio-level" style="width: 0%"></div>
+                            </div>
+                        </div>
+
+                        <div class="hud-grid">
+                            <div class="hud-item">
+                                <span class="hud-label">Network RTT</span>
+                                <span class="hud-value" id="hud-latency">-- ms</span>
+                            </div>
+                            <div class="hud-item">
+                                <span class="hud-label">ICE State</span>
+                                <span class="hud-value" id="hud-ice">checking</span>
+                            </div>
+                            <div class="hud-item">
+                                <span class="hud-label">Packets Lost</span>
+                                <span class="hud-value" id="hud-packets-lost">0</span>
+                            </div>
+                            <div class="hud-item">
+                                <span class="hud-label">Decoder</span>
+                                <span class="hud-value" id="hud-codec">--</span>
+                            </div>
+                            <div class="hud-item">
+                                <span class="hud-label">Resolution</span>
+                                <span class="hud-value" id="hud-resolution">--</span>
+                            </div>
+                            <div class="hud-item">
+                                <span class="hud-label">Decoded/Dropped</span>
+                                <span class="hud-value" id="hud-frames">--</span>
+                            </div>
+                            <div class="hud-item">
+                                <span class="hud-label">Network Jitter</span>
+                                <span class="hud-value" id="hud-jitter">-- ms</span>
+                            </div>
+                            <div class="hud-item">
+                                <span class="hud-label">Buffer Target</span>
+                                <span class="hud-value" id="hud-buffer">180 ms</span>
+                            </div>
+                            <div class="hud-item hud-item-wide">
+                                <span class="hud-label">Video State</span>
+                                <span class="hud-value" id="hud-video-state">--</span>
+                            </div>
+                        </div>
+
+                        <!-- Diagnostic JSON Export -->
+                        <button class="hud-copy-btn" id="hud-copy-report-btn">
+                            <i class="fa-solid fa-clipboard-check"></i> Copy Diagnostic Report
+                        </button>
+                    </div>
+
+                    <!-- Custom Player Controls (Visible on Hover & Active) -->
+                    <div class="player-controls" id="player-controls">
+                        <div class="controls-row">
+                            <div class="controls-left">
+                                <button class="control-btn" id="play-pause-btn" title="Play/Pause" aria-label="Play or pause">
+                                    <i class="fa-solid fa-pause"></i>
+                                </button>
+                                <div class="volume-control">
+                                    <button class="control-btn" id="mute-btn" title="Mute/Unmute" aria-label="Mute or unmute" aria-pressed="true">
+                                        <i class="fa-solid fa-volume-high"></i>
+                                    </button>
+                                    <input type="range" class="volume-slider" id="volume-slider" min="0" max="1" step="0.05" value="1" title="Volume" aria-label="Volume">
+                                    <span class="volume-badge" id="volume-value-badge">100%</span>
+                                </div>
+                                <span class="live-label" id="live-label" hidden><span class="live-dot"></span>LIVE</span>
+                            </div>
+                            <div class="controls-right">
+                                <!-- Adaptive Latency Mode Switcher -->
+                                <button class="control-btn" id="latency-mode-btn" title="Latency buffer: Anti-Stutter (350 ms)" aria-label="Change latency buffer">
+                                    <i class="fa-solid fa-shield-halved"></i>
+                                </button>
+
+                                <!-- Picture in Picture -->
+                                <button class="control-btn" id="pip-btn" title="Picture in picture (P)" aria-label="Picture in picture">
+                                    <i class="fa-solid fa-clone"></i>
+                                </button>
+
+                                <!-- Theatre Mode Toggle -->
+                                <button class="control-btn" id="theatre-btn" title="Theatre mode (T)" aria-label="Theatre mode" aria-pressed="false">
+                                    <i class="fa-solid fa-tv"></i>
+                                </button>
+
+                                <!-- Stream Stats -->
+                                <button class="control-btn" id="stats-btn" title="Toggle Stream Stats" aria-label="Toggle stream stats" aria-pressed="false">
+                                    <i class="fa-solid fa-chart-line"></i>
+                                </button>
+
+                                <!-- Fullscreen -->
+                                <button class="control-btn" id="fullscreen-btn" title="Fullscreen" aria-label="Fullscreen">
+                                    <i class="fa-solid fa-expand"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Reaction Emitter Bar -->
+                <div class="reaction-section">
+                    <div class="reactions-title"><i class="fa-solid fa-face-laugh-beam"></i><span>Quick reactions</span><small>Local to this screen</small></div>
+                    <div class="emoji-bar">
+                        <button class="emoji-btn" data-emoji="heart" title="Send a heart reaction" aria-label="Send a heart reaction"><span class="emoji-icon">❤️</span><span class="emoji-count" id="count-heart">0</span></button>
+                        <button class="emoji-btn" data-emoji="fire" title="Send a fire reaction" aria-label="Send a fire reaction"><span class="emoji-icon">🔥</span><span class="emoji-count" id="count-fire">0</span></button>
+                        <button class="emoji-btn" data-emoji="clap" title="Send a clap reaction" aria-label="Send a clap reaction"><span class="emoji-icon">👏</span><span class="emoji-count" id="count-clap">0</span></button>
+                        <button class="emoji-btn" data-emoji="laugh" title="Send a laugh reaction" aria-label="Send a laugh reaction"><span class="emoji-icon">😂</span><span class="emoji-count" id="count-laugh">0</span></button>
+                        <button class="emoji-btn" data-emoji="thumbs" title="Send a thumbs-up reaction" aria-label="Send a thumbs-up reaction"><span class="emoji-icon">👍</span><span class="emoji-count" id="count-thumbs">0</span></button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Panel: Chat and Stream Info -->
+            <section class="sidebar-section">
+                <div class="sidebar-tabs" role="tablist" aria-label="Stream panels">
+                    <button class="tab-btn active" id="tab-chat" role="tab" aria-selected="true" aria-controls="content-chat"><i class="fa-solid fa-list"></i> Activity</button>
+                    <button class="tab-btn" id="tab-info" role="tab" aria-selected="false" aria-controls="content-info" tabindex="-1"><i class="fa-solid fa-circle-info"></i> Stream info</button>
+                    <div class="tab-indicator"></div>
+                </div>
+
+                <!-- Chat Container -->
+                <div class="tab-content chat-content active" id="content-chat" role="tabpanel" aria-labelledby="tab-chat" aria-hidden="false">
+                    <div class="chat-header-bar">
+                        <span class="chat-header-title"><i class="fa-solid fa-wave-square"></i> Session activity</span>
+                        <button class="chat-sound-btn" id="sound-toggle-btn" title="Toggle interface sounds" aria-label="Toggle interface sounds" aria-pressed="true">
+                            <i class="fa-solid fa-volume-high"></i>
+                        </button>
+                    </div>
+                    <div class="chat-messages" id="chat-messages" role="log" aria-live="polite" aria-relevant="additions">
+                        <div class="activity-empty"><i class="fa-solid fa-comment-slash"></i><p>Shared chat isn’t connected yet.</p><span>Use this space for notes visible only in this browser.</span></div>
+                    </div>
+                    <form class="chat-input-area" id="chat-form">
+                        <input type="text" class="chat-input" id="chat-input" placeholder="Add a private note…" aria-label="Add a note visible only in this browser" autocomplete="off" maxlength="150">
+                        <button type="submit" class="chat-send-btn" title="Add note" aria-label="Add note">
+                            <i class="fa-solid fa-paper-plane"></i>
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Info Container -->
+                <div class="tab-content info-content" id="content-info" role="tabpanel" aria-labelledby="tab-info" aria-hidden="true">
+                    <div class="info-details">
+                        <div class="info-group">
+                            <div class="info-group-header">
+                                <i class="fa-solid fa-link"></i>
+                                <h3>Connection Details</h3>
+                            </div>
+                            <div class="info-cards">
+                                <div class="info-card">
+                                    <span class="info-card-label">URL</span>
+                                    <span class="info-card-value copyable-text" id="stream-url">Loading page URL…</span>
+                                </div>
+                                <div class="info-card">
+                                    <span class="info-card-label">Quality</span>
+                                    <span class="info-card-value" id="stream-quality">Set by the broadcaster</span>
+                                </div>
+                                <div class="info-card">
+                                    <span class="info-card-label">Network RTT</span>
+                                    <span class="info-card-value" id="stream-rtt">Waiting for connection</span>
+                                </div>
+                                <div class="info-card">
+                                    <span class="info-card-label">Engine</span>
+                                    <span class="info-card-value">WebRTC via WHEP</span>
+                                </div>
+                            </div>
+                            <p class="info-description">Remote viewers open <strong>https://stream.rydius.in</strong> — no install or account needed (Cloudflare Tunnel). The Tailscale URL still works as a fallback. Keep this laptop awake and connected while streaming.</p>
+                        </div>
+
+                        <!-- Keyboard Shortcuts Reference -->
+                        <div class="info-group">
+                            <div class="info-group-header">
+                                <i class="fa-solid fa-keyboard"></i>
+                                <h3>Pro Shortcuts</h3>
+                            </div>
+                            <div class="shortcuts-grid">
+                                <div class="shortcut-item"><kbd>Space</kbd><span>Play / Pause</span></div>
+                                <div class="shortcut-item"><kbd>M</kbd><span>Mute / Unmute</span></div>
+                                <div class="shortcut-item"><kbd>F</kbd><span>Fullscreen</span></div>
+                                <div class="shortcut-item"><kbd>T</kbd><span>Theatre Mode</span></div>
+                                <div class="shortcut-item"><kbd>P</kbd><span>Picture-in-Pic</span></div>
+                                <div class="shortcut-item"><kbd>S</kbd><span>Telemetry HUD</span></div>
+                                <div class="shortcut-item"><kbd>↑ / ↓</kbd><span>Volume (Up/Down)</span></div>
+                                <div class="shortcut-item"><kbd>C</kbd><span>Focus activity note</span></div>
+                            </div>
+                        </div>
+
+                        <div class="info-group">
+                            <div class="info-group-header">
+                                <i class="fa-solid fa-sliders"></i>
+                                <h3>OBS Studio Settings</h3>
+                            </div>
+                            <p class="info-description">Select ingest protocol for OBS Studio setup:</p>
+                            <div class="ingest-selector">
+                                <button class="ingest-tab active" id="ingest-tab-whip">RTMP (this laptop)</button>
+                                <button class="ingest-tab" id="ingest-tab-srt">SRT / WHIP options</button>
+                            </div>
+
+                            <!-- OBS runs on the same laptop as MediaMTX. -->
+                            <ul class="obs-instructions active" id="instructions-whip">
+                                <li><span class="obs-key">Service</span><span class="obs-val">Custom...</span></li>
+                                <li><span class="obs-key">Server</span><code class="code-box copyable-text" id="whip-server-url">rtmp://127.0.0.1:1935/live</code></li>
+                                <li><span class="obs-key">Stream Key</span><span class="obs-val">Leave empty</span></li>
+                                <li><span class="obs-key">Audio</span><span class="obs-val obs-val-important">RTMP audio is AAC, which MediaMTX cannot convert for WebRTC — viewers hear nothing. Use the WHIP option in the next tab when you need sound.</span></li>
+                                <li><span class="obs-key">Encoder</span><span class="obs-val obs-val-important">Start with H.264; test other codecs on each browser</span></li>
+                                <li><span class="obs-key">Rate Control</span><span class="obs-val">CBR</span></li>
+                                <li><span class="obs-key">Bitrate</span><span class="obs-val">Keep about 25% of stable hotspot upload free</span></li>
+                                <li><span class="obs-key">Keyframe Interval</span><span class="obs-val obs-val-important">2 seconds</span></li>
+                                <li><span class="obs-key">Max B-frames</span><span class="obs-val">Try 0 if viewers see decoder issues</span></li>
+                                <li><span class="obs-key">Look-ahead</span><span class="obs-val">Disable to prioritize low latency</span></li>
+                            </ul>
+
+                            <!-- Optional alternate ingest protocols, also local to this laptop. -->
+                            <ul class="obs-instructions" id="instructions-srt">
+                                <li><span class="obs-key">SRT Ingest</span><code class="code-box copyable-text" id="srt-server-url">srt://127.0.0.1:8890?streamid=publish:live</code></li>
+                                <li><span class="obs-key">WHIP Ingest</span><code class="code-box copyable-text">http://127.0.0.1:8889/live/whip</code></li>
+                                <li><span class="obs-key">Audio (recommended)</span><span class="obs-val obs-val-important">WHIP is the only OBS path that delivers sound: it publishes Opus, while RTMP/SRT carry AAC which WebRTC players cannot receive. In OBS choose Service: WHIP, set Server to the URL above, and leave Bearer Token empty.</span></li>
+                                <li><span class="obs-key">Encoder Info</span><span class="obs-val">Use CBR and a 2-second keyframe interval; test playback before a long session.</span></li>
+                            </ul>
+                        </div>
+
+                        <div class="info-group">
+                            <div class="info-group-header">
+                                <i class="fa-solid fa-bolt"></i>
+                                <h3>About WebRTC & WHEP</h3>
+                            </div>
+                            <p class="info-description">Playback uses WebRTC through WHEP. The header reports the resolution, frame rate, and bitrate measured from the active stream; values depend on the broadcast and your connection.</p>
+                        </div>
+
+                        <div class="info-group">
+                            <div class="info-group-header">
+                                <i class="fa-solid fa-wand-magic-sparkles"></i>
+                                <h3>Smooth Playback Tips</h3>
+                            </div>
+                            <p class="info-description">For steadier playback:</p>
+                            <ul class="obs-instructions active">
+                                <li><span class="obs-key">Hardware GPU Decode</span><span class="obs-val">Ensure Hardware Acceleration is turned ON in your browser settings.</span></li>
+                                <li><span class="obs-key">Decoder compatibility</span><span class="obs-val">If playback fails, try H.264 and set B-frames to 0.</span></li>
+                                <li><span class="obs-key">Frame pacing</span><span class="obs-val">Match the capture and display frame rates where practical.</span></li>
+                                <li><span class="obs-key">OBS Pacing Lock</span><span class="obs-val">Check <b>"Limit capture framerate"</b> in Game Capture source settings.</span></li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Custom JavaScript -->
+<script src="/streaming/app.js?v=2.8.0"></script>
+</body>
+</html>

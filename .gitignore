@@ -1,0 +1,30 @@
+# Local credentials and generated configuration
+.env
+.env.*
+!.env.example
+secrets.local.env
+cloudflared_config.yml
+*.key
+*.pem
+*.p12
+*.crt
+
+# Runtime downloads and generated artifacts
+/cloudflared_win/
+/mediamtx_win/*
+!/mediamtx_win/LICENSE
+!/mediamtx_win/mediamtx.exe
+*.zip
+*.log
+*.err
+test_out.txt
+_*.txt
+__pycache__/
+*.py[cod]
+node_modules/
+coverage/
+
+# Legacy deployment material and OS files
+/legacy_vps/
+.DS_Store
+Thumbs.db
