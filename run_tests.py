@@ -1,5 +1,7 @@
 """Local checks for the Windows laptop streaming host (no remote services)."""
 
+import gzip
+import io
 import json
 import os
 import re
@@ -16,6 +18,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from threading import Thread
 from urllib.error import HTTPError, URLError
+from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 
@@ -615,6 +618,31 @@ class StreamApiProxyChecks(_SiteUnderTest):
     def setUp(self):
         super().setUp()
         self.start_site(signaling_routes=self.SIGNALING_ROUTES, api_routes=self.API_ROUTES)
+
+    def test_static_assets_serve_gzip_when_requested(self):
+        # The page assets ride gzip when the browser allows it: app.js is
+        # ~170 KB raw and ~40 KB gzipped, which cuts the first page load on
+        # the LAN/Tailscale paths roughly 4x (the Cloudflare tunnel already
+        # compresses). Without Accept-Encoding the identity bytes (and the
+        # exact Content-Length) must be served as before.
+        status, headers, body = http_request(
+            self.port, "GET", "/streaming/app.js",
+            headers={"Accept-Encoding": "gzip"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Encoding"), "gzip")
+        self.assertEqual(headers.get("Vary"), "Accept-Encoding")
+        self.assertNotIn("Content-Length", headers,
+                         "a preset Content-Length on gzipped output would truncate the body")
+        with gzip.GzipFile(fileobj=io.BytesIO(body)) as decoded:
+            self.assertEqual(decoded.read(), APP_PATH.read_bytes(),
+                             "the gzipped body must decompress to the exact asset bytes")
+
+        status, headers, body = http_request(self.port, "GET", "/streaming/app.js")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Content-Encoding", headers,
+                         "no Accept-Encoding must mean no content coding")
+        self.assertEqual(headers.get("Content-Length"), str(APP_PATH.stat().st_size))
 
     def test_whep_post_is_forwarded_and_session_location_is_rewritten(self):
         sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\n"
@@ -1291,6 +1319,27 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertIn("renditionHasVideo", bridge, "rendition video watchdog missing")
         self.assertIn("RENDITION_START_TIMEOUT_MS", bridge, "watchdog timeout missing")
         self.assertIn("restarting the transcoder", bridge, "watchdog restart log missing")
+        # ... and a transcoder that STOPS producing output after video
+        # already flowed (hung NVENC session, dead RTSP leg that never
+        # errors) must be detected and restarted too — MediaMTX keeps the
+        # path online either way, so the rendition viewers would freeze
+        # indefinitely. The liveness signal is the control API's per-path
+        # byte counter, NOT ffmpeg's stderr: ffmpeg prints its "frame="
+        # stats line at AV_LOG_INFO and the bridge runs at -loglevel
+        # warning, so a stderr-gated watchdog can never fire at all
+        # (verified: 0 matching lines at warning, present at info). Bytes
+        # landing on the published path is also the stronger evidence.
+        self.assertIn("RENDITION_STALL_TIMEOUT_MS", bridge, "mid-broadcast stall timeout missing")
+        self.assertIn("renditionBytesIngested", bridge, "stall detection must read the path ingest counter")
+        self.assertIn("bytesReceived", bridge,
+                      "the counter MUST be bytesReceived: MediaMTX bytesSent is EGRESS to readers and "
+                      "reads a flat 0 whenever nobody is watching, which rebuilt a healthy transcoder "
+                      "every 38.2s for the whole broadcast")
+        self.assertNotIn("targetPath.bytesSent", bridge, "the egress counter must never gate liveness")
+        self.assertIn("stalledSamples", bridge, "a single slow API read must not kill a healthy bridge")
+        self.assertNotIn("_progressSeen", bridge,
+                         "stderr progress gating is dead code at -loglevel warning")
+        self.assertIn("stopped publishing bytes for", bridge, "stall restart log missing")
         # The bundled ffmpeg 8.1 carries the AV1 RTP fragmented-keyframe fix
         # (d12791ef) that lets OBS WHIP AV1 sources bridge; the bridge must
         # prefer it automatically while keeping the env/PATH overrides.
@@ -1311,12 +1360,63 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertIn("mediaCapabilities", app, "Media Capabilities probe missing")
         self.assertIn("decodingInfo", app, "decodingInfo call missing")
         self.assertIn("async function probeAv1DecodeSmooth()", app)
-        self.assertIn("function chooseStreamPath(items, av1Capable, av1Smooth = true, preference = 'auto')",
+        self.assertIn("function chooseStreamPath(items, av1Capable, av1Smooth = true, preference = 'auto', h265Capable = true)",
                       app, "path selection must take the decode-quality and ABR arguments")
         # A legacy browser on an AV1-only broadcast must be told WHY nothing
         # plays instead of waiting on "connecting" forever.
         self.assertIn("renditionWaitPolls", app, "rendition wait counter missing")
         self.assertIn("broadcast H.264 via WHIP", app, "AV1-only viewer notice missing")
+
+    def test_abr_never_downgrades_to_an_undecodable_rendition(self):
+        # The ABR downgrade target is the AV1 rendition: a browser without
+        # AV1 support (or with software-only decode) must keep its decodable
+        # full-bitrate path — an undecodable session is strictly worse than
+        # the stutter it is escaping. The upgrade path consults the same
+        # capabilities, and H265 sources route non-H265 browsers to the AV1
+        # rendition instead of a black native session.
+        run_js_check(self, "abr-switching-state-machine")
+        run_js_check(self, "choose-stream-path-matrix")
+        app = read_text(APP_PATH)
+        self.assertIn("browserSupportsAv1() && av1DecodeSmooth !== false", app,
+                      "the ABR downgrade must require real AV1 decode capability")
+        self.assertIn("function browserSupportsH265(", app,
+                      "H265 receive-capability probe missing")
+        self.assertIn("sourceIsH265 && h265Capable === false", app,
+                      "H265 sources must be gated on browser decode support")
+
+    def test_connected_black_limbo_recovers(self):
+        # A session where the handshake succeeds but no frame ever decodes
+        # (publisher vanished mid-handshake, undecodable codec) hangs black
+        # forever: the freeze watchdog needs bytes flowing AND a decoded
+        # frame to fire. The stats loop must detect the limbo and rejoin,
+        # capped so a genuinely broken broadcast cannot loop forever.
+        app = read_text(APP_PATH)
+        self.assertIn("noMediaRejoinCount", app, "limbo rejoin counter missing")
+        self.assertIn("decoded === 0 && performance.now() - connectionStartTime > 10000", app,
+                      "limbo detection (no frame 10s after connect) missing")
+        self.assertIn("No video arrived on this session", app,
+                      "limbo rejoin viewer message missing")
+
+    def test_freeze_recovery_stages_cannot_wedge_on_a_dead_session(self):
+        # player.play() stays pending forever on a session with no media;
+        # awaiting it unconditionally in the recovery stages wedges recovery
+        # with isRecovering stuck true, disabling the watchdog. Stage 2 must
+        # also prove it restored playback instead of skipping stage 3.
+        app = read_text(APP_PATH)
+        self.assertIn("Promise.race([", app,
+                      "recovery stages must be time-bounded against pending play() promises")
+        self.assertIn("Stage 2 flush did not restore playback", app,
+                      "stage 2 must escalate to the full session renewal when the flush fails")
+
+    def test_ice_candidate_errors_are_surfaced(self):
+        # A network that blocks STUN/TURN loops connecting->offline with no
+        # explanation; onicecandidateerror is the only place the cause is
+        # visible. It must be wired, deduped, and reported in diagnostics.
+        app = read_text(APP_PATH)
+        self.assertIn("onicecandidateerror", app, "ICE candidate error handler missing")
+        self.assertIn("iceErrorNoticed", app, "candidate-error dedupe missing")
+        self.assertIn("iceCandidateError: iceErrorNoticed", app,
+                      "the diagnostic export must report candidate errors")
 
     def test_decode_lag_state_machine(self):
         run_js_check(self, "decode-lag-state-machine")
@@ -1624,7 +1724,171 @@ class StreamingHardeningChecks(unittest.TestCase):
 
     def test_ice_prefetch_and_candidate_pool(self):
         self.assertIn("prefetchIceServers();", self.app, "startup ICE prefetch missing")
-        self.assertIn("iceCandidatePoolSize: 2", self.app, "candidate pool missing")
+        # iceCandidatePoolSize was asserted here for years and removed by an
+        # audit round, correctly: the pool belongs to the RTCPeerConnection
+        # being created and is discarded with it, so it can never accelerate the
+        # NEXT connection — and Chrome dropped candidate-pool support in M80
+        # anyway. The comment claiming it "lets the srflx gather of the next
+        # connection start early" was simply false. This is the real speedup.
+        self.assertNotIn("iceCandidatePoolSize", self.app,
+                         "the candidate pool is discarded with its own peer connection and "
+                         "cannot help the next one; the ICE prefetch is the actual optimisation")
+
+    def test_switch_cooldown_survives_the_switch_reconnect(self):
+        # switchRendition()/maybeRejoinOnReturn() stamp the ABR cooldown anchor
+        # and then reconnect through handleConnected -> startTelemetry. If a
+        # fresh session wiped that anchor, the 60s cooldown would reopen on the
+        # very next stats tick and a link under sustained stress could switch
+        # renditions every ~8s — the reconnect storm the cooldown prevents.
+        # Runs the REAL startTelemetry() out of app.js in a VM: a genuinely
+        # fresh session still starts uncooled, because the anchor is declared
+        # as -60000 and any anchor from an earlier session is already older
+        # than the cooldown window.
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise startTelemetry")
+        script = (
+            "const {compileFunction,quietConsole}=require('./js_checks.js');"
+            "const NOW=100000;"
+            "const sb={performance:{now:()=>NOW},beginStatsLoop(){},hudRoute:{innerText:'x'},"
+            "console:quietConsole(),lastRenditionSwitchAt:NOW};"
+            "const {fn,sandbox}=compileFunction('startTelemetry',sb);"
+            "fn();"
+            "if(sandbox.lastRenditionSwitchAt!==NOW){"
+            "throw new Error('startTelemetry reset the ABR cooldown anchor to '+sandbox.lastRenditionSwitchAt);}"
+            "if(!(NOW-sandbox.lastRenditionSwitchAt<=60000)){"
+            "throw new Error('switch cooldown is open again right after a switch');}"
+        )
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT), capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_bridge_watchdog_never_kills_through_the_reassigned_child(self):
+        # `child` is a main()-scope binding the retry loop reassigns, and the
+        # startup phase of the watchdog awaits the control API (up to 3s) before
+        # killing. A tick already inside that await resumes after clearInterval()
+        # and would kill the NEXT iteration's freshly spawned ffmpeg — counted by
+        # the loop as a fast failure (a bogus 24h NVDEC block) and, ten times
+        # over, a terminal exit with runOnAvailableRestart: false.
+        #
+        # This runs the REAL watchdog callback out of codec_bridge.js and lets the
+        # retry loop advance `child` while the tick is parked on the await, so the
+        # test fails for any variant that re-reads `child` after the await (the
+        # original bug) as well as for one that kills nothing at all.
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise the bridge watchdog")
+        script = """
+        const fs=require('fs'),vm=require('vm');
+        const src=fs.readFileSync('codec_bridge.js','utf8');
+        const start=src.indexOf('setInterval(async () => {');
+        const end=src.indexOf(', RENDITION_WATCHDOG_POLL_MS)',start);
+        if(start<0||end<0) throw new Error('watchdog callback not extractable');
+        const fnSrc=src.slice(src.indexOf('(',start)+1,end);
+        const mk=()=>({_progressSeen:true,_lastProgressAt:0,killed:0,kill(){this.killed++;}});
+        // A: the child this tick judged, already dead. B: the child the retry
+        // loop spawns while the tick waits on the control API.
+        async function tick({respawnDuringAwait}) {
+          const A=mk(),B=mk();
+          const sb={child:A,watchdogKilled:false,renditionEverReady:false,
+            startedAt:Date.now()-60000,RENDITION_START_TIMEOUT_MS:20000,
+            RENDITION_STALL_TIMEOUT_MS:15000,planTargetList:['live-av1'],
+            logError(){},Date,
+            renditionHasVideo: async()=>{ if(respawnDuringAwait) sb.child=B; return false; }};
+          const fn=vm.runInNewContext('('+fnSrc+')',vm.createContext(sb));
+          await fn();
+          return {A,B};
+        }
+        (async()=>{
+          const raced=await tick({respawnDuringAwait:true});
+          if(raced.A.killed!==1) throw new Error('watchdog did not kill the hung child it judged (A.killed='+raced.A.killed+')');
+          if(raced.B.killed!==0) throw new Error('watchdog killed the NEXT iteration\\'s ffmpeg after resuming from the await');
+          const solo=await tick({respawnDuringAwait:false});
+          if(solo.A.killed!==1) throw new Error('watchdog kills nothing when no respawn races it');
+          console.log('ok');
+        })();
+        """
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT), capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("ok", result.stdout)
+
+    def test_switch_cooldown_is_only_stamped_never_reset(self):
+        # Closes the relocation bypass: the cooldown anchor must be assigned at
+        # its declaration and by the two functions that deliberately switch
+        # (switchRendition, maybeRejoinOnReturn) and nowhere else. A reset
+        # smuggled into startTelemetry() OR beginStatsLoop() — which
+        # startTelemetry() also calls, and which the tab-resume path calls
+        # directly — would reopen the 60s cooldown on the next stats tick.
+        self.assertEqual(self.app.count("lastRenditionSwitchAt = "), 3,
+                         "lastRenditionSwitchAt must be declared once and stamped by the two "
+                         "switch paths, never reset by a session-start routine")
+        for name in ("function startTelemetry(", "function beginStatsLoop("):
+            at = self.app.index(name)
+            self.assertNotEqual(at, -1, f"{name} not found in app.js")
+            body = self.app[at:self.app.index("\n    }", at)]
+            # Assignment form only: the routines may legitimately mention the
+            # anchor in a comment explaining why it is left alone.
+            self.assertNotIn("lastRenditionSwitchAt =", body,
+                             f"{name} must not reset the ABR switch-cooldown anchor")
+
+    def test_bridge_cleanup_kills_its_own_ffmpeg_but_never_a_recycled_pid(self):
+        # Two properties of the runOnUnavailable cleanup, checked together
+        # because they constrain each other.
+        #
+        # (1) The PID record is stamped once, when ffmpeg starts, and never
+        #     refreshed, so a "stale record" age gate silently disabled this
+        #     cleanup for every broadcast longer than the gate — while
+        #     clearPidFile() unlinked the record either way, leaving nothing to
+        #     retry with. The record must therefore be cleaned up at ANY age.
+        # (2) Dropping that gate is only safe because PID reuse is now decided by
+        #     PROCESS age: our ffmpeg is always older than createdAt (stamped just
+        #     after spawn), whereas a recycled PID is always newer. The target
+        #     substring alone is far too loose to carry that weight — it also
+        #     matches an ffplay or a debug command that merely mentions the path.
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise codec_bridge --cleanup")
+        if shutil.which("powershell") is None:
+            self.skipTest("cleanup kills through PowerShell; not available on this host")
+        script = """
+        const {spawn,spawnSync}=require('child_process');
+        const fs=require('fs'),os=require('os'),path=require('path');
+        const PID_FILE=path.join(os.tmpdir(),'rydius_reuse_probe_'+process.pid+'.pid');
+        const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+        const alive=(pid)=>{try{process.kill(pid,0);return true;}catch(e){return false;}};
+        // olderThanRecordMs>0: the decoy IS the ffmpeg the record describes.
+        // <0: the PID was recycled onto a process newer than createdAt.
+        async function run(olderThanRecordMs,exe,expectKilled){
+          const d=spawn(process.execPath,['-e','setTimeout(()=>{},120000)','live-av1'],{stdio:'ignore'});
+          await sleep(800);
+          if(!alive(d.pid)) throw new Error('decoy failed to start');
+          const rec={pid:d.pid,targets:['live-av1'],createdAt:Date.now()+olderThanRecordMs};
+          if(exe) rec.exe=exe;
+          fs.writeFileSync(PID_FILE,JSON.stringify(rec));
+          spawnSync(process.execPath,['codec_bridge.js','--cleanup'],
+            {timeout:30000,env:Object.assign({},process.env,{BRIDGE_PID_FILE:PID_FILE})});
+          await sleep(600);
+          const wasKilled=!alive(d.pid);
+          if(wasKilled){}else{try{process.kill(d.pid);}catch(e){}}
+          try{fs.unlinkSync(PID_FILE);}catch(e){}
+          await sleep(250);
+          if(wasKilled!==expectKilled){
+            throw new Error('olderThanRecord='+olderThanRecordMs+' exe='+exe
+              +' -> killed='+wasKilled+', expected '+expectKilled);
+          }
+        }
+        (async()=>{
+          await run(11*60*1000,'node.exe',true);   // long broadcast: must be killed
+          await run(1000,'node.exe',true);        // fresh: must be killed
+          await run(-30*60*1000,'node.exe',false); // recycled: must survive
+          await run(-30*60*1000,null,false);      // legacy record, no exe: must survive
+          await run(1000,'ffmpeg-nvenc.exe',false); // wrong executable: must survive
+          console.log('ok');
+        })();
+        """
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT), capture_output=True, text=True, timeout=180)
+        try:
+            os.unlink(os.path.join(tempfile.gettempdir(), f"rydius_reuse_probe_{os.getpid()}.pid"))
+        except OSError:
+            pass
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("ok", result.stdout)
 
 
 class ViewerCountRuntimeChecks(_SiteUnderTest):
@@ -1679,6 +1943,915 @@ class ViewerCountRuntimeChecks(_SiteUnderTest):
         leave_event = read_frame(res_a, b'"count":1')
         self.assertIn(b'"count":1', leave_event, "leave must broadcast the dropped count")
         conn_a.close()
+
+
+
+class EndToEndBridgeChecks(unittest.TestCase):
+    """Opt-in END-TO-END check on the real machine: boots the bundled
+    MediaMTX with free ports, lets the runOnAvailable hook launch
+    codec_bridge.js for real, publishes a synthetic H264+AAC broadcast with
+    the bundled ffmpeg, and verifies both renditions come up (live-av1 with
+    NVENC AV1 + Opus, live-h264 with the video-copy audio rescue) — plus
+    that the bridge re-fires across an OBS stop/start cycle.
+
+    Runs only when RYDIUS_E2E=1 (it takes ~60s and needs the GPU encoders);
+    the default suite stays fast and hermetic.
+    """
+
+    def test_bridge_end_to_end_on_real_mediamtx(self):
+        if os.environ.get("RYDIUS_E2E") != "1":
+            self.skipTest("opt-in: set RYDIUS_E2E=1 to run the ~60s real-MediaMTX bridge check")
+        script = ROOT / "e2e_bridge_check.py"
+        self.assertTrue(script.is_file(), "e2e_bridge_check.py missing")
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for the E2E check")
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            "E2E bridge check failed: " + result.stdout[-4000:] + " " + result.stderr[-2000:],
+        )
+
+
+class ViewerSmoothnessRegressionChecks(unittest.TestCase):
+    """Regression guards for the viewer-smoothness audit.
+
+    Each test pins a specific defect that was found by inspecting the real code
+    (and, where noted, reproduced by running the extracted logic). They exist so
+    the fixes cannot silently regress while someone tunes a constant.
+    """
+
+    def setUp(self):
+        self.app = read_text(APP_PATH)
+        self.css = read_text(ROOT / "style.css")
+        self.server = read_text(SERVER_PATH)
+        self.config = read_text(CONFIG_PATH)
+        self.bridge = read_text(BRIDGE_PATH)
+        self.launcher = read_text(LAUNCHER_PATH)
+
+    @staticmethod
+    def _strip_comments(text, kind):
+        """Comments explain these fixes by name, so a naive substring check
+        would flag the explanation as if it were the defect. Both block and
+        line comments are removed.
+
+        The opener must be preceded by whitespace or a line start, otherwise a
+        path literal such as '/stream-api/**' contains '/*' and a non-greedy
+        match would swallow real code until the next '*/'."""
+        opener = r"(?:^|(?<=\s))[ \t]*/\*"
+        if kind == "css":
+            return re.sub(opener + r".*?\*/", "", text, flags=re.DOTALL | re.MULTILINE)
+        without_block = re.sub(opener + r".*?\*/", "", text, flags=re.DOTALL | re.MULTILINE)
+        return re.sub(r"(?m)^[ \t]*//.*$", "", without_block)
+
+    @staticmethod
+    def _css_rule(css, selector):
+        """Return the declaration block of the rule whose selector is exactly
+        `selector` at the start of a line. Anchoring matters: several of these
+        selectors also appear inside a `body.perf-mode ...` selector list, and
+        matching that would assert against the wrong rule."""
+        match = re.search(r"(?m)^[ \t]*" + re.escape(selector) + r"\s*\{([^}]*)\}", css)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _js_function_body(source, name):
+        """Declarations of a `function name(...)` up to the next function at the
+        SAME indentation. Matching the sibling indentation (rather than a fixed
+        4 spaces) is what lets this work for both app.js, whose declarations sit
+        inside the DOMContentLoaded closure, and server.js, whose are top level.
+        A `\\n    }` anchor would also end too early, because these functions
+        contain nested declarations."""
+        start = re.search(r"(?m)^([ \t]*)function " + re.escape(name) + r"\(", source)
+        if not start:
+            return None
+        indent = start.group(1)
+        rest = source[start.end():]
+        nxt = re.search(r"(?m)^" + re.escape(indent) + r"function ", rest)
+        return rest[: nxt.start()] if nxt else rest
+
+    # -- transport ---------------------------------------------------------
+
+    def test_udp_payload_size_does_not_claim_a_fragmentation_fix(self):
+        """Regression guard for a RETRACTED claim.
+
+        An earlier version of this test (and of the mediamtx.yml comment) held
+        that MediaMTX's 1452-byte default was fragmenting every packet to remote
+        viewers because this host's Tailscale adapter reports an MTU of 1280.
+        That was measured A/B and is FALSE: with a real 1280x720 H264 publish
+        read by real headless Chrome through a real WHEP session, the mean
+        inbound video RTP packet size was 901.1-902.1 bytes at 200, at 1200 AND
+        at 1452 — the WebRTC path does not read this key at all, it packetizes
+        with its own ~1200-byte MTU, which fits a 1280-byte MTU with room to
+        spare. There was never fragmentation on the WebRTC path.
+
+        The value stays at 1200 because the key is real and honoured by
+        MediaMTX's other RTP consumers, but the config must not assert a
+        WebRTC fragmentation fix that was never happening."""
+        match = re.search(r"^\s*udpMaxPayloadSize\s*:\s*(\d+)", self.config, re.MULTILINE)
+        self.assertIsNotNone(match, "udpMaxPayloadSize must be set explicitly in mediamtx.yml")
+        payload = int(match.group(1))
+        self.assertLess(payload, 1452, "udpMaxPayloadSize must stay under the MediaMTX default")
+        # The comment block for this key must record the measurement and must not
+        # re-assert the refuted claim.
+        block = self.config[max(0, match.start() - 1600): match.start()]
+        self.assertIn("MEASURED", block, "the reasoning for this value must record that it was measured")
+        self.assertNotIn("EVERY RTP packet to a remote viewer was split",
+                         block,
+                         "the refuted IP-fragmentation claim must not be reinstated")
+
+    def test_write_queue_does_not_disconnect_a_congested_viewer(self):
+        """A reader queue is the only thing between a brief congestion event
+        and a hard disconnect. Keep the tuning, and keep the comment honest
+        about the packet size actually in use."""
+        self.assertIn("writeQueueSize: 2048", self.config)
+        # The comment claimed "2048 packets ~= 2.4s at 6 Mbps" while the packet
+        # size in the same file was 1452 (4.0s). The claim is only true at the
+        # size actually configured now.
+        self.assertIn("1200", self.config)
+
+    def test_bridge_can_restart_itself_when_media_returns(self):
+        self.assertIn("runOnAvailableRestart: true", self.config,
+                      "an exited bridge must be re-run, or its rendition is dead for the whole broadcast")
+
+    def test_bridge_failure_budget_is_consecutive_not_cumulative(self):
+        """Ten unrelated ffmpeg exits spread over a long broadcast must not
+        eventually trip the cap and kill the rendition permanently."""
+        self.assertIn("MAX_CONSECUTIVE_FFMPEG_FAILURES", self.bridge)
+        self.assertRegex(
+            self.bridge, r"if \(runSeconds >= 30\) \{\s*\n\s*failures = 0;",
+            "a long healthy run must clear the consecutive-failure counter")
+
+    def test_stall_watchdog_uses_published_bytes_not_ffmpeg_stderr(self):
+        """ffmpeg emits its 'frame=' stats line at AV_LOG_INFO and the bridge
+        runs at -loglevel warning, so a stderr-gated mid-broadcast watchdog can
+        never fire at all. The signal must be the control API's byte counter,
+        and a single slow read must not kill a healthy transcoder."""
+        self.assertIn("-loglevel', 'warning", self.bridge)
+        self.assertNotIn("_progressSeen", self.bridge,
+                         "dead stderr progress gating must not come back")
+        self.assertIn("renditionBytesIngested", self.bridge)
+        self.assertIn("bytesReceived", self.bridge)
+        self.assertIn("stalledSamples", self.bridge)
+        self.assertIn("n !== lastBytesSeen", self.bridge,
+                      "a counter DECREASE means a new publisher connected, not a stall; only an "
+                      "unchanged value is evidence of one")
+        self.assertNotIn("targetPath.bytesSent", self.bridge,
+                         "bytesSent is EGRESS to readers; using it inverts the watchdog")
+
+    def test_opus_rescue_corrects_timestamps(self):
+        self.assertIn("aresample=async=1", self.bridge,
+                      "a drifting audio clock makes the browser nudge playbackRate forever")
+
+    # -- compositing / render path ----------------------------------------
+
+    def test_nothing_animates_on_the_video_surface(self):
+        """The video container's box IS the video texture. Animating anything on
+        it repaints a video-sized layer every frame for the whole session, and
+        will-change: transform on the video's parent is the documented way to
+        pull it off the hardware-overlay path."""
+        css = self._strip_comments(self.css, "css")
+        body = self._css_rule(css, ".video-container")
+        self.assertIsNotNone(body, ".video-container rule not found")
+        self.assertNotIn("animation:", body,
+                         ".video-container must not animate anything (border-breathe "
+                         "was a full-video-sized repaint every frame)")
+        self.assertNotIn("will-change", body,
+                         "will-change on the video's parent costs the hardware overlay path")
+        self.assertNotIn("@keyframes border-breathe", css)
+        self.assertNotIn("@keyframes drift", css)
+
+    def test_ambient_backdrop_is_static_so_blurs_can_be_cached(self):
+        """Three surfaces carry a backdrop-filter over the ambient orbs. While
+        the orbs animated, every one of those re-ran a Gaussian blur on every
+        decoded frame. Frozen orbs let the compositor cache the result."""
+        body = self._css_rule(self._strip_comments(self.css, "css"), ".ambient-orb")
+        self.assertIsNotNone(body, ".ambient-orb rule not found")
+        self.assertIn("animation: none", body,
+                      "the orb backdrop must be static or the blurs above it recompute every frame")
+
+    def test_no_backdrop_filter_sits_over_live_video(self):
+        """Autoplay is only permitted muted, so the unmute overlay is on screen
+        for the whole session by default. A backdrop-filter directly over the
+        video forces a render surface and a per-frame sample of that texture."""
+        css = self._strip_comments(self.css, "css")
+        for selector in (".unmute-btn", ".action-feedback", ".volume-toast"):
+            body = self._css_rule(css, selector)
+            self.assertIsNotNone(body, "{} rule not found".format(selector))
+            self.assertNotIn("backdrop-filter: blur", body,
+                             "{} is drawn over live video and must not blur it".format(selector))
+
+    def test_idle_video_overlays_leave_the_render_tree(self):
+        """opacity:0 still keeps an element in the render tree. These two are
+        idle for an entire session between gestures."""
+        css = self._strip_comments(self.css, "css")
+        for selector in (".action-feedback", ".volume-toast"):
+            body = self._css_rule(css, selector)
+            self.assertIn("visibility: hidden", body,
+                          "{} must be hidden with visibility, not only opacity".format(selector))
+
+    def test_reaction_overlay_density_is_bounded(self):
+        """Every accepted reaction is broadcast to every viewer, where it becomes
+        an animated layer over live video. Aggregate rate is per-viewer rate x
+        viewer count, so it must be bounded globally and per client."""
+        self.assertIn("MAX_FLYING_EMOJI", self.app,
+                      "concurrent reaction layers over the video must be capped")
+        self.assertIn("REACTION_GLOBAL_CAP_PER_SEC", self.server,
+                      "aggregate reaction broadcast rate must be capped regardless of viewer count")
+        body = self._css_rule(self._strip_comments(self.css, "css"), ".flying-emoji")
+        self.assertIsNotNone(body, ".flying-emoji rule not found")
+        self.assertNotIn("drop-shadow", body,
+                         "a filter on a promoted layer over video forces its own render pass")
+
+    # -- player control loop ----------------------------------------------
+
+    def test_playout_target_writes_are_rate_limited(self):
+        """Every jitterBufferTarget write re-paces the browser's playout, so an
+        unguarded 25-50ms step per tick is a per-second re-pace forever."""
+        self.assertIn("BUFFER_TARGET_BAND_MS", self.app, "a hysteresis band is required")
+        self.assertIn("BUFFER_TARGET_DWELL_MS", self.app, "a dwell between applied changes is required")
+        self.assertIn("recentDropAt", self.app,
+                      "a protective raise while frames are actually dropped must stay instant")
+
+    def test_stress_raise_is_a_hold_not_a_countdown(self):
+        """A wall-clock stamp expiring after 15s produced a proven square wave
+        on a continuously marginal link: 350ms for 15s, 180ms for 7s, five
+        target steps per minute, forever, on a link that never went calm."""
+        code = self._strip_comments(self.app, "js")
+        self.assertNotIn("adaptiveRaiseUntil", code,
+                         "the stress raise must be a level, not an expiring timestamp")
+        self.assertIn("adaptiveRaiseLevelMs", code)
+
+    def test_drift_rejoin_requires_a_fresh_measurement(self):
+        """avgPlayoutDelayMs latches when a window produces no measurement, so
+        three ticks containing zero new readings used to satisfy the
+        confirmation and force a 2-4s hard teardown of a healthy session."""
+        self.assertIn("avgPlayoutDelayAt", self.app)
+        self.assertIn("driftReadingIsFresh", self.app)
+
+    def test_return_from_hidden_tab_does_not_rejoin_on_one_reading(self):
+        """A normal Alt-Tab measures 1.7-2.8s, within 300ms of the 3.1s trip
+        point, so a single-reading decision could end in a hard freeze."""
+        self.assertIn("returnDriftChecks", self.app)
+        self.assertIn("returnDriftChecks >= 3", self.app)
+
+    def test_playout_target_is_not_pushed_to_the_audio_receiver(self):
+        """For synchronized tracks the UA SHOULD use the larger of the two
+        JitterBufferTargets for BOTH, so a video-scale target on the audio
+        receiver stretches audio instead of containing itself."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "reapplyBufferTargets")
+        self.assertIsNotNone(body, "reapplyBufferTargets not found")
+        self.assertIn("kind === 'video'", body)
+        # Every remaining call site must be guarded the same way: the ontrack
+        # hook and the manual-mode override are separate from the supervisor.
+        for anchor in ("applyPlayoutDelay(event.receiver, event.track.kind)",
+                       "applyPlayoutDelay(r, 'video')"):
+            for match in re.finditer(re.escape(anchor), code):
+                guard = code[max(0, match.start() - 120): match.start()]
+                self.assertIn("kind === 'video'", guard,
+                              "{} must be guarded to video receivers only".format(anchor))
+        self.assertNotIn("applyPlayoutDelay(r, r.track ? r.track.kind : 'media')", code,
+                         "the manual-mode override must not push to the audio receiver either")
+
+    def test_buffer_target_is_not_latched_before_it_is_written(self):
+        """Latching first meant a mid-reconnect receiver list left the app
+        believing it had granted a target it never did, so it never retried and
+        every downstream decision regulated against a fiction."""
+        body = self._js_function_body(self.app, "reapplyBufferTargets")
+        guard = body.index("if (applied === 0) return false;")
+        latch = body.index("lastAppliedTargetMs = targetMs;")
+        self.assertLess(guard, latch,
+                        "the change latch must be written only after a receiver accepted the target")
+
+    def test_accommodation_uses_an_independent_late_frame_signal(self):
+        """The measured delay is a mean over the frames that LEFT the jitter
+        buffer, so late-discarded frames are excluded from numerator and
+        denominator alike. Gating the anti-stutter raise on it made the
+        mechanism structurally unreachable on a slow link."""
+        self.assertIn("lateFrameEvidence", self.app)
+        self.assertIn("droppedDelta > 0 || lateFrameEvidence", self.app)
+
+    def test_hidden_span_does_not_drive_the_accommodation(self):
+        """The stats loop sleeps while hidden, so the first tick after a tab
+        return spans the whole hidden span. Acting on it snapped the
+        accommodation to its cap and left it inert for the rest of the session."""
+        code = self._strip_comments(self.app, "js")
+        # The flag is read TWICE in one stats tick: once to seed the rolling drop
+        # window, and again ~100 lines later to decide whether the accommodation
+        # controller may act. The first read CLEARS it, so the second is
+        # statically always false and the tab-return re-baseline is dead code —
+        # the guard's own comment describes the exact damage it prevents. The
+        # intent must be captured once, before the clear.
+        self.assertIn("const rebaseThisTick = dropTickPending;", code,
+                      "the re-baseline intent must be captured before the flag is cleared")
+        self.assertRegex(code, r"const rebaseThisTick = dropTickPending;\s*\n\s*if \(dropTickPending\) \{\s*\n\s*dropTickPending = false;",
+                         "the alias must be taken before the clear, not after")
+        idx = code.find("const lateFrameEvidence")
+        self.assertGreater(idx, 0, "the late-frame evidence signal was not found")
+        window = code[max(0, idx - 1500): idx + 1200]
+        guard = window.find("if (rebaseThisTick) {")
+        self.assertGreater(guard, -1,
+                           "the accommodation must be gated on the CAPTURED intent, not on the cleared flag")
+        self.assertIn("accommodationCalmTicks", window[guard:guard + 200],
+                      "the hidden-span branch must re-baseline the accommodation")
+        self.assertIn("bufferAccommodationMs", window[guard:],
+                      "the accommodation update must be in the ELSE of that branch")
+
+    def test_freeze_watchdog_does_not_walk_the_stats_graph_twice(self):
+        """getStats() walks every RTP report and allocates a fresh report set.
+        Doing it 1.67x per second is avoidable main-thread work on exactly the
+        low-end receivers this code protects."""
+        body = self._js_function_body(self._strip_comments(self.app, "js"), "startFreezeWatchdog")
+        self.assertIsNotNone(body, "startFreezeWatchdog not found")
+        self.assertNotIn("getStats()", body,
+                         "the freeze watchdog must reuse the stats loop's snapshot")
+        self.assertIn("inboundSnapshot", body)
+        self.assertIn("INBOUND_SNAPSHOT_MAX_AGE_MS", self.app,
+                      "a stale snapshot must be rejected rather than read as 'no progress'")
+
+    def test_level_meter_cannot_spin_at_display_rate(self):
+        """A style.width write per frame invalidates layout, and rAF callbacks
+        are scheduled in the same frame update that presents the video."""
+        self.assertIn("AUDIO_METER_INTERVAL_MS", self.app,
+                      "the level meter must be sampled at a bounded rate")
+        self.assertIn("renderAudioMeter", self.app,
+                      "the meter must only write when the rounded value changes")
+        body = self._js_function_body(self.app, "startAudioMeter")
+        self.assertIn("stopAudioMeterLoop();", body,
+                      "the meter must stop when there is nothing to measure")
+        self.assertNotIn("hudAudioLevel.style.width = '0%';", body,
+                         "the idle branch must not write layout every frame")
+
+    def test_auto_eco_mode_is_not_permanently_disabled_by_the_toggle(self):
+        """A stored '0' (Turbo GPU) is not a request to stutter through a
+        measured drop storm, and it used to veto the relief forever."""
+        body = self._js_function_body(self.app, "maybeAutoPerfMode")
+        self.assertIsNotNone(body, "maybeAutoPerfMode not found")
+        self.assertIn("storedPerfChoice === '1'", body,
+                      "only an explicit Eco choice may veto the relief")
+        self.assertNotIn("storedPerfChoice !== null", body,
+                         "any prior toggle click must not permanently disable the relief")
+
+    def test_stage_two_recovery_cannot_freeze_a_marginal_link_repeatedly(self):
+        """Reassigning srcObject tears down and rebuilds the media pipeline, so
+        it guarantees a freeze. Run on every watchdog trip it made a marginal
+        link stutter on top of whatever it was already struggling with."""
+        self.assertIn("stage2AttemptedThisSession", self.app)
+        self.assertIn("!stage2AttemptedThisSession", self.app)
+
+    def test_degradation_preference_pins_picture_detail(self):
+        """The default 'balanced' lets Chrome trade resolution away silently;
+        on a live stream the picture just gets softer and no controller can see
+        it, because nothing is lost — the frames are only smaller."""
+        self.assertIn("degradationPreference", self.app)
+        self.assertIn("maintain-resolution", self.app)
+
+    # -- signaling ---------------------------------------------------------
+
+    def test_keep_alive_outlives_the_client_poll_cadence(self):
+        """Node's default is 5s and the player polls every 5s, so pooled
+        sockets were torn down in a race with the next request. A WHEP
+        handshake is a POST, which browsers do not reliably retry on a reused
+        socket -> failed handshake -> visible freeze on a healthy link."""
+        self.assertIn("server.keepAliveTimeout = 65000", self.server)
+        self.assertIn("server.headersTimeout = 66000", self.server)
+
+    def test_forwarded_headers_are_only_trusted_behind_the_tunnel(self):
+        """x-forwarded-for is attacker-controlled. A unique value per request
+        is a unique rate-limit key per request, so the per-IP reaction limit
+        could be bypassed outright and the map could be filled with one entry
+        per spoofed string."""
+        self.assertIn("TRUST_FORWARDED_HEADERS", self.server)
+        self.assertIn("clientIpForRateLimit", self.server)
+        self.assertNotIn("req.headers['x-forwarded-for'] || (req.socket", self.server,
+                         "an unvalidated x-forwarded-for must not be a rate-limit key")
+
+    def test_sse_backpressure_counts_real_queue_depth(self):
+        """write()===false only trips once Node's own 16KB highWaterMark is
+        exceeded, which cannot happen until the kernel socket buffer is already
+        full. Measured: 6000 events (~1.2MB) produced zero false returns, so the
+        old consecutive-false counter never tripped at all. The guard must read
+        the stream's own queue depth instead."""
+        broadcast = self._js_function_body(self._strip_comments(self.server, "js"),
+                                           "broadcastChatEvent")
+        self.assertIsNotNone(broadcast, "broadcastChatEvent not found")
+        self.assertIn("writableLength", broadcast,
+                      "the guard must use the stream's real queue depth")
+        self.assertIn("SSE_MAX_QUEUED_BYTES", self.server)
+
+    def test_304_advertises_the_encoding_it_was_served_with(self):
+        # A 304 that omits Vary can let a shared cache hand a gzip body to a
+        # client that never advertised gzip — a hard decode error.
+        start = self.server.find("writeHead(304")
+        self.assertGreater(start, 0, "the 304 branch was not found")
+        branch = self.server[start:start + 900]
+        self.assertIn("Vary': 'Accept-Encoding", branch,
+                      "the 304 response must carry the same Vary the 200 does")
+
+    def test_launcher_refuses_a_stale_mediamtx_instance(self):
+        """The launcher reused a running MediaMTX without comparing config, so
+        editing a tuning knob and re-running was a silent no-op — the exact
+        failure mode of a 'tuned' setting that does nothing."""
+        self.assertIn("/v3/config/global/get", self.launcher)
+        self.assertIn("DIFFERENT configuration", self.launcher)
+        for key in ("writeQueueSize", "udpReadBufferSize", "udpMaxPayloadSize", "logLevel"):
+            self.assertIn(key, self.launcher,
+                          "{} must be compared before reusing a running instance".format(key))
+
+
+    def test_sse_backpressure_uses_the_stream_not_a_running_total(self):
+        """A hand-rolled running byte total is the wrong instrument here, and was
+        actively destructive: `drain` only fires after a write() has previously
+        returned false, so a HEALTHY reader never drains, never resets, and the
+        accumulator climbs forever. Real payload 173 bytes -> destroyed after
+        ceil(262144/173) = 1516 events (~1.2h of busy chat), for every viewer at
+        once, each then auto-reconnecting. `writableLength` is the stream's own
+        count of what is still queued and falls back to 0 by itself."""
+        broadcast = self._js_function_body(self.server, "broadcastChatEvent")
+        self.assertIsNotNone(broadcast, "broadcastChatEvent not found")
+        self.assertIn("writableLength", broadcast,
+                      "the backpressure guard must use the stream's own queue depth")
+        self.assertNotIn("_queuedBytes", broadcast,
+                         "a cumulative byte counter destroys healthy subscribers; it must not come back")
+        self.assertNotIn("+ Buffer.byteLength(payload)", broadcast)
+        # The slow-reader flag must be able to recover rather than latch dark.
+        self.assertIn("_lagging = false", self.server)
+        self.assertIn("res.on('drain'", self.server)
+        self.assertIn("_lagSince", self.server,
+                      "a subscriber that never recovers must be closed so the browser reconnects")
+
+    def test_audio_rescue_preserves_the_source_av_offset(self):
+        """`first_pts=0` does not tidy a timeline, it drags the audio track onto
+        the video track's head. Measured with the bundled ffmpeg on a source
+        whose audio starts 279ms after its video: the shipped filter turned that
+        into -7ms (destroyed, sign flipped) while plain async=1 preserved it at
+        +294ms. A viewer sees a permanent lip-sync error they report as "janky
+        video"."""
+        bridge = self._strip_comments(self.bridge, "js")
+        self.assertIn("aresample=async=1", bridge,
+                      "the Opus rescue must resample asynchronously to stop A/V drift")
+        self.assertNotIn("first_pts", bridge,
+                         "first_pts re-bases audio onto the video head and destroys the source A/V offset")
+
+    def test_a_suspended_audio_context_recovers_by_itself(self):
+        """Once createMediaElementSource is attached the element's audio is
+        rendered by the WebAudio graph, so a later suspension (device change,
+        headset connect, audio service restart) is permanent silence — the
+        gesture listeners that would otherwise rescue it have already removed
+        themselves. A suspended context does not stall the video, so this is
+        invisible in the video path."""
+        self.assertIn("audioCtx.onstatechange", self.app,
+                      "a context that suspends after wiring must be resumed, not left silent")
+        self.assertIn("audioCtx.resume().catch", self.app)
+
+    def test_sfx_nodes_are_released_and_voices_capped(self):
+        """Each effect is an OscillatorNode -> GainNode pair connected to the
+        destination: a connected subgraph anchored on a long-lived node, which
+        is not the shape WebAudio's collector reclaims cheaply. Measured: 200
+        calls created 400 nodes and disconnected 0. playSfx fires on every
+        incoming reaction, so the churn is continuous during a hype train."""
+        sfx = self._js_function_body(self.app, "playSfx")
+        self.assertIsNotNone(sfx, "playSfx not found")
+        self.assertIn("disconnect()", sfx, "SFX nodes must be explicitly disconnected")
+        self.assertIn("onended", sfx, "release must be tied to the oscillator ending")
+        self.assertIn("MAX_SFX_VOICES", self.app, "concurrent SFX voices must be capped")
+
+    def test_aborted_whep_post_runs_a_real_teardown(self):
+        """The AbortError branch must not merely clear isConnecting.
+
+        The 16s connectTimeout is gated on `isConnecting && !isConnected`, and
+        only handleDisconnected() re-arms the status poll. Clearing the flag
+        alone left a hung-POST attempt with no watchdog, no cleanupConnection
+        (PeerConnection still open and gathering, no WHEP DELETE ever sent) and
+        no retry — measured as still "connecting" after 60s with 1 POST, 0
+        DELETEs and zero pending timers. That regression was introduced by an
+        earlier fix in this same file, which is exactly why it is pinned."""
+        code = self._strip_comments(self.app, "js")
+        start = code.find("error.name === 'AbortError'")
+        self.assertGreater(start, 0, "the AbortError branch was not found")
+        # Take a generous window: the branch contains a nested guard, so a
+        # brace-matching regex would stop at the wrong one.
+        body = code[start:start + 1200]
+        self.assertIn("handleDisconnected()", body,
+                      "an aborted WHEP POST must run the real teardown, not just clear a flag")
+        self.assertNotRegex(body, r"isConnecting = false;\s*\n\s*return;",
+                            "clearing the flag and returning is the bug: it disables the watchdog "
+                            "and never re-arms the poll")
+        self.assertIn("superseded()", body,
+                      "a superseded attempt must not paint the page offline behind the live session")
+
+    def test_connect_watchdog_covers_ice_separately_from_signaling(self):
+        """The watchdog used to be armed before signaling and only cleared on
+        connect, so it had to cover 2.5s ICE fetch + 3s gather + up to 10s WHEP
+        POST = 15.5s of a 15s budget, leaving 0.5s for the actual ICE
+        connection. A remote or relayed viewer that would connect at 16s was
+        torn down at 15s, and every retry repeated it — it could never play.
+        LAN viewers connect in ~50ms and never saw it."""
+        code = self._strip_comments(self.app, "js")
+        self.assertGreaterEqual(code.count("connectTimeout = setTimeout"), 2,
+                                "the ICE window needs its own watchdog, re-armed after the answer")
+        tail = code.rfind("setRemoteDescription")
+        after = code[tail:tail + 2000]
+        self.assertIn("connectTimeout", after,
+                      "the ICE-only watchdog must be armed after the answer is applied")
+
+    def test_offer_is_not_sent_before_a_routable_candidate_exists(self):
+        """WHEP is non-trickle, so whatever candidates exist when the POST goes
+        out are the only ones the server gets. This page never calls
+        getUserMedia, so Chrome mDNS-obfuscates host candidates as *.local, and
+        MediaMTX (Pion) resolves no mDNS — an offer carrying only those has
+        nothing to connect to. A fixed 3s deadline POSTed exactly that on the
+        networks the code itself diagnoses as blocking UDP STUN, and a `turns:`
+        relay needing >3s to allocate was cut off the same way."""
+        code = self._strip_comments(self.app, "js")
+        self.assertIn("hasRoutableCandidate", code,
+                      "the gather window must wait for a usable candidate, not just a deadline")
+        self.assertIn(".local", code, "mDNS-obfuscated candidates must be recognised and waited past")
+        window = re.search(r"const hasRoutableCandidate = \(\) => \{(.*?)\n            \};",
+                           code, re.DOTALL)
+        self.assertIsNotNone(window, "hasRoutableCandidate was not found")
+        self.assertIn("a=candidate:", window.group(1),
+                      "the routability check must actually inspect the SDP candidates")
+        self.assertIn(".local", window.group(1),
+                      "mDNS-obfuscated candidates must be recognised as NOT routable")
+        # ORDER: the gather cap must be armed BEFORE the first poll call. The
+        # poll's guard tests `gatherTimeout === null` to know the window is open,
+        # so priming the poll first made it return immediately and never
+        # reschedule — the whole routable-candidate path was dead code and the
+        # window silently degraded to "gathering complete or the cap". This is
+        # the same class of bug pass 2 already found once (a flag cleared before
+        # its second reader), so it is pinned explicitly.
+        armed = code.find("gatherTimeout = setTimeout(() => finish('6s cap reached')")
+        polled = code.find("pollRoutable();", armed - 600 if armed > 0 else 0)
+        self.assertGreater(armed, 0, "the gather cap is missing")
+        self.assertGreater(polled, 0, "the routable poll is never started")
+        self.assertLess(armed, polled,
+                        "the gather cap must be armed before pollRoutable() is first called, "
+                        "or the poll's `gatherTimeout === null` guard kills the loop on tick one")
+
+    def test_rtcp_fb_collection_is_scoped_to_the_video_section(self):
+        """The collection pass swept the WHOLE document while the injection pass
+        was section-scoped, so a payload type also present in m=audio was
+        recorded as already having feedback and the video section silently kept
+        only what audio declared — reproduced with a colliding fixture, where
+        the video came out with nack pli and goog-remb but NO nack, i.e. no
+        retransmission at all."""
+        code = self._strip_comments(self.app, "js")
+        collect = re.search(r"presentFeedback = new Set\(\);(.*?)\}\)\(\);", code, re.DOTALL)
+        self.assertIsNotNone(collect, "the scoped collection pass was not found")
+        self.assertIn("inVideo", collect.group(1),
+                      "the collection pass must be scoped to the video section, like the injection pass")
+
+    def test_teardown_clears_every_peer_connection_handler(self):
+        """onicecandidateerror was the one handler missing from the teardown
+        list. It calls addSystemMessage, so a candidate error from a gathering
+        pass still in flight posted a chat warning after the offline banner,
+        for a session that no longer existed."""
+        teardown = self._js_function_body(self.app, "cleanupConnection")
+        self.assertIsNotNone(teardown, "cleanupConnection not found")
+        for handler in ("ontrack", "onconnectionstatechange", "oniceconnectionstatechange",
+                        "onicegatheringstatechange", "onicecandidate", "onicecandidateerror"):
+            self.assertIn(handler + " = null", teardown,
+                          "{} must be cleared on teardown".format(handler))
+
+    def test_film_grain_is_one_static_layer_not_a_fixed_overlay(self):
+        """The grain used to be a fixed, inset:0 overlay element the compositor
+        carried over the ambient stack every frame, at 0.035 opacity, behind the
+        app container. It is now painted once into the body background. The
+        hazard this guards is a comment that no longer matches the code: an
+        earlier revision claimed the data-URI had been relocated while it had in
+        fact been deleted outright."""
+        css = self._strip_comments(self.css, "css")
+        self.assertEqual(css.count("feTurbulence"), 1,
+                         "the grain must exist exactly once; 0 means it was dropped, "
+                         "2 means the overlay and the body both paint it")
+        noise = self._css_rule(css, ".noise-overlay")
+        self.assertIsNotNone(noise, ".noise-overlay rule not found")
+        self.assertIn("display: none", noise,
+                      "the fixed overlay element must be removed from the render tree")
+        self.assertNotIn("background-image", noise,
+                         "the overlay must not keep painting the grain as a layer")
+        body = re.search(r"(?m)^body\s*\{([^}]*)\}", css)
+        self.assertIsNotNone(body, "no body rule found")
+        self.assertIn("feTurbulence", body.group(1),
+                      "the grain must be relocated onto the body background")
+
+    def test_relocated_grain_keeps_its_low_alpha(self):
+        """Moving the grain off the fixed overlay and onto the body background
+        dropped its alpha on the way: a background-image cannot be faded from
+        CSS — there is no background-opacity — so the byte-identical data-URI
+        painted at FULL strength and the whole page rendered as visible TV
+        static behind the player. Nothing about the relocation was visible in a
+        test, and the comment above the rule even claimed the 0.035 had come
+        along, so the grain has to carry its own alpha inside the SVG now."""
+        css = self._strip_comments(self.css, "css")
+        body = re.search(r"(?m)^body\s*\{([^}]*)\}", css)
+        self.assertIsNotNone(body, "no body rule found")
+        grain = unquote(body.group(1))
+        rect = re.search(r"<rect[^>]*>", grain)
+        self.assertIsNotNone(rect, "the grain texture no longer has a rect to fade")
+        alpha = re.search(r"opacity=[\"']([0-9.]+)[\"']", rect.group(0))
+        self.assertIsNotNone(
+            alpha, "the grain rect has no opacity; a background-image cannot be "
+                   "faded from CSS, so the texture would paint at full strength")
+        self.assertLessEqual(
+            float(alpha.group(1)), 0.05,
+            "the grain alpha is no longer the subtle 0.035 texture it is meant to be")
+
+    def test_eco_mode_still_drops_the_relocated_grain(self):
+        """The same relocation silently deleted Eco Mode's grain toggle.
+        `body.perf-mode .noise-overlay { display: none }` was dropped along with
+        the overlay it targeted, and nothing replaced it: once the grain moved
+        onto the body background, hiding an element cannot unset a background
+        on an ancestor, so the old selector had become a no-op even if it had
+        survived. Eco Mode therefore stopped shedding the one texture it exists
+        to shed, with no test failing to say so. The toggle has to be re-issued
+        against whichever element actually owns the grain."""
+        css = self._strip_comments(self.css, "css")
+        perf = self._css_rule(css, "body.perf-mode")
+        self.assertIsNotNone(perf, "no body.perf-mode rule found; Eco Mode has lost "
+                                   "its ability to drop the body grain")
+        self.assertIn("background-image: none", perf,
+                      "Eco Mode must unset the grain on the body, which is where "
+                      "the relocation put it")
+
+    def test_unmute_prompt_is_hidden_until_the_stream_is_live(self):
+        """"Click to unmute" was painted across "Stream is Offline". The grouped
+        overlay rule sets display:flex for all three player overlays and the
+        markup ships #unmute-overlay with no inline display, so the very first
+        paint — before the status poll has answered — laid the prompt over the
+        offline banner, both being inset:0 and both centring their content.
+        Only app.js may show it, and it always does so with an inline
+        display, so the stylesheet default has to be the hidden one (which is
+        what .player-loader has always done)."""
+        css = self._strip_comments(self.css, "css")
+        unmute = self._css_rule(css, ".unmute-overlay")
+        self.assertIsNotNone(unmute, ".unmute-overlay rule not found")
+        self.assertIn("display: none", unmute,
+                      "the unmute prompt must be hidden by default and shown only by app.js")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+    def test_self_sent_chat_ids_are_pruned(self):
+        """A sender's own echoed message hits an early return before the prune,
+        so the set grew 1:1 with self-sends and the stated 500 cap never held."""
+        send_path = self._js_function_body(self.app, "addMessage") or self.app
+        idx = self.app.find("seenClientMsgIds.add(clientMsgId)")
+        self.assertGreater(idx, 0, "the send-path insert was not found")
+        window = self.app[idx:idx + 600]
+        self.assertIn("seenClientMsgIds.size", window,
+                      "the send path must prune the set it just grew")
+
+    def test_root_cursor_write_is_not_repeated_per_mousemove(self):
+        """applyCursorState writes the ROOT element's inline style, the broadest
+        invalidation available, and it runs on every qualifying mousemove while
+        the value being written is identical. Outside fullscreen `hide` is
+        always false, so this was the same no-op write dozens of times a
+        second."""
+        fn = self._js_function_body(self.app, "applyCursorState")
+        self.assertIsNotNone(fn, "applyCursorState not found")
+        self.assertIn("lastCursorHidden", fn,
+                      "the root cursor write must be skipped when the value is unchanged")
+
+    def test_chat_autoscroll_is_batched_into_one_layout(self):
+        """Reading scrollHeight right after appendChild is a forced synchronous
+        layout, so a chat burst cost one full sidebar layout per message on the
+        same thread that decodes video."""
+        self.assertIn("scheduleChatAutoscroll", self.app)
+        self.assertNotIn("chatMessages.scrollTop = chatMessages.scrollHeight;\n        \n        // Prune",
+                         self.app)
+        fn = self._js_function_body(self.app, "scheduleChatAutoscroll")
+        self.assertIsNotNone(fn, "scheduleChatAutoscroll not found")
+        self.assertIn("requestAnimationFrame", fn,
+                      "the scroll read must be deferred so a burst coalesces into one layout")
+        self.assertIn("chatScrollScheduled", fn, "the deferral must be coalesced, not one rAF per message")
+
+    def test_webfont_display_is_not_optional(self):
+        """`display=optional` was tried here to avoid a post-handshake font-swap
+        reflow, on the reasoning that the stylesheet is cross-origin. Both halves
+        of that are wrong: the <link rel=stylesheet> is render-blocking whatever
+        `display` says, and `display` governs the FONT FILE fetch. The real cost
+        is that `optional` gives the face ~100ms and then keeps the fallback for
+        the whole page load with no swap — and this host's uplink is a phone
+        hotspot already saturated carrying the video, so the .woff2 would
+        routinely miss that window and the brand fonts would silently never
+        render for any viewer. That is a visible regression traded for one
+        layout pass, so it was reverted to the default `swap`."""
+        html = read_text(HTML_PATH)
+        self.assertIn("fonts.googleapis.com", html)
+        self.assertIn("display=swap", html,
+                      "the brand fonts must still be able to load on a slow uplink")
+        self.assertNotIn("display=optional", html,
+                         "display=optional silently drops the brand fonts for the whole "
+                         "page load on a saturated link")
+
+    def test_abr_seam_keeps_the_audio_track(self):
+        """The ABR seam swapped the element's stream for a VIDEO-ONLY one.
+
+        A WHEP answer usually delivers the audio track's ontrack BEFORE the
+        video one, so by the time the seam closed the audio track was already
+        sitting in the previous (now stale) stream — and replacing the stream
+        dropped it. The viewer kept a picture and lost all sound, and because
+        which track arrives first is not guaranteed it presented as "sometimes
+        video, sometimes music" rather than as a reliable fault. The tell in the
+        telemetry was RESOLUTION: -- (player.videoWidth === 0, so the element
+        had nothing to size) together with a rising framesDecoded counter and a
+        live audio meter: WebRTC decodes regardless of what the element holds.
+        """
+        code = self._strip_comments(self.app, "js")
+        seam = re.search(r"if \(switchSeamPending && event\.track\.kind === 'video'\) \{(.*?)\n                \}",
+                         code, re.DOTALL)
+        self.assertIsNotNone(seam, "the ABR seam block was not found")
+        body = seam.group(1)
+        self.assertNotRegex(body, r"replacement\.addTrack\(event\.track\)",
+                            "adding only the incoming video track drops the audio track")
+        self.assertIn("getReceivers()", body,
+                      "the seam must take every track the session has produced, not just the video one")
+
+    def test_every_element_stream_keeps_all_tracks(self):
+        """No path may hand the <video> element a single-track stream while the
+        session has more than one. Each assignment site is checked for the same
+        shape, so a future edit cannot reintroduce the seam's original bug."""
+        code = self._strip_comments(self.app, "js")
+        sites = [m.start() for m in re.finditer(r"player\.srcObject = ", code)]
+        self.assertGreaterEqual(len(sites), 3,
+                                "expected the seam, the first-track and the stage-2 assignments")
+        for start in sites:
+            window = code[max(0, start - 700): start + 120]
+            if "new MediaStream()" in window or "freshStream" in window or "replacement" in window:
+                self.assertTrue(
+                    "getReceivers()" in window or "addTrack(event.track)" in window,
+                    "a stream assigned to the element must carry every available track")
+
+    def test_element_stream_is_rebuilt_for_a_new_session(self):
+        """The black-screen root cause.
+
+        A <video> renders its FIRST video track. A graceful teardown
+        (cleanupConnection(true), used by Stage 2 and every ICE failure) leaves
+        the previous stream on screen on purpose, so the next session's tracks
+        were APPENDED to it and the dead first video track stayed in charge of
+        rendering. Measured symptom: framesDecoded climbing (the new session
+        decodes fine), PACKETS LOST 0, audio working, and RESOLUTION "--"
+        because player.videoWidth is 0 for a track that produces nothing.
+        The stream must therefore be tagged with the session that built it."""
+        code = self._strip_comments(self.app, "js")
+        self.assertIn("elementStreamSessionId", code,
+                      "the element's stream must be tagged with the session that built it")
+        pc_site = code.find("new RTCPeerConnection(")
+        bump = code.find("currentSessionId += 1", pc_site if pc_site > 0 else 0)
+        self.assertGreater(bump, 0, "each peer connection must start a new session id")
+        self.assertGreater(bump, pc_site,
+                           "the session id must be bumped where the peer connection is created")
+        guard = code.find("elementStreamSessionId !== currentSessionId")
+        self.assertGreater(guard, 0,
+                           "a stream from an older session must be rebuilt, not appended to")
+        window = code[guard:guard + 700]
+        self.assertIn("getReceivers()", window,
+                      "the rebuild must take the current session's tracks")
+
+    def test_seam_pending_is_actually_left_set(self):
+        """`switchSeamPending` was set true and then cleared two lines later in
+        the same synchronous block, with the first `await` ~100 lines further
+        down — so no ontrack could ever fire in between and the whole seam was
+        provably unreachable. Every rendition switch silently fell through to
+        appending to the stale stream, which is what the seam exists to prevent
+        (and is why the audio-drop fix inside it had no effect at all)."""
+        code = self._strip_comments(self.app, "js")
+        start = code.find("switchSeamPending = true;")
+        self.assertGreater(start, 0, "the seam is never armed")
+        end = code.find("await new Promise(r => setTimeout(r, 200))", start)
+        self.assertGreater(end, start, "the first await after arming was not found")
+        between = code[start:end]
+        self.assertNotIn("switchSeamPending = false", between,
+                         "clearing the flag before the first await makes the seam dead code")
+
+    def test_seam_safety_timer_is_cancelled_by_teardown(self):
+        """cleanupConnection did not know about the seam's 12s safety net, so an
+        ICE failure landing inside that window tore everything down, painted
+        offline, and then had the orphan fire 12s later and reconnect on its own
+        — the page flipping offline -> connecting -> live by itself. It must
+        also clear the pending flag, or the next session's first ontrack would
+        take the seam branch on a teardown that never asked for a switch."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "cleanupConnection")
+        self.assertIsNotNone(body, "cleanupConnection not found")
+        self.assertIn("switchSeamTimer", body, "teardown must cancel the seam safety net")
+        self.assertIn("switchSeamPending = false", body,
+                      "teardown must clear the pending flag so a later session is not hijacked")
+
+    def test_gop_env_is_bounded(self):
+        """`BRIDGE_GOP` was passed to ffmpeg with only a /^\\d+$/ test, so '0'
+        and 999999999 both reached the encoder. Measured with the bundled
+        encoder at 1080p60: `-g 0` means every frame is an IDR and produced
+        5145 KB where `-g 60` produced 3073 KB over the same 4s — a 67%
+        SUSTAINED bitrate overrun for the whole broadcast. `-g 999999999` is
+        the opposite: one keyframe, then no viewer who joins or drops a packet
+        ever gets another."""
+        bridge = self._strip_comments(self.bridge, "js")
+        self.assertRegex(bridge, r"Number\.isInteger\(n\)\s*&&\s*n >= 1\s*&&\s*n <= 300",
+                         "BRIDGE_GOP must be bounded to a sane frame count")
+        self.assertNotRegex(bridge, r"/\^\\d\+\$/\.test\(forced\)\s*return forced;",
+                            "an unbounded digits-only test lets -g 0 and -g 999999999 through")
+
+    def test_probe_failure_keeps_the_designed_interval(self):
+        """The probe has exactly one call site and the track-fetch retry loop
+        never re-enters it, so the log line claiming it "will retry" was false
+        and an operator would rely on it. On failure it silently reverted to
+        the hard-coded 60 frames the rework exists to remove — 1.0s at 60fps,
+        twice the intended 0.5s, and 2.0s at 30fps."""
+        bridge = self._strip_comments(self.bridge, "js")
+        self.assertIn("60 * seconds", bridge,
+                      "a failed probe must fall back to the designed interval at the host's 60fps")
+        self.assertNotIn("will retry or keep the default", bridge,
+                         "the log must not promise a retry that does not exist")
+        self.assertIn("NOT retried", bridge,
+                      "the log must say plainly that the value is final for this run")
+
+    def test_unknown_byte_counter_is_not_a_stall(self):
+        """The stall watchdog's most dangerous failure mode. A path that has
+        disappeared from the control API, or a non-numeric counter, returns
+        null, and `Number.isFinite(null)` is false — so an UNKNOWN reading was
+        scored exactly like a frozen counter. Five consecutive 3s API timeouts
+        on a box also running OBS/NVENC/MediaMTX/Node/tunnel would kill a
+        healthy transcoder, which drops its RTMP publish and tears down every
+        WHEP session on the path: a room-wide hard stop for a broadcast that
+        never stalled."""
+        code = self._strip_comments(self.bridge, "js")
+        watchdog = self._js_function_body(code, "advance")
+        body = code
+        idx = body.find("const advanced = counts.some(")
+        self.assertGreater(idx, 0, "the advance test was not found")
+        window = body[max(0, idx - 900): idx]
+        self.assertIn("!Number.isFinite(n)", window,
+                      "a non-finite reading is UNKNOWN and must reset the stall counter")
+        self.assertIn("stalledSamples = 0", window,
+                      "an unknown reading must not accumulate toward a kill")
+
+    def test_crash_cycle_cannot_reset_the_circuit_breaker(self):
+        """The 30s 'healthy run' reset was doing double duty. A crash cycle
+        landing in the 30-45s band (run 35s, exit, 2s sleep, respawn) reset the
+        strike counter every iteration, so the give-up cap could never fire —
+        an unbounded loop where every cycle drops the RTMP publisher and
+        therefore hard-stops the whole room roughly every 37 seconds. A long,
+        uninterrupted run has to be the thing that earns forgiveness."""
+        code = self._strip_comments(self.bridge, "js")
+        self.assertIn("lastHealthyRunAt", code,
+                      "a long healthy run must be tracked separately from the strike count")
+        self.assertRegex(code, r"if \(runSeconds >= 300\) \{\s*\n\s*lastHealthyRunAt = Date\.now\(\);",
+                         "only a genuinely long run should mark the bridge as healthy")
+        check = code.find("if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES")
+        self.assertGreater(check, 0, "the give-up check was not found")
+        window = code[check:check + 400]
+        self.assertIn("noHealthyRunFor", window,
+                      "the breaker must also trip when the bridge never produces a long run")
+
+    def test_launcher_stale_config_is_a_warning_not_a_site_outage(self):
+        """The comparison used to `throw`, and the launcher's outer catch exits
+        before Node and cloudflared start — so a stale MediaMTX config took the
+        entire website and tunnel DOWN, which is the opposite of what the check
+        exists to protect. The streaming stack is already running; refusing to
+        bring the site up next to it helps nobody."""
+        idx = self.launcher.find("DIFFERENT configuration")
+        self.assertGreater(idx, 0, "a stale-config comparison must exist at all")
+        window = self.launcher[max(0, idx - 300): idx + 900]
+        self.assertIn("Write-Warning", window,
+                      "a stale config must warn and continue, not abort the host")
+        self.assertNotIn("throw", window.split("Write-Warning")[0][-300:],
+                         "nothing before the warning may throw — the outer catch exits before "
+                         "Node and cloudflared start, taking the whole site down")
+        self.assertIn("its config was NOT verified", self.launcher,
+                      "the reassuring 'config matches' line must never print when the "
+                      "comparison did not actually run")
+        self.assertIn("$configVerified", self.launcher,
+                      "the launcher must distinguish a verified config from an unverified one")
+
+    def test_write_queue_comment_arithmetic(self):
+        """The comment claimed 2048 packets x 1200 B = 3.3s at 6 Mbps. It is
+        2.46 MB, which is ~0.41s — the claim was 8x high, and anyone sizing a
+        burst budget from it would be badly wrong. The 2048 value itself is
+        sound (measured worst 100ms window is ~5% of the queue)."""
+        block = self.config[max(0, self.config.find("writeQueueSize") - 1400):
+                            self.config.find("writeQueueSize")]
+        self.assertIn("0.41s", block, "the queue-depth arithmetic must be correct")
+        self.assertNotIn("3.3s at 6 Mbps", block, "the 8x-wrong figure must not come back")
+
+    def test_grain_background_has_no_fixed_attachment(self):
+        """`background-attachment: fixed` is a no-op while html/body's background
+        is colour-only (this background propagates to the canvas, and canvas
+        backgrounds never scroll) but becomes a real per-scroll repaint cost the
+        moment that stops applying. It bought nothing, so it is removed rather
+        than left as a trap."""
+        css = self._strip_comments(self.css, "css")
+        self.assertNotIn("background-attachment", css,
+                         "a no-op fixed background attachment is a trap, not a setting")
 
 
 if __name__ == "__main__":

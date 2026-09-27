@@ -5,16 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="dark">
     <meta name="theme-color" content="#080812">
+    <!-- The unlisted URL is the only access control for a broadcast; keep
+         search engines from ever indexing a private stream page. -->
+    <meta name="robots" content="noindex, noimageindex">
 <title>Rydius Stream — Low-Latency WebRTC Live Stream</title>
     <meta name="description" content="Watch a live screen share with real-time WebRTC playback and stream diagnostics.">
-    <!-- Google Fonts -->
+    <!-- Google Fonts. display=swap is the default and is correct here. An audit
+         round tried display=optional to avoid a mid-playback font-swap reflow,
+         on the reasoning that the stylesheet is cross-origin. That reasoning is
+         wrong twice over: the <link rel=stylesheet> is render-blocking whatever
+         the display value says, and `display` governs the FONT FILE fetch, not
+         the stylesheet. The real cost of `optional` is severe: it gives the face
+         ~100ms and then keeps the fallback for the whole page load with no
+         swap — and this host's uplink is a phone hotspot already saturated
+         carrying the video, so the .woff2 would routinely miss that window and
+         Inter/Orbitron/Fira Code would silently never render for anyone. Losing
+         the brand fonts on every viewer to avoid one layout pass is the wrong
+         trade, and it was reverted. -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <!-- FontAwesome Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <!-- Custom CSS -->
-<link rel="stylesheet" href="/streaming/style.css?v=2.22.0">
+<link rel="stylesheet" href="/streaming/style.css?v=2.24.0">
 </head>
 <body>
     <!-- Ambient Background -->
@@ -381,6 +395,6 @@
     </div>
 
     <!-- Custom JavaScript -->
-<script src="/streaming/app.js?v=2.22.0"></script>
+<script src="/streaming/app.js?v=2.24.0"></script>
 </body>
 </html>

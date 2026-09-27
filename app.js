@@ -40,7 +40,24 @@ document.addEventListener('DOMContentLoaded', () => {
     const fullscreenBtn = document.getElementById('fullscreen-btn');
     const perfToggleBtn = document.getElementById('perf-toggle-btn');
     const perfToggleLabel = document.getElementById('perf-toggle-label');
-    
+
+    // Ask the media pipeline to preserve picture detail. The default is
+    // 'balanced', which lets Chrome trade RESOLUTION away when it decides the
+    // viewer is under resource pressure — for a live stream that is the worst
+    // possible trade: the picture silently softens and stays soft, and the
+    // ABR/buffer controllers cannot see it because nothing is "lost", the frames
+    // are just smaller. 'maintain-resolution' keeps every decoded frame at full
+    // size; if the device still cannot keep up, the honest failure (dropped
+    // frames) is something the rest of this file can actually measure and act
+    // on. Set once, before any MediaStream is attached.
+    try {
+        if (player && 'degradationPreference' in player) {
+            player.degradationPreference = 'maintain-resolution';
+        }
+    } catch (err) {
+        console.warn('[Player] Could not pin degradationPreference:', err);
+    }
+
     // Telemetry HUD
     const telemetryHud = document.getElementById('telemetry-hud');
     const hudCloseBtn = document.getElementById('hud-close-btn');
@@ -119,16 +136,28 @@ document.addEventListener('DOMContentLoaded', () => {
     let whepSessionUrl = null;           // Location header URL for WHEP DELETE teardown
     let whepAbortController = null;      // Cancels an in-flight WHEP POST when the session is torn down
     let whepPostTimeout = null;          // Aborts a hung WHEP POST quickly instead of waiting for the 16s watchdog
+    let gatherTimeout = null;            // ICE-gather window timer; module-scoped so teardown can cancel it
+    let switchSeamTimer = null;          // Safety net for a seamless rendition switch that never lands
+    let switchSeamPending = false;       // A replacement session is expected to take over the element
+    // Session identity for the media element's MediaStream. A <video> renders
+    // its FIRST video track, so a stream carrying tracks from an older session
+    // would keep presenting dead video while the new session decodes in the
+    // background — reported as framesDecoded climbing with RESOLUTION "--".
+    let currentSessionId = 0;            // Bumped every time a peer connection is created
+    let elementStreamSessionId = -1;     // Which session built the stream currently on the element
+    let viewerPausedByChoice = false;    // True when the viewer (not a controller) paused playback
     let activeStreamPath = 'live';       // Path chosen for this session: live, live-av1 or live-h264
     let isConnected = false;
     let isConnecting = false;
     let connectionStartTime = 0;
     let connectTimeout = null;           // 12s connection watchdog timer
     let statsInterval = null;
+    let statsTickInFlight = false;      // Overlap guard: a slow getStats() must not double-count deltas
     let streamActiveCheckTimeout = null;
     let lastBytesReceived = 0;
     let lastFramesDecodedCount = 0;
     let lastFramesReceived = 0;         // framesReceived baseline (decode-pressure detection)
+    let lastFramesDiscarded = 0;        // framesDiscarded baseline (decoder's own drops)
     let decodeLagSec = 0;               // Consecutive seconds decoded lags received (decode pressure)
     let lastStatsTime = 0;
     let controlsHideTimeout = null;
@@ -176,13 +205,17 @@ document.addEventListener('DOMContentLoaded', () => {
     let stressRunSec = 0;               // Consecutive seconds of jitter/loss stress
     let calmRunSec = 0;                 // Consecutive calm seconds (restores mode target)
     let rejoinDriftSec = 0;             // Consecutive seconds past the reconnection drift cap
-    let adaptiveRaiseUntil = 0;         // >now: hold a 350ms floor (rough network)
+    let adaptiveRaiseLevelMs = 0;      // Held 350ms floor while the link is stressed (0 = off)
     let lastNetJitterMs = null;         // Smoothed inbound network jitter (ms)
     let lastLossPct = null;             // Packet loss over the last stats interval (%)
     let avgPlayoutDelayMs = null;       // Windowed jitter-buffer delay (ms, where reported)
+    let avgPlayoutDelayAt = 0;          // performance.now() of the last FRESH reading above
     let lastJitterDelayTotal = 0;       // Cumulative jitterBufferDelay baseline (seconds)
     let lastJitterEmittedTotal = 0;     // Cumulative jitterBufferEmittedCount baseline
     let lastAppliedTargetMs = null;     // Last target pushed to receivers (change detection)
+    let lastAppliedTargetChangeAt = 0;  // performance.now() of the last applied change (dwell gate)
+    let jitterFloorTick = 0;            // Stats ticks since the jitter floor was last allowed to decay
+    const JITTER_FLOOR_DECAY_EVERY_TICKS = 5;
     let bufferNoticeState = '';         // 'raised' | '' (system-message dedupe)
     let renditionWaitPolls = 0;         // Consecutive polls waiting for a compatible rendition
     let renditionWaitWarned = false;    // AV1-only viewer notice dedupe per broadcast
@@ -196,8 +229,23 @@ document.addEventListener('DOMContentLoaded', () => {
     let renditionPollInterval = null;   // Slow paths poll that keeps the ladder fresh while connected
     let lastPresentedFrames = 0;        // rVFC metadata.presentedFrames accumulator (real render count)
     let lastPresentedFps = null;        // Presented-frames delta over the last stats tick
+    let lastPresentedFramesAtTick = 0;  // presentedFrames baseline at the previous stats tick
+    let lastPresentedTickAt = 0;        // Wall clock of the previous stats tick (the fps denominator)
     let lastRouteText = '--';           // Selected ICE route: direct / relay (TURN)
     let lastRecoveryCounts = null;      // { pli, nack } session totals for diagnostics
+    let noMediaRejoinCount = 0;         // Connected-but-no-video rejoin attempts this session
+    let iceErrorNoticed = false;        // One STUN/TURN candidate-error notice per connection
+    let stage2AttemptedThisSession = false; // Freeze-recovery Stage 2 runs at most once per session
+    // Latest inbound video counters, published by the 1s stats loop and read by
+    // the freeze watchdog. getStats() walks the whole RTP graph and allocates a
+    // fresh report set on every call, so the watchdog used to pay for a SECOND
+    // full walk every 1.5s on top of the loop's 1s one — on the low-end devices
+    // that most need the main thread. One walk per second is the budget; the
+    // watchdog judges liveness from this snapshot instead. `at` is the
+    // performance.now() of publication so a stale/skipped tick cannot be
+    // mistaken for "no progress".
+    let inboundSnapshot = null;         // { decoded, bytes, at }
+    const INBOUND_SNAPSHOT_MAX_AGE_MS = 3000;
 
     // Bitrate History for Canvas Sparkline (Rolling 60 seconds)
     const bitrateHistory = new Array(60).fill(0);
@@ -254,6 +302,23 @@ document.addEventListener('DOMContentLoaded', () => {
             gainNode.gain.setValueAtTime(1.0, audioCtx.currentTime);
             gainNode.connect(analyserNode);
             analyserNode.connect(audioCtx.destination);
+            // Recovery from a LATER suspension. Once createMediaElementSource
+            // has been attached, the element's audio is rendered by this graph
+            // — so if the context suspends afterwards (output device change, a
+            // Bluetooth headset connecting, the browser's audio service
+            // restarting) the viewer gets PERMANENT SILENCE: the video plays
+            // normally, the mute button still reads "unmuted" and the meter
+            // reads zero, and nothing in the app ever tries again, because
+            // unlockAudio removes its own gesture listeners on the first
+            // success and nothing else touches the context. A suspended context
+            // does NOT stall or drift the video (the media element has its own
+            // clock), so this was invisible in the video path and only
+            // presented as mysteriously missing audio.
+            audioCtx.onstatechange = () => {
+                if (audioCtx && audioCtx.state === 'suspended' && !document.hidden) {
+                    audioCtx.resume().catch(() => {});
+                }
+            };
             console.log("[Audio] Web Audio context initialized successfully.");
         } catch (e) {
             console.warn("[Audio] Could not initialize Web Audio context:", e);
@@ -297,8 +362,19 @@ document.addEventListener('DOMContentLoaded', () => {
         if (gainNode && audioCtx && audioCtx.state !== 'closed' && audioSourceNode) {
             try {
                 const now = audioCtx.currentTime;
+                // RAMP, never step. setValueAtTime moves the gain inside one
+                // render quantum (128 samples = 2.67ms at 48kHz), and a step in
+                // gain on a non-zero waveform is a broadband discontinuity — an
+                // audible click. Mute/unmute steps by a full 1.0 (0dBFS, the
+                // loudest transient possible, at the moment the listener's ear
+                // is adapted to the room), and the volume slider fires `input`
+                // at the OS pointer rate, so dragging it produced 60-200 steps
+                // per second of continuous crackle. 20ms is the right order of
+                // magnitude: the ear integrates transients under ~10ms as clicks
+                // and over ~30ms as fades.
                 gainNode.gain.cancelScheduledValues(now);
-                gainNode.gain.setValueAtTime(clamped, now);
+                gainNode.gain.setValueAtTime(gainNode.gain.value, now);
+                gainNode.gain.linearRampToValueAtTime(clamped, now + 0.02);
                 // Element volume must stay at 1 while the graph carries the
                 // multiplier, or the two multiply together (50% → 25%).
                 player.volume = 1.0;
@@ -310,52 +386,114 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // The level meter is decoration, but it used to run a requestAnimationFrame
+    // loop at display rate that wrote `style.width` EVERY frame — and kept
+    // re-arming even while muted, paused or disconnected, which is the default
+    // state for most of a session. A `width` write invalidates layout, and rAF
+    // callbacks are scheduled in the same frame update that presents the video,
+    // so ~60 style recalcs + layouts per second were competing directly with
+    // frame presentation for main-thread time on exactly the low-end receivers
+    // this loop can least afford. It now:
+    //   - samples the analyser at ~12 Hz (a level bar cannot show 60 Hz detail),
+    //   - writes style only when the rounded value actually changes,
+    //   - stops itself entirely when there is no audio to measure, and is
+    //     re-armed by the same events that call startAudioMeter().
+    const AUDIO_METER_INTERVAL_MS = 80;
+    let audioMeterLastSampleAt = 0;
+    let audioMeterLastPct = -1;
+    // Drive the bar with a custom property that the stylesheet applies as
+    // `transform: scaleX()`, not with `width`. `width` is a LAYOUT property: at
+    // ~12Hz that is 12 relayouts of the meter subtree per second, on the
+    // per-frame critical path of a page whose whole job is presenting video, and
+    // the CSS `transition: width` then interpolated between them for another
+    // ~6 relayouts/s. scaleX is compositor-only. The inline `width` in
+    // index.html is cleared on first write so it cannot outrank the new
+    // mechanism; until then the transform's fallback keeps the bar full-width
+    // rather than invisible.
+    function renderAudioMeter(percentage) {
+        if (percentage === audioMeterLastPct) return;
+        audioMeterLastPct = percentage;
+        if (!hudAudioLevel) return;
+        hudAudioLevel.style.removeProperty('width');
+        hudAudioLevel.style.setProperty('--level', String(percentage / 100));
+    }
+    function stopAudioMeterLoop() {
+        if (audioMeterAnimId) {
+            cancelAnimationFrame(audioMeterAnimId);
+            audioMeterAnimId = null;
+        }
+    }
     function startAudioMeter() {
         if (!analyserNode || !hudAudioLevel || !telemetryHud || telemetryHud.style.display !== 'block') return;
-        if (audioMeterAnimId) cancelAnimationFrame(audioMeterAnimId);
+        if (audioMeterAnimId) return;   // already running; never stack loops
         const dataArray = new Uint8Array(analyserNode.frequencyBinCount);
+        audioMeterLastSampleAt = 0;
+        audioMeterLastPct = -1;
 
-        const updateMeter = () => {
+        const updateMeter = (now) => {
             if (!telemetryHud || telemetryHud.style.display !== 'block') {
-                stopAudioMeter();
+                stopAudioMeterLoop();
                 return;
             }
             if (!isConnected || player.paused || player.muted) {
-                hudAudioLevel.style.width = '0%';
-                audioMeterAnimId = requestAnimationFrame(updateMeter);
+                renderAudioMeter(0);
+                stopAudioMeterLoop();   // idle: re-armed by mute/unmute + play/pause
                 return;
             }
-
-            analyserNode.getByteFrequencyData(dataArray);
-            let sum = 0;
-            for (let i = 0; i < dataArray.length; i++) {
-                sum += dataArray[i];
+            if (now - audioMeterLastSampleAt >= AUDIO_METER_INTERVAL_MS) {
+                audioMeterLastSampleAt = now;
+                analyserNode.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < dataArray.length; i++) {
+                    sum += dataArray[i];
+                }
+                const average = sum / dataArray.length;
+                renderAudioMeter(Math.min(100, Math.round((average / 180) * 100)));
             }
-            const average = sum / dataArray.length;
-            const percentage = Math.min(100, Math.round((average / 180) * 100));
-            hudAudioLevel.style.width = `${percentage}%`;
             audioMeterAnimId = requestAnimationFrame(updateMeter);
         };
         audioMeterAnimId = requestAnimationFrame(updateMeter);
     }
 
     function stopAudioMeter() {
-        if (audioMeterAnimId) {
-            cancelAnimationFrame(audioMeterAnimId);
-            audioMeterAnimId = null;
-        }
-        if (hudAudioLevel) hudAudioLevel.style.width = '0%';
+        stopAudioMeterLoop();
+        audioMeterLastPct = -1;
+        if (hudAudioLevel) hudAudioLevel.style.setProperty('--level', '0');
     }
 
-    // Synthesize gentle sci-fi click & pop sound effects on the fly
+    // Synthesize gentle sci-fi click & pop sound effects on the fly.
+    // Every node pair is explicitly disconnected when it ends, and concurrent
+    // voices are capped. Each effect is a fresh OscillatorNode -> GainNode pair
+    // connected to the destination, i.e. a connected subgraph anchored on a
+    // long-lived node — not the shape WebAudio's collector reclaims cheaply.
+    // Measured: 200 calls created 400 nodes and disconnected 0. playSfx fires on
+    // every local reaction click, every INCOMING reaction broadcast, every chat
+    // send and every rendition switch, so during a hype train the churn is
+    // continuous on the same main thread that is decoding video. Scheduling is
+    // not the cost (0.013ms/call) — lifetime is.
+    const MAX_SFX_VOICES = 6;
+    let liveSfxVoices = 0;
     function playSfx(type = 'pop') {
         if (!soundEnabled || !audioCtx) return;
+        if (liveSfxVoices >= MAX_SFX_VOICES) return;   // drop rather than pile up
         try {
-            if (audioCtx.state === 'suspended') audioCtx.resume();
+            // Catches its rejection: the context is created outside a user
+            // gesture, so resume() rejects on the ordinary autoplay path
+            // (handleConnected plays a chime for viewers who never clicked).
+            if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
             const osc = audioCtx.createOscillator();
             const sfxGain = audioCtx.createGain();
             osc.connect(sfxGain);
             sfxGain.connect(audioCtx.destination);
+            liveSfxVoices += 1;
+            let released = false;
+            const release = () => {
+                if (released) return;
+                released = true;
+                liveSfxVoices = Math.max(0, liveSfxVoices - 1);
+                try { osc.disconnect(); sfxGain.disconnect(); } catch (_) {}
+            };
+            osc.onended = release;
 
             const now = audioCtx.currentTime;
             if (type === 'pop') {
@@ -377,6 +515,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (e) {
             // Audio context locked or not permitted
+            liveSfxVoices = Math.max(0, liveSfxVoices - 1);
         }
     }
 
@@ -409,10 +548,27 @@ document.addEventListener('DOMContentLoaded', () => {
         const desiredFeedback = ['nack', 'nack pli', 'goog-remb', 'transport-cc'];
         const presentFeedback = new Set();
         const lines = modified.split('\r\n');
-        lines.forEach(line => {
-            const match = line.match(/^a=rtcp-fb:(\d+)\s+(.+)$/);
-            if (match) presentFeedback.add(`${match[1]} ${match[2].trim()}`);
-        });
+        // Scope the COLLECTION pass to the video section too. It used to sweep
+        // the whole document, so a payload type that also appears in m=audio
+        // was recorded as "already has feedback" and the video section silently
+        // kept only what audio happened to declare. Reproduced with a colliding
+        // fixture (video PT 111 also present in m=audio): the video section came
+        // out with nack pli and goog-remb but NO nack — i.e. no retransmission
+        // at all, so one lost packet discarded a frame until the next keyframe.
+        // Chrome's own payload ranges do not collide today, so this is a latent
+        // trap rather than a live defect, but the injection pass below is
+        // already section-scoped and the collection must match it.
+        (() => {
+            let inVideo = false;
+            for (const line of lines) {
+                if (/^m=/.test(line)) {
+                    inVideo = /^m=video/.test(line);
+                    continue;
+                }
+                const match = line.match(/^a=rtcp-fb:(\d+)\s+(.+)$/);
+                if (match && inVideo) presentFeedback.add(`${match[1]} ${match[2].trim()}`);
+            }
+        })();
 
         const rebuilt = [];
         let inVideoSection = false;
@@ -450,6 +606,19 @@ document.addEventListener('DOMContentLoaded', () => {
             const prioritizedCodecs = capabilities.codecs.slice().sort((a, b) => {
                 const getScore = (c) => {
                     const mime = c.mimeType.toLowerCase();
+                    // RTX/red/ulpfec/flexfec are REPAIR payloads, not media: they
+                    // carry no picture of their own and belong immediately after
+                    // the media payload type they serve (rtx's `apt=` parent).
+                    // Scoring them with the catch-all 50 parked them below every
+                    // media codec at the tail of the list, which is exactly where
+                    // setCodecPreferences can detach rtx from its apt parent in
+                    // the negotiated m-line. Retransmission is the cheapest loss
+                    // recovery there is — losing it turns every isolated dropped
+                    // packet into a discarded frame, and a lost keyframe into a
+                    // full decode stall until the next IDR. Rank them alongside
+                    // their primary and let the browser's order stand among
+                    // equals (Array.sort is stable).
+                    if (/(rtx|red|ulpfec|flexfec)/.test(mime)) return 100;
                     if (mime.includes('h264')) return 100;
                     if (mime.includes('h265') || mime.includes('hevc')) return 90;
                     if (mime.includes('av01') || mime.includes('av1')) return 80;
@@ -488,11 +657,29 @@ document.addEventListener('DOMContentLoaded', () => {
     // step per second once the network calms down. Jitter at or below 20ms
     // needs no floor: the mode target and the browser's own buffering absorb
     // it, and Ultra mode stays meaningful on clean links.
-    function jitterBufferFloorMs(jitterMs, prevFloorMs = 0) {
+    //
+    // allowDecay (pure) exists because the DECAY is what churns: walking the
+    // floor down 25ms every tick means 24 consecutive target writes over 24
+    // seconds after a single jitter spike, and every jitterBufferTarget write
+    // re-paces Chrome's playout. Callers pass false between decay steps, so
+    // the floor only ratchets up promptly and back down once every few ticks.
+    // Raising is never gated: a bigger buffer is always the safe direction.
+    // Floor held while the link is measurably stressed. Mid-way between
+    // Balanced (180ms) and Smooth (350ms) would be tempting, but the point of a
+    // stress hold is to sit decisively clear of the arrival-delay distribution,
+    // so it uses the same value as the explicit Smooth mode.
+    const ADAPTIVE_RAISE_MS = 350;
+    // Release granularity for the stress hold. Matches the 50ms band that
+    // reapplyBufferTargets uses to decide whether a change is worth writing at
+    // all, so a ramped release produces one real re-pace per step instead of a
+    // burst of sub-band no-ops.
+    const ADAPTIVE_RAISE_STEP_MS = 50;
+    function jitterBufferFloorMs(jitterMs, prevFloorMs = 0, allowDecay = true) {
         const candidate = (jitterMs === null || !Number.isFinite(jitterMs) || jitterMs <= 20)
             ? 0
             : Math.min(600, Math.round((jitterMs * 2.5 + 75) / 25) * 25);
         if (candidate >= prevFloorMs) return candidate;
+        if (!allowDecay) return prevFloorMs;
         return Math.max(candidate, prevFloorMs - 25);
     }
 
@@ -513,7 +700,23 @@ document.addEventListener('DOMContentLoaded', () => {
     // buffer Chrome wants — accommodate it, and reconnect only past the cap.
     function bufferAccommodationMs(delayMs, prevMs, baseTargetMs, dropsNow, calmTicks) {
         if (delayMs === null || !Number.isFinite(delayMs) || delayMs < 0) return prevMs;
-        if (dropsNow && delayMs > baseTargetMs + 150) {
+        // Compare against what has ALREADY been granted, never against the bare
+        // base. baseBufferTargetMs() deliberately EXCLUDES accommodationTargetMs
+        // (it is the mode + stress raise + jitter floor), so using it here made
+        // the threshold permanently satisfied the moment Chrome converged on the
+        // granted target: `delay > base + 150` stayed true forever, so every
+        // drop-tick re-granted `delay + 100` and walked the target straight to
+        // the 2200ms cap in ~19 ticks. Each step is a jitterBufferTarget write
+        // ABOVE the filled level, which makes Chrome hold frames — simulated
+        // through the real band/dwell gates that was 11 applied raises and ~1.1s
+        // of frozen picture in the first 20s of any session that drops a frame.
+        // This is precisely the "inflate every session to the cap within half a
+        // minute" failure the drop-gate was introduced to stop; the gate only
+        // ever stopped it for the no-drops case. Comparing against `granted`
+        // still lets a genuinely larger need through (700 measured against a
+        // 450 grant clears 450+150), it just cannot climb against its own grant.
+        const granted = Math.max(baseTargetMs, prevMs);
+        if (dropsNow && delayMs > granted + 150) {
             return Math.min(2200, Math.round((delayMs + 100) / 50) * 50);
         }
         if (!dropsNow && calmTicks >= 5 && prevMs > 0) {
@@ -528,12 +731,32 @@ document.addEventListener('DOMContentLoaded', () => {
     // 90% sheds one, and a low-rate window (under 15 frames) is unmeasurable
     // and decays — static screens and paused publishers must not look like
     // decode pressure.
-    function updateDecodeLag(lagSec, decodedDelta, receivedDelta) {
+    // Decoder pressure. `receivedDelta` is framesReceived, which counts EVERY
+    // frame the transport delivered to the jitter buffer — including frames
+    // the decoder then dropped because it could not keep up. Charging those to
+    // the decoder (as the ratio below used to) made every sustained packet-loss
+    // burst look like a struggling decoder, which drives the 350ms buffer raise
+    // and the ABR downgrade for a problem the jitter buffer already absorbs.
+    // framesDiscarded is the net of frames dropped due to "needs resize" and
+    // "decoder failure" — i.e. genuinely the decoder's own doing — so the ratio
+    // is computed from frames the decoder actually had the opportunity to show:
+    //   delivered = decoded + discarded
+    // A ratio below 0.85 therefore means the decoder could not deliver 15% of
+    // the frames it received, which is real decode pressure; a ratio at 0.9 with
+    // the old code sat in the hold band forever and could never accumulate, so a
+    // decoder stuck at 83% never triggered anything at all.
+    function updateDecodeLag(lagSec, decodedDelta, receivedDelta, discardedDelta = 0) {
         if (receivedDelta < 15) return Math.max(0, lagSec - 1);
         if (decodedDelta < 0) return Math.min(30, lagSec + 1);
-        const ratio = decodedDelta / receivedDelta;
-        if (ratio < 0.7) return Math.min(30, lagSec + 1);
-        if (ratio >= 0.9) return Math.max(0, lagSec - 1);
+        const discarded = Number.isFinite(discardedDelta) ? Math.max(0, discardedDelta) : 0;
+        const delivered = decodedDelta + discarded;
+        if (delivered <= 0) return Math.min(30, lagSec + 1);
+        const ratio = delivered / receivedDelta;
+        if (ratio < 0.85) return Math.min(30, lagSec + 1);
+        if (ratio >= 0.98) return Math.max(0, lagSec - 1);
+        // Marginal band (0.85-0.98): keep the current reading rather than
+        // pushing it either way, so a link sitting right at the edge does not
+        // oscillate across the 5s ABR trigger.
         return lagSec;
     }
 
@@ -546,7 +769,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function baseBufferTargetMs() {
         const config = LATENCY_MODES[currentLatencyMode] || LATENCY_MODES.balanced;
         let target = config.ms;
-        if (performance.now() < adaptiveRaiseUntil) target = Math.max(target, 350);
+        if (adaptiveRaiseLevelMs > 0) target = Math.max(target, adaptiveRaiseLevelMs);
         // The jitter floor sits above the mode and the stress raise: measured
         // network jitter is the ground truth for how late frames arrive, and
         // a target below it turns late frames into visible drops.
@@ -560,30 +783,91 @@ document.addEventListener('DOMContentLoaded', () => {
         return Math.max(baseBufferTargetMs(), accommodationTargetMs);
     }
 
-    // Apply the effective playout delay target to one receiver.
+    // Apply the effective playout delay target to one receiver. Returns true
+    // when a target was actually written, so callers can avoid latching a
+    // change that never landed.
     function applyPlayoutDelay(receiver, kind) {
-        if (!receiver) return;
+        if (!receiver) return false;
         const targetMs = currentBufferTargetMs();
         try {
             if ('jitterBufferTarget' in receiver) {
                 receiver.jitterBufferTarget = targetMs;
             } else if ('playoutDelayHint' in receiver) {
                 receiver.playoutDelayHint = targetMs / 1000;
+            } else {
+                return false;
             }
+            return true;
         } catch (err) {
             console.warn(`[WebRTC] Could not apply ${targetMs}ms playout target on ${kind} receiver:`, err);
+            return false;
         }
     }
 
     // Push the current target to every receiver. Returns true when it changed.
+    //
+    // Rate-limited on purpose. Every jitterBufferTarget write re-paces Chrome's
+    // playout: a raise above the currently-filled level makes the jitter buffer
+    // HOLD frames (a visible stall), a lower target lets late frames be
+    // discarded (visible drops). The state machines upstream of here move in
+    // 25-50ms steps, and both the jitter floor and the accommodation used to
+    // walk down one step EVERY tick — so a single jitter spike produced ~24
+    // consecutive writes over 24 seconds, and a link hovering near a threshold
+    // produced a permanent up/down churn. Read by a viewer that is "not quite
+    // smooth but nothing is obviously wrong", which is the worst symptom to
+    // diagnose. Two gates bound it:
+    //   - a hysteresis band, so a sub-BUFFER_TARGET_BAND_MS change is noise;
+    //   - a dwell, so two applied changes are never closer together than
+    //     BUFFER_TARGET_DWELL_MS — EXCEPT a genuine emergency raise while
+    //     frames are actually being dropped, which stays instant because a
+    //     bigger buffer is always the safe direction. Latency is explicitly
+    //     not a concern in this project, so the dwell is spent entirely on
+    //     never re-pacing the decoder for a cosmetic change.
+    const BUFFER_TARGET_BAND_MS = 50;
+    const BUFFER_TARGET_DWELL_MS = 3000;
+    const BUFFER_TARGET_EMERGENCY_DWELL_MS = 1200;
+    // performance.now() of the last stats tick that saw a late frame discarded.
+    // A raise requested while frames are ACTUALLY being dropped is the
+    // anti-stutter path and skips the full dwell; a raise requested by a
+    // drifting measurement with no drops is cosmetic and waits.
+    let recentDropAt = -Infinity;
     function reapplyBufferTargets() {
         if (!peerConnection) return false;
         const targetMs = currentBufferTargetMs();
-        if (targetMs === lastAppliedTargetMs) return false;
-        lastAppliedTargetMs = targetMs;
+        if (lastAppliedTargetMs === null) {
+            // First apply of a session: always grant it, no gate.
+        } else {
+            if (targetMs === lastAppliedTargetMs) return false;
+            if (Math.abs(targetMs - lastAppliedTargetMs) < BUFFER_TARGET_BAND_MS) return false;
+            const sinceLast = performance.now() - lastAppliedTargetChangeAt;
+            const urgent = targetMs > lastAppliedTargetMs
+                && performance.now() - recentDropAt < 3000;
+            const dwell = urgent ? BUFFER_TARGET_EMERGENCY_DWELL_MS : BUFFER_TARGET_DWELL_MS;
+            if (sinceLast < dwell) return false;
+        }
+        // Only the VIDEO receiver. Per the WebRTC-PC spec, for tracks
+        // synchronized with another receiver the user agent SHOULD use the
+        // LARGER of the two JitterBufferTargets for BOTH. So a 2200ms
+        // video-scale target written to the audio receiver does not stay
+        // contained: the UA is expected to reach it by decelerating playout
+        // (insertedSamplesForDeceleration), which stretches and desyncs audio,
+        // and the video target ends up pinned to the audio one. The video never
+        // benefits from a target that large, and the viewer gets A/V artifacts
+        // instead. Audio keeps the browser's own default.
+        let applied = 0;
         peerConnection.getReceivers().forEach(r => {
-            applyPlayoutDelay(r, r.track ? r.track.kind : 'media');
+            if (r.track && r.track.kind === 'video') {
+                if (applyPlayoutDelay(r, 'video')) applied += 1;
+            }
         });
+        // Latch only after a receiver actually accepted the write. Latching
+        // first meant a mid-reconnect receiver list (or a throwing setter) left
+        // the app believing it had granted a target it never did: it would never
+        // retry, the HUD would advertise a buffer the browser is not running,
+        // and every downstream decision would be regulating against a fiction.
+        if (applied === 0) return false;
+        lastAppliedTargetMs = targetMs;
+        lastAppliedTargetChangeAt = performance.now();
         console.log(`[AdaptiveBuffer] Playout target -> ${targetMs}ms` +
             ` (netJitter=${lastNetJitterMs === null ? '--' : lastNetJitterMs.toFixed(0)}ms` +
             ` loss=${lastLossPct === null ? '--' : lastLossPct.toFixed(1)}%` +
@@ -608,6 +892,17 @@ document.addEventListener('DOMContentLoaded', () => {
         // Supervision resumes the moment the tab becomes visible again — the
         // freeze watchdog applies the same rule.
         if (document.hidden) return;
+        // A viewer who paused is not a viewer under stress. RTP keeps arriving
+        // while paused, so loss and jitter keep looking "stressed" forever and
+        // the controllers that can rebuild the session start acting on it —
+        // 8 stressed seconds while paused fired a full rendition switch, and
+        // `droppedDelta > 0 || lateFrameEvidence` is permanently true while
+        // paused (packets arrive, nothing leaves the buffer), which walked
+        // jitterBufferTarget up to the 2200ms cap in 50ms steps, ~44 writes
+        // each re-pacing playout. The freeze watchdog, the stall guard and the
+        // audio meter all already honour `player.paused`; these did not. State is
+        // reset on the `play` event so resume starts from a clean, live edge.
+        if (player.paused) return;
         const config = LATENCY_MODES[currentLatencyMode] || LATENCY_MODES.balanced;
         const now = performance.now();
 
@@ -629,10 +924,12 @@ document.addEventListener('DOMContentLoaded', () => {
         } else if (abrCalm) {
             abrCalmSec += 1;
             abrBadSec = 0;
-        } else {
-            abrBadSec = 0;
-            abrCalmSec = 0;
         }
+        // No else, for the same reason as the stress/calm runs above: a
+        // half-stressed link used to reset both counters on every ambiguous
+        // tick, so abrBadSec could never reach 8 and a struggling viewer stayed
+        // on the full-bitrate rendition 2-4x longer than intended (see the
+        // tick-vs-second note on the accumulators).
 
         const abrCanSwitch = now - lastRenditionSwitchAt > 60000
             && Array.isArray(renditionPathsItems)
@@ -648,7 +945,13 @@ document.addEventListener('DOMContentLoaded', () => {
             // (full source bitrate, no sound on the native path) — a weak link
             // must be able to step down to the 3000k rendition from there too.
             const onFullBitratePath = activeStreamPath === 'live' || activeStreamPath === 'live-h264';
-            if (abrBadSec >= 8 && onFullBitratePath && !sourceIsAv1 && rendReady) {
+            // The downgrade target DECODES AV1: a browser without AV1 support
+            // (or with software-only decode) would land in an undecodable
+            // session — strictly worse than the stutter it is escaping. Those
+            // viewers keep the full-bitrate path; buffer accommodation and the
+            // stress floor still protect them from the rough link.
+            if (abrBadSec >= 8 && onFullBitratePath && !sourceIsAv1 && rendReady
+                && browserSupportsAv1() && av1DecodeSmooth !== false) {
                 switchRendition('live-av1',
                     'Your connection is struggling with the full-quality stream — '
                     + 'switched to the lighter rendition to stop frame drops.');
@@ -666,7 +969,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities
                         ? true : false,
                     av1DecodeSmooth,
-                    'preferNonTranscode'
+                    'preferNonTranscode',
+                    browserSupportsH265()
                 );
                 if (upgradeTarget && upgradeTarget !== 'live-av1') {
                     switchRendition(upgradeTarget,
@@ -705,7 +1009,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 const dpHasOpus = dpTracksUpper.includes('OPUS');
                 const dpHasAudio = dpTracksUpper.some((t) => t && !['AV1', 'H264', 'H265', 'HEVC', 'VP8', 'VP9'].includes(t));
                 if (dpHasOpus || !dpHasAudio) {
-                    hwPath = 'live';
+                    // The native path carries the SOURCE codec: a browser
+                    // without H265 receive support (chooseStreamPath routed
+                    // it onto the AV1 rendition for exactly that reason)
+                    // must not be "recovered" onto an undecodable stream —
+                    // the same wrong-target trap the ABR downgrade guard
+                    // closes. It keeps its current rendition instead.
+                    const dpSourceIsH265 = dpTracksUpper.includes('H265') || dpTracksUpper.includes('HEVC');
+                    hwPath = (dpSourceIsH265 && browserSupportsH265() === false) ? null : 'live';
                 } else {
                     const rescueReady = renditionPathsItems.some((item) => item && item.name === 'live-h264'
                         && (item.ready === true || item.online === true));
@@ -732,7 +1043,20 @@ document.addEventListener('DOMContentLoaded', () => {
         // that on every mode. The switch cooldown bounds this to at most one
         // rejoin per minute.
         const rejoinCapMs = Math.max(config.driftLimitMs + 1600, 3100);
-        if (avgPlayoutDelayMs !== null && avgPlayoutDelayMs > rejoinCapMs
+        // Count only FRESH, PERSISTENT over-cap measurements.
+        //   - `avgPlayoutDelayAt` guards freshness. avgPlayoutDelayMs is only
+        //     overwritten when windowedPlayoutDelayMs returns non-null, so on a
+        //     quiet window (publisher stall, decoder stall, a few seconds with
+        //     no emitted frames) it LATCHES at whatever the last reading was.
+        //   - Without the freshness test, "3 consecutive ticks" is satisfied by
+        //     three ticks containing ZERO new measurements, and a single stale
+        //     high reading from before a hidden-tab return is enough to force a
+        //     full WHEP teardown. That is a 2-4s hard black screen on a session
+        //     that was fine. A live measurement must be newer than the
+        //     confirmation window itself.
+        const driftReadingIsFresh = avgPlayoutDelayMs !== null
+            && now - avgPlayoutDelayAt < 3000;
+        if (driftReadingIsFresh && avgPlayoutDelayMs > rejoinCapMs
             && !isConnecting && now - lastRenditionSwitchAt > 60000) {
             rejoinDriftSec += 1;
             if (rejoinDriftSec >= 3) {
@@ -746,6 +1070,22 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         // --- Stress raise / calm restore ---
+        // A LEVEL, not a countdown. This used to be a wall-clock stamp
+        // (adaptiveRaiseUntil = now + 15000) that expired on schedule whether or
+        // not the link had recovered. On a continuously marginal link — the
+        // 20->160ms queue ramp plus ~3% loss case, simulated end to end
+        // against the extracted real functions — that produced a perfect square
+        // wave: 350ms for 15s, back to 180ms for 7s, 5 target steps per minute,
+        // FOREVER, on a link that never once went calm. Every one of those
+        // steps re-paces Chrome's playout (the spec has the UA reach a new
+        // target by accel/decel, rendering frames twice or dropping them), so a
+        // link that is merely noisy — not broken — produced a repeating
+        // hitch-and-catch-up that reads as "quality pumping". The calm restore
+        // could never help: it needs 20 CONSECUTIVE calm ticks, which that link
+        // never produces.
+        // Holding the raise as a level while the stress condition holds, and
+        // releasing it only after sustained calm, makes the response a hold
+        // instead of an oscillator.
         const stressed = (lastNetJitterMs !== null && lastNetJitterMs > 55)
             || (lastLossPct !== null && lastLossPct > 2.5);
         const calm = (lastNetJitterMs === null || lastNetJitterMs < 25)
@@ -754,30 +1094,51 @@ document.addEventListener('DOMContentLoaded', () => {
         if (stressed) {
             calmRunSec = 0;
             stressRunSec += 1;
-            if (stressRunSec >= 3 && now >= adaptiveRaiseUntil) {
-                adaptiveRaiseUntil = now + 15000;
+            if (stressRunSec >= 3) {
+                adaptiveRaiseLevelMs = ADAPTIVE_RAISE_MS;
                 if (bufferNoticeState !== 'raised') {
                     bufferNoticeState = 'raised';
                     addSystemMessage('Network jitter detected — widening the playout buffer to keep video smooth.');
                 }
-                reapplyBufferTargets();
             }
         } else if (calm) {
             stressRunSec = 0;
             calmRunSec += 1;
-            if (calmRunSec >= 20 && (adaptiveRaiseUntil !== 0 || bufferNoticeState === 'raised')) {
-                adaptiveRaiseUntil = 0;
-                calmRunSec = 0;
-                if (bufferNoticeState === 'raised') {
-                    bufferNoticeState = '';
-                    addSystemMessage(`Network is stable again — back to the ${config.label} buffer.`);
+            if (calmRunSec >= 20 && (adaptiveRaiseLevelMs !== 0 || bufferNoticeState === 'raised')) {
+                // RAMP OUT, never a single step. This level is the largest move in
+                // the system (350ms over an 180ms mode) and it was the only one
+                // with no ramp: releasing it wrote 350 -> 0 in one go, and a
+                // downward jitterBufferTarget is exactly what makes Chrome
+                // DISCARD frames to reach the new level — 170ms of frames, 5
+                // dropped at 30fps, on every stress->calm transition. The jitter
+                // floor already decays in 25ms steps and the accommodation in
+                // 50ms ones; this matches them, and the existing 50ms band plus
+                // 3s dwell space the steps out.
+                if (adaptiveRaiseLevelMs > ADAPTIVE_RAISE_STEP_MS) {
+                    adaptiveRaiseLevelMs -= ADAPTIVE_RAISE_STEP_MS;
+                    calmRunSec = 0;   // each step needs its own calm window
+                } else {
+                    adaptiveRaiseLevelMs = 0;
+                    calmRunSec = 0;
+                    if (bufferNoticeState === 'raised') {
+                        bufferNoticeState = '';
+                        addSystemMessage(`Network is stable again — back to the ${config.label} buffer.`);
+                    }
                 }
-                reapplyBufferTargets();
             }
-        } else {
-            stressRunSec = 0;
-            calmRunSec = 0;
         }
+        // No else: the dead band (jitter 25-55ms, or loss 0.8-2.5%) is neither
+        // stressed nor calm, and zeroing BOTH counters here meant a link that was
+        // stressed 2 ticks in 3 could never reach stressRunSec >= 3, so the 350ms
+        // raise never latched and the target stayed at the mode value on exactly
+        // the marginal links it exists for. The jitter floor cannot cover that
+        // case either — it is driven by `jitter` alone, and a lossy-but-not-
+        // jittery link (3% loss, 20ms jitter) reports LOW jitter, so the floor
+        // stays at 0 while the buffer never grows to contain the loss bursts.
+        // Each branch already zeroes the other counter on a genuine state
+        // change, and `stressed`/`calm` are mutually exclusive, so holding here
+        // cannot leak or deadlock: it only stops an ambiguous tick from erasing
+        // evidence.
 
         reapplyBufferTargets();
         updateBufferHud(null);
@@ -814,7 +1175,15 @@ document.addEventListener('DOMContentLoaded', () => {
         if (document.body.classList.contains('perf-mode')) return;
         let storedPerfChoice = null;
         try { storedPerfChoice = localStorage.getItem('rydius_perf_mode'); } catch (e) {}
-        if (storedPerfChoice !== null) return;   // user decided before — respect it
+        // Only an explicit ECO choice vetoes this. A stored '0' means the user
+        // once tried the toggle and left it on "Turbo GPU" — that is not a
+        // request to keep stuttering through a measured drop storm, and
+        // treating it as a veto meant a single idle click permanently disabled
+        // the relief on every future visit (the same veto also blocked the
+        // low-core heuristic below). Eco Mode only fires after getStats shows
+        // sustained real frame drops, and the toggle visibly flips, so the
+        // viewer can always turn it back off.
+        if (storedPerfChoice === '1') return;
         if (!perfToggleBtn) return;
 
         document.body.classList.add('perf-mode');
@@ -918,16 +1287,22 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
         isConnecting = true;
+        // Each connection gets one fresh STUN/TURN failure notice (see the
+        // onicecandidateerror handler below).
+        iceErrorNoticed = false;
         updateUIState('connecting');
         
-        // Arm a 16-second connection timeout watchdog to prevent an infinite
-        // connecting spinner. The budget covers the worst legitimate stack:
-        // ICE-config fetch (2.5s cap) + candidate gathering (3s cap) + WHEP
-        // POST (10s cap) = 15.5s. The old 12s watchdog could cut off a POST
-        // that was still inside its own 10s window, wasting the attempt and
-        // adding a reconnect stall — real ICE failures still tear down
-        // immediately via the connectionState 'failed' handler; this is only
-        // the no-state-change backstop.
+        // Arm a connection-timeout watchdog to prevent an infinite connecting
+        // spinner. The budget covers the worst legitimate stack: ICE-config
+        // fetch (2.5s cap) + candidate gathering (6s cap, because the window
+        // now waits for a ROUTABLE candidate so a network that blocks UDP STUN
+        // is not cut off before its srflx or TURN candidate lands) + WHEP POST
+        // (10s cap) = 18.5s, so the cap is 22s. Leaving this at 16s guaranteed
+        // the watchdog fired BEFORE the attempt could possibly finish on a slow
+        // link — the exact viewer this change was meant to help.
+        // Real ICE failures still tear down immediately via the
+        // connectionState 'failed' handler; this is only the no-state-change
+        // backstop.
         if (connectTimeout) clearTimeout(connectTimeout);
         connectTimeout = setTimeout(() => {
             if (isConnecting && !isConnected) {
@@ -935,7 +1310,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 addSystemMessage("⚠️ Connection timed out. Re-attempting handshake...");
                 handleDisconnected();
             }
-        }, 16000);
+        }, 22000);
         
         console.log("[WebRTC] Starting connection sequence...");
         
@@ -944,12 +1319,39 @@ document.addEventListener('DOMContentLoaded', () => {
             console.log("[WebRTC] Creating RTCPeerConnection (iceServers:", iceServers.length, ")...");
             peerConnection = new RTCPeerConnection({
                 iceServers: iceServers,
-                bundlePolicy: 'max-bundle',
-                // Pre-allocate a small candidate pool so the srflx gather of the
-                // NEXT connection can start early — reconnects reach the WHEP
-                // POST a few hundred milliseconds sooner on slow networks.
-                iceCandidatePoolSize: 2
+                bundlePolicy: 'max-bundle'
             });
+            // Every peer connection is a new SESSION. The media element's
+            // MediaStream is tagged with the session that built it, because a
+            // <video> renders its FIRST video track — so if a new session's
+            // tracks are appended to a stream left over from an older one, the
+            // element keeps presenting the dead track while the new session
+            // decodes happily in the background. That is exactly the reported
+            // symptom: framesDecoded climbing (the new session is fine),
+            // PACKETS LOST 0, audio fine, and RESOLUTION "--" because
+            // player.videoWidth is 0 for a track that produces nothing.
+            //
+            // It is reachable without any rendition switch at all: the freeze
+            // watchdog's Stage 2 and every graceful ICE teardown call
+            // cleanupConnection(true), which deliberately leaves the old stream
+            // on screen. The old first-track branch only replaced the stream
+            // when it was null, so on the next connect the tracks were appended
+            // to the stale one.
+            currentSessionId += 1;
+            // GENERATION TOKEN. This function has an unavoidable ~3s await on ICE
+            // gathering that cleanupConnection() cannot cancel, and it used to
+            // read the MODULE global `peerConnection` at every step. A torn-down
+            // attempt therefore kept running and then operated on whatever the
+            // global pointed at by then — i.e. the NEXT attempt's connection.
+            // Reproduced with the real extracted function: a stale continuation
+            // woke 3.0s in and tore down a *healthy* 1.9s-old pc, and a second
+            // WHEP POST went out carrying the new pc's SDP, leaving two MediaMTX
+            // reader sessions for one viewer with `whepSessionUrl` overwritten so
+            // the orphaned one could never be DELETEd. Binding the pc locally and
+            // re-checking identity after every await makes a superseded attempt
+            // a no-op instead of a saboteur.
+            const pc = peerConnection;
+            const superseded = () => peerConnection !== pc;
 
             console.log("[WebRTC] ICE config ready (iceServers:", peerConnection.getConfiguration().iceServers.length, "- host candidates, TURN relay when remote).");
 
@@ -963,7 +1365,13 @@ document.addEventListener('DOMContentLoaded', () => {
             peerConnection.ontrack = (event) => {
                 console.log("[WebRTC] Track received! Kind:", event.track.kind, "ID:", event.track.id, "Streams count:", event.streams.length);
                 
-                applyPlayoutDelay(event.receiver, event.track.kind);
+                // Video only — see reapplyBufferTargets(). A video-scale target
+                // on the audio receiver does not stay contained: the UA is
+                // expected to use the larger of two synchronized targets for
+                // both, so it stretches the audio instead.
+                if (event.track.kind === 'video') {
+                    applyPlayoutDelay(event.receiver, event.track.kind);
+                }
 
                 // Track mute/unmute listeners for freeze guard.
                 // A track 'mute' event also fires on brief publisher hiccups and short packet-loss
@@ -998,25 +1406,84 @@ document.addEventListener('DOMContentLoaded', () => {
                     };
                 }
 
-                // Initialize srcObject as a new MediaStream if it doesn't exist yet
-                if (!player.srcObject || !(player.srcObject instanceof MediaStream)) {
+                // ABR seam: this track belongs to a REPLACEMENT session, and
+                // `player.srcObject` still holds the previous (now ended) stream
+                // that cleanupConnection(true) deliberately left on screen. The
+                // add-track path below would append to it, and a video element
+                // renders its FIRST video track — so the new picture would never
+                // be shown. Swap in a fresh single-track stream instead. That is
+                // the moment the frozen last frame becomes the live picture.
+                if (switchSeamPending && event.track.kind === 'video') {
+                    const replacement = new MediaStream();
+                    // Every track this session has produced so far, NOT just this
+                    // video one. A single-track stream is the bug this replaces:
+                    // the audio track is very often delivered FIRST (ontrack for
+                    // audio precedes video on a WHEP answer), so by the time the
+                    // seam closes the audio track is already sitting in the
+                    // previous, now-stale stream. Swapping in a video-only
+                    // stream silently DROPPED the audio, and the viewer got a
+                    // picture with no sound. It is order-dependent, which is why
+                    // it presented as "sometimes video, sometimes music" rather
+                    // than as a reliable fault. Taking the tracks off the peer
+                    // connection (the same source Stage 2 uses) makes the result
+                    // identical whichever track arrives first, and a track that
+                    // has not arrived yet still appends through the branch below.
+                    peerConnection.getReceivers().forEach(r => {
+                        if (r.track) replacement.addTrack(r.track);
+                    });
+                    player.srcObject = replacement;
+                    elementStreamSessionId = currentSessionId;
+                    switchSeamPending = false;
+                    if (switchSeamTimer) { clearTimeout(switchSeamTimer); switchSeamTimer = null; }
+                    console.log(`[ABR] Seam closed: ${replacement.getTracks().length} track(s) now on screen.`);
+                } else if (elementStreamSessionId !== currentSessionId) {
+                    // The element is holding a stream from an EARLIER session
+                    // (a graceful teardown deliberately leaves the old picture in
+                    // place). Appending this session's tracks to it would leave
+                    // the dead first video track in charge of rendering, so build
+                    // a fresh one from the current receivers instead. Tracks that
+                    // have not arrived yet still append through the branch below.
+                    const fresh = new MediaStream();
+                    peerConnection.getReceivers().forEach(r => {
+                        if (r.track) fresh.addTrack(r.track);
+                    });
+                    player.srcObject = fresh;
+                    elementStreamSessionId = currentSessionId;
+                    console.log(`[WebRTC] Rebuilt player.srcObject for session ${currentSessionId} `
+                        + `(${fresh.getTracks().length} track(s)); a stale stream was on the element.`);
+                } else if (!player.srcObject || !(player.srcObject instanceof MediaStream)) {
+                    // Initialize srcObject as a new MediaStream if it doesn't exist yet
                     player.srcObject = new MediaStream();
+                    elementStreamSessionId = currentSessionId;
                     console.log("[WebRTC] Initialized player.srcObject with a new MediaStream.");
+                } else {
+                    // Add the track to the player's MediaStream if not already present
+                    const existingTracks = player.srcObject.getTracks();
+                    if (!existingTracks.find(t => t.id === event.track.id)) {
+                        player.srcObject.addTrack(event.track);
+                        console.log(`[WebRTC] Added track (${event.track.kind}) to player.srcObject.`);
+                    }
                 }
-                
-                // Add the track to the player's MediaStream if not already present
-                const existingTracks = player.srcObject.getTracks();
-                if (!existingTracks.find(t => t.id === event.track.id)) {
-                    player.srcObject.addTrack(event.track);
-                    console.log(`[WebRTC] Added track (${event.track.kind}) to player.srcObject.`);
+
+                // Explicitly play the player with autoplay-protection fallback.
+                // Two rules: never override a viewer who paused by choice, and
+                // never let a rejection from a session that no longer exists
+                // touch the CURRENT one — the old catch ran on the globals of a
+                // dead session, so a teardown between play() and its resolution
+                // left the NEXT session starting muted behind the unmute overlay.
+                if (viewerPausedByChoice) {
+                    console.log("[ABR] Replacement track received; leaving playback paused as the viewer left it.");
+                    return;
                 }
-                
-                // Explicitly play the player with autoplay-protection fallback
                 player.play().then(() => {
                     console.log(`[WebRTC] Video playback running after adding ${event.track.kind} track.`);
                     initAudioContext();
                     connectPlayerToAudioNodes();
                 }).catch(err => {
+                    if (superseded()) {
+                        console.warn("[WebRTC] play() rejected on a superseded session; not touching current state.", err);
+                        return;
+                    }
                     console.warn("[WebRTC] Playback play() promise blocked / pending user interaction:", err);
                     player.muted = true;
                     updateUIState(isConnected ? 'live' : 'connecting');
@@ -1093,47 +1560,124 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             };
 
+            // STUN/TURN failures surface only through this event — an ICE
+            // 'failed' state hides the cause. A network that blocks UDP STUN
+            // (hotel/corporate wifi) would otherwise loop connecting→offline
+            // with no explanation; naming the unreachable server turns "the
+            // stream is broken" into "this network blocks WebRTC, use the
+            // Tailscale link". Fired per candidate-gathering attempt, so it
+            // is reported once per connection.
+            peerConnection.onicecandidateerror = (event) => {
+                if (!event || !event.errorCode || iceErrorNoticed) return;
+                iceErrorNoticed = true;
+                const server = typeof event.url === 'string' && event.url ? event.url : 'the STUN/TURN server';
+                console.warn(`[WebRTC] ICE candidate error ${event.errorCode} from ${server}: ${event.errorText || 'no detail'}`);
+                addSystemMessage(`⚠️ Could not reach ${server} for WebRTC path discovery (error ${event.errorCode}). `
+                    + 'Trying the remaining candidates — if nothing connects, this network blocks WebRTC and the Tailscale link is the fallback.');
+            };
+
             // Create and set local SDP Offer
             console.log("[WebRTC] Creating SDP offer...");
-            const offer = await peerConnection.createOffer();
+            const offer = await pc.createOffer();
+            if (superseded()) {
+                console.log("[WebRTC] Offer abandoned: a newer connection superseded this one.");
+                return;
+            }
             console.log("[WebRTC] Setting local description...");
-            await peerConnection.setLocalDescription(offer);
+            await pc.setLocalDescription(offer);
+            if (superseded()) {
+                console.log("[WebRTC] setLocalDescription abandoned: a newer connection superseded this one.");
+                return;
+            }
 
             // Wait for ICE candidate gathering. MediaMTX WHEP is non-trickle (candidates must
             // ride inside the offer), so cutting gathering short can drop the browser's
             // srflx candidate and break receivers behind strict NAT. Early-exit on 'complete'
-            // keeps typical startup fast; the 3s cap only binds on very slow networks.
-            console.log("[WebRTC] Waiting up to 3s for local ICE candidate gathering...");
+            // keeps typical startup fast; the cap only binds on very slow networks.
+            //
+            // The exit condition is "a ROUTABLE candidate exists", not "3s elapsed".
+            // That distinction decides whether a hard network can ever connect. This
+            // page never calls getUserMedia, so Chrome mDNS-obfuscates its host
+            // candidates as `xxxx.local`; MediaMTX is Pion and resolves no mDNS, so an
+            // offer carrying only those has literally nothing to connect to. A fixed
+            // 3s deadline would POST that useless offer on exactly the network the
+            // code elsewhere diagnoses as "blocks UDP STUN" — where gathering may
+            // still be running and a `turns:` relay needs longer than 3s to allocate —
+            // and every retry would repeat it identically. Waiting for a non-mDNS
+            // candidate (or for gathering to complete) costs nothing on a normal link,
+            // where a host candidate appears in single-digit milliseconds.
+            const hasRoutableCandidate = () => {
+                const sdp = pc.localDescription && (pc.localDescription.value || pc.localDescription.sdp);
+                if (!sdp) return false;
+                return sdp.split('\r\n').some((line) =>
+                    line.startsWith('a=candidate:')
+                    && !/ [0-9a-f]{8}-[0-9a-f-]+\.local \d+ /i.test(line));
+            };
+            console.log("[WebRTC] Waiting up to 6s for a routable ICE candidate...");
             await new Promise((resolve) => {
                 let checkState;
-                let gatherTimeout;
+                let routablePoll = null;
+                let routableSettle = null;
+
+                const finish = (why) => {
+                    if (gatherTimeout) { clearTimeout(gatherTimeout); gatherTimeout = null; }
+                    if (routablePoll) { clearTimeout(routablePoll); routablePoll = null; }
+                    if (routableSettle) { clearTimeout(routableSettle); routableSettle = null; }
+                    pc.removeEventListener('icegatheringstatechange', checkState);
+                    console.log(`[WebRTC] Proceeding to send WHEP offer (${why}).`);
+                    resolve();
+                };
 
                 checkState = () => {
-                    if (peerConnection && peerConnection.iceGatheringState === 'complete') {
+                    if (superseded()) {
+                        console.log("[WebRTC] ICE gather aborted: a newer connection superseded this one.");
+                        finish('superseded');
+                        return;
+                    }
+                    if (pc.iceGatheringState === 'complete') {
                         console.log("[WebRTC] Local ICE gathering completed inside promise check.");
-                        if (gatherTimeout) clearTimeout(gatherTimeout);
-                        peerConnection.removeEventListener('icegatheringstatechange', checkState);
-                        resolve();
+                        finish('gathering complete');
                     }
                 };
 
-                if (peerConnection && peerConnection.iceGatheringState === 'complete') {
-                    console.log("[WebRTC] Local ICE gathering already complete.");
-                    resolve();
-                } else {
-                    peerConnection.addEventListener('icegatheringstatechange', checkState);
-                    gatherTimeout = setTimeout(() => {
-                        console.log("[WebRTC] ICE gathering window reached. Proceeding to send WHEP offer...");
-                        if (peerConnection) {
-                            peerConnection.removeEventListener('icegatheringstatechange', checkState);
-                        }
-                        resolve();
-                    }, 3000);
-                }
+                // Settle briefly after the first routable candidate so a trickle
+                // of follow-up candidates (srflx/relay) still lands in the offer.
+                const pollRoutable = () => {
+                    // A superseded session must RESOLVE, not just stop polling:
+                    // cleanupConnection() clears the gather cap, so a bare return
+                    // would leave this promise pending forever with the await in
+                    // connectStream suspended indefinitely — a session that never
+                    // posts WHEP, never errors and never times out. Resolve it
+                    // through finish() so the caller runs its own stale check.
+                    if (superseded()) { finish('superseded'); return; }
+                    if (routableSettle || gatherTimeout === null) return;
+                    if (!hasRoutableCandidate()) {
+                        routablePoll = setTimeout(pollRoutable, 100);
+                        return;
+                    }
+                    routableSettle = setTimeout(() => finish('routable candidate'), 400);
+                };
+
+                pc.addEventListener('icegatheringstatechange', checkState);
+                // ORDER MATTERS. The cap must be armed BEFORE the first
+                // pollRoutable() call: that function's guard tests
+                // `gatherTimeout === null` to know the window is still open, so
+                // priming the poll first made it return immediately and never
+                // reschedule. The routable-candidate logic was therefore dead
+                // code and this window silently degraded to "gathering complete
+                // or 6s" — which is neither what it claims to do nor the 3s cap
+                // it replaced.
+                gatherTimeout = setTimeout(() => finish('6s cap reached'), 6000);
+                pollRoutable();
             });
+            if (gatherTimeout) { clearTimeout(gatherTimeout); gatherTimeout = null; }
+            if (superseded()) {
+                console.log("[WebRTC] Gather window exited but a newer connection took over; not sending WHEP.");
+                return;
+            }
 
             // Patch local SDP Offer with high bitrate limits
-            const rawOfferSdp = peerConnection.localDescription.value || peerConnection.localDescription.sdp;
+            const rawOfferSdp = pc.localDescription.value || pc.localDescription.sdp;
             const finalOfferSdp = optimizeSdp(rawOfferSdp);
 
             console.log("[WebRTC] Sending WHEP POST to signal gateway...");
@@ -1170,6 +1714,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
             console.log("[WHEP POST Response Status]:", response.status, response.statusText);
 
+            // The POST is the longest await in this function. If the attempt was
+            // torn down while it was in flight, the answer that comes back
+            // belongs to a dead session: applying it (and recording its Location)
+            // would overwrite the live attempt's whepSessionUrl and orphan a
+            // MediaMTX reader this client can no longer DELETE.
+            if (superseded()) {
+                console.log("[WHEP POST] Answer discarded: a newer connection superseded this one.");
+                // We just made a reader on the server, so release it rather than
+                // leaking one per superseded attempt.
+                try {
+                    const staleLocation = response.headers.get('Location');
+                    if (staleLocation) {
+                        fetch(new URL(staleLocation, window.location.origin).href, { method: 'DELETE' })
+                            .catch(() => {});
+                    }
+                } catch (e) { /* best-effort */ }
+                return;
+            }
+
             if (!response.ok) {
                 const errText = await response.text();
                 throw new Error(`WHEP signaling failed (Status ${response.status}): ${errText}`);
@@ -1187,20 +1750,63 @@ document.addEventListener('DOMContentLoaded', () => {
             // Set remote SDP answer from MediaMTX
             const answerSdp = await response.text();
             console.log("[WebRTC] Received SDP answer from MediaMTX.");
-            
+
             console.log("[WebRTC] Setting remote description...");
-            await peerConnection.setRemoteDescription(new RTCSessionDescription({
+            await pc.setRemoteDescription(new RTCSessionDescription({
                 type: 'answer',
                 sdp: answerSdp
             }));
             console.log("[WebRTC] Set remote description successfully! Waiting for media packets...");
+
+            // Re-arm the connect watchdog to cover ICE ONLY, from the moment the
+            // answer is applied. The original one is armed before signaling and
+            // cleared in handleConnected, so it had to cover the whole sequence:
+            // 2.5s ICE-config fetch + 3s candidate wait + up to 10s WHEP POST =
+            // 15.5s of a 15s budget, leaving half a second for the actual ICE
+            // connection. A remote or relayed viewer — exactly the audience the
+            // tunnel serves — that would connect at 16s was torn down at 15s, and
+            // every retry repeated it identically, so it could never play. LAN
+            // viewers connect in ~50ms and never noticed, which is why this
+            // survived so long.
+            if (connectTimeout) {
+                clearTimeout(connectTimeout);
+                connectTimeout = null;
+            }
+            connectTimeout = setTimeout(() => {
+                if (isConnecting && !isConnected) {
+                    console.warn("[WebRTC] No ICE connection 15s after the SDP answer.");
+                    handleDisconnected();
+                }
+            }, 15000);
             
         } catch (error) {
             if (error && error.name === 'AbortError') {
-                // Teardown already ran (16s watchdog, freeze recovery, or ICE
-                // failure). A late answer must not be applied to the next peer
-                // connection or resurrect a session that no longer exists.
-                console.log("[WebRTC] WHEP request aborted during teardown. Ignoring stale answer.");
+                // Either a teardown already ran, or the WHEP POST outlived
+                // whepPostTimeout (10s). A late answer must not be applied to the
+                // next peer connection or resurrect a session that no longer
+                // exists.
+                console.log("[WebRTC] WHEP request aborted. Abandoning the attempt.");
+                // Only tear down if this attempt is still the current one. An
+                // abort that belongs to a SUPERSEDED session must not paint the
+                // page offline behind the newer session's live picture, and must
+                // not run cleanupConnection on its live peer connection.
+                if (superseded()) {
+                    console.log("[WebRTC] ...but this session was already superseded; leaving current state alone.");
+                    return;
+                }
+                // Do NOT simply clear isConnecting here. The 16s connectTimeout
+                // is gated on `isConnecting && !isConnected`, and only
+                // handleDisconnected() re-arms the status poll — so clearing the
+                // flag alone leaves a hung-POST attempt with no watchdog, no
+                // cleanupConnection (the PeerConnection stays open, still
+                // gathering and holding a UDP socket, and no WHEP DELETE is ever
+                // sent) and no retry. Measured: after 60s the UI is still on
+                // "connecting" with the PC open, 1 POST, 0 DELETEs and zero
+                // pending timers — permanently stuck until a manual reload.
+                // handleDisconnected clears both flags, runs the teardown, paints
+                // offline and calls schedulePoll, and is idempotent when a
+                // teardown already did the work.
+                handleDisconnected();
                 return;
             }
             console.error("[WebRTC] Error in connection sequence:", error);
@@ -1280,8 +1886,18 @@ document.addEventListener('DOMContentLoaded', () => {
         schedulePoll();
     }
 
-    // Gracefully clean up connection and send WHEP DELETE to server
-    function cleanupConnection() {
+    // Gracefully clean up connection and send WHEP DELETE to server.
+    // keepPicture=true is the ABR path: it releases every network resource but
+    // deliberately leaves `player.srcObject` attached. The old MediaStream's
+    // track is ended by the pc.close() below, so the element freezes on the
+    // LAST DECODED FRAME instead of going black, until the new pc's ontrack
+    // swaps in the new stream. Nulling srcObject here (the old behaviour) made
+    // every rendition switch a guaranteed black screen: 2-4s of it per switch
+    // against the project's own WHEP + keyframe figure, which is 120-240
+    // dropped frames at 60fps. Simulated against the real thresholds that is
+    // 21-30s of hard black per 10-minute session (3.5-5%) on any link that
+    // alternates stressed/calm — i.e. every hotspot and every tailnet.
+    function cleanupConnection(keepPicture = false) {
         console.log("[WebRTC] Cleaning up PeerConnection...");
         if (connectTimeout) {
             clearTimeout(connectTimeout);
@@ -1308,6 +1924,13 @@ document.addEventListener('DOMContentLoaded', () => {
             clearTimeout(whepPostTimeout);
             whepPostTimeout = null;
         }
+        // The ICE-gather window is the one await in connectStream() that the
+        // abort controller above cannot reach. Leaving its timer live is what
+        // kept a torn-down attempt resident for a further 3 seconds.
+        if (gatherTimeout) {
+            clearTimeout(gatherTimeout);
+            gatherTimeout = null;
+        }
 
         // Send WHEP DELETE to instantly free MediaMTX resources
         if (whepSessionUrl) {
@@ -1327,6 +1950,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 peerConnection.oniceconnectionstatechange = null;
                 peerConnection.onicegatheringstatechange = null;
                 peerConnection.onicecandidate = null;
+                // This one was the only handler missing from the teardown list.
+                // It calls addSystemMessage, so a candidate error from a
+                // gathering pass still in flight at teardown posted a chat
+                // warning AFTER the offline banner, for a session that no longer
+                // existed.
+                peerConnection.onicecandidateerror = null;
                 peerConnection.close();
             } catch (e) {
                 console.warn("[WebRTC] Error closing peer connection:", e);
@@ -1336,6 +1965,27 @@ document.addEventListener('DOMContentLoaded', () => {
         if (renditionPollInterval) {
             clearInterval(renditionPollInterval);
             renditionPollInterval = null;
+        }
+        if (keepPicture) {
+            // Leave the element alone. `clearSeamWatchdog()` in switchRendition
+            // guarantees the stale stream cannot survive if the replacement
+            // handshake never produces a track.
+            //
+            // The seam's own 12s safety net IS cancelled, though. It was the
+            // only timer cleanupConnection did not know about, so an ICE failure
+            // or grace expiry landing inside the 12s window after a switch tore
+            // everything down, painted offline, and then — 12 seconds later —
+            // had the orphan fire and reconnect on its own, flipping the page
+            // offline -> connecting -> live by itself. It also has to clear the
+            // pending flag, or the NEXT session's first ontrack would take the
+            // seam branch and swap in a stream on a teardown that never asked
+            // for a switch.
+            if (switchSeamTimer) {
+                clearTimeout(switchSeamTimer);
+                switchSeamTimer = null;
+            }
+            switchSeamPending = false;
+            return;
         }
         player.pause();
         player.srcObject = null;
@@ -1376,6 +2026,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // Adaptive rendition switch (ABR): tear the current WHEP session down and
     // reconnect to a different rendition. A brief connecting paint is honest;
     // everything else (chat, volume, latency mode) carries over.
+    //
+    // This is the single choke point for EVERY path change — ABR steps, the
+    // connected-but-black limbo rejoin, the drift rejoin and the decode-pressure
+    // hardware-path hop all come through here — so its per-switch cost is paid
+    // repeatedly on exactly the marginal links that need help most. It therefore
+    // hands the old frame to the new session instead of destroying it, and it
+    // honours a viewer who paused rather than silently resuming them.
     async function switchRendition(pathName, message) {
         if (isConnecting || !isConnected) return;
         console.log(`[ABR] Switching rendition ${activeStreamPath} -> ${pathName}`);
@@ -1387,7 +2044,38 @@ document.addEventListener('DOMContentLoaded', () => {
         playSfx('pop');
         stopFreezeWatchdog();
         stopTelemetry();
-        cleanupConnection();
+        // A paused viewer is invisible to the controllers that can rebuild the
+        // session (RTP keeps arriving while paused, so loss and jitter look
+        // "stressed" forever), but a rebuild must not override their choice.
+        const wasPaused = player.paused;
+        viewerPausedByChoice = wasPaused;
+        switchSeamPending = true;
+        cleanupConnection(true);
+        // Safety net for the seam: if the replacement handshake never yields a
+        // track, the stale (now-ended) stream would otherwise stay on screen
+        // indefinitely. 12s is far beyond the 10s WHEP cap, so this only fires
+        // on a genuine failure, and it fails LOUDLY to a real reconnect.
+        if (switchSeamTimer) clearTimeout(switchSeamTimer);
+        // `switchSeamPending` stays TRUE here. It used to be cleared two lines
+        // below this comment, in the same synchronous block — and the first
+        // `await` is ~100 lines further down, so no ontrack could ever fire in
+        // between and the whole seam was provably unreachable. Every rendition
+        // switch therefore fell through to the generic "append to the old
+        // stream" branch, which is precisely what the seam exists to prevent:
+        // cleanupConnection(true) deliberately leaves the previous (now ended)
+        // stream on screen so the picture is not lost mid-switch, and a video
+        // element renders its FIRST video track. It happened to work only
+        // because Chrome's selectVideoTracks skips ended tracks. It is also why
+        // the audio-drop fix in ontrack had no effect — that code lives inside
+        // the seam.
+        switchSeamTimer = setTimeout(() => {
+            switchSeamTimer = null;
+            console.warn("[ABR] Replacement rendition produced no track in 12s; forcing a hard reconnect.");
+            if (player.srcObject) { player.pause(); player.srcObject = null; }
+            cleanupConnection();
+            viewerPausedByChoice = false;
+            connectStream();
+        }, 12000);
         isConnected = false;
         isConnecting = false;
         updateUIState('connecting');
@@ -1406,6 +2094,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // is re-established at the live edge at once, inside it the measurement
     // feeds the accommodation (no drops, slightly higher latency).
     let rejoinCheckInFlight = false;
+    let returnDriftChecks = 0;   // Consecutive over-cap hidden-span readings (see maybeRejoinOnReturn)
     async function maybeRejoinOnReturn() {
         if (!isConnected || isConnecting || rejoinCheckInFlight || !peerConnection) return;
         rejoinCheckInFlight = true;
@@ -1427,8 +2116,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (hiddenSpanDelayMs !== null) avgPlayoutDelayMs = hiddenSpanDelayMs;
             }
             const config = LATENCY_MODES[currentLatencyMode] || LATENCY_MODES.balanced;
-            if (avgPlayoutDelayMs !== null
-                && avgPlayoutDelayMs > Math.max(config.driftLimitMs + 1600, 3100)) {
+            const capMs = Math.max(config.driftLimitMs + 1600, 3100);
+            // PERSISTENCE, exactly as the periodic supervisor requires. A single
+            // windowed reading is not enough to justify tearing a working session
+            // down: this measurement covers the whole hidden span, and the
+            // project's own live numbers put a normal Alt-Tab at 1.7-2.8s —
+            // within 300ms of the 3.1s trip point. One-shot here meant every
+            // slightly-long tab switch could end in a hard 2-5s freeze, and the
+            // 60s cooldown let it repeat. The in-loop path needs 3 consecutive
+            // bad ticks; this path now needs the same, spread over successive
+            // returns/checks, so a healthy session is never dropped for one
+            // noisy reading.
+            if (avgPlayoutDelayMs !== null && avgPlayoutDelayMs > capMs) {
+                returnDriftChecks += 1;
+            } else {
+                returnDriftChecks = 0;
+            }
+            if (returnDriftChecks >= 3) {
+                returnDriftChecks = 0;
                 lastRenditionSwitchAt = performance.now();
                 rejoinDriftSec = 0;
                 switchRendition(activeStreamPath,
@@ -1460,6 +2165,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 clearTimeout(streamActiveCheckTimeout);
                 streamActiveCheckTimeout = null;
             }
+            // The rendition-ladder poll is part of that promise: a hidden tab
+            // needs no ABR ladder, and Chrome throttles the timer to ~1/min
+            // anyway. startRenditionPathsPoll() re-arms with an immediate
+            // fresh snapshot the moment the tab returns.
+            if (renditionPollInterval) {
+                clearInterval(renditionPollInterval);
+                renditionPollInterval = null;
+            }
             stopAudioMeter();
         } else {
             console.log("[App] Tab foregrounded. Resuming polling/telemetry...");
@@ -1467,6 +2180,7 @@ document.addEventListener('DOMContentLoaded', () => {
             frozenSince = 0;
             if (isConnected) {
                 beginStatsLoop();
+                startRenditionPathsPoll();
                 startAudioMeter();
                 ensureVideoFrameCallback();
                 maybeRejoinOnReturn();
@@ -1494,6 +2208,26 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         } catch (err) {
             console.warn('[Polling] AV1 capability probe failed, assuming unsupported:', err);
+            return false;
+        }
+    }
+
+    // True when this browser can decode HEVC/H265 inside a WebRTC peer
+    // connection. Support is still rare (Safari 18+, flag-gated Chrome), and
+    // MediaMTX happily answers a WHEP handshake with an H265 stream a browser
+    // cannot decode — a black-screen session. Mirrors browserSupportsAv1.
+    function browserSupportsH265() {
+        try {
+            if (typeof RTCRtpReceiver === 'undefined' || !RTCRtpReceiver.getCapabilities) return false;
+            const caps = RTCRtpReceiver.getCapabilities('video');
+            if (!caps || !Array.isArray(caps.codecs)) return false;
+            return caps.codecs.some((c) => {
+                if (!c || typeof c.mimeType !== 'string') return false;
+                const mime = c.mimeType.toLowerCase();
+                return mime.includes('h265') || mime.includes('hevc');
+            });
+        } catch (err) {
+            console.warn('[Polling] H265 capability probe failed, assuming unsupported:', err);
             return false;
         }
     }
@@ -1543,6 +2277,13 @@ document.addEventListener('DOMContentLoaded', () => {
     //                                        smoothly on this device, else live
     //   source H264  + legacy browser     -> live
     //
+    // h265Capable (probed by the caller via RTCRtpReceiver capabilities):
+    // a browser WITHOUT H265 receive support must never be sent to the native
+    // path of an H265 source — MediaMTX would answer the handshake with a
+    // stream the decoder cannot touch (connected, black, forever). Such a
+    // viewer rides the bridge's live-av1 rendition exactly like a legacy
+    // browser on an AV1 source, waiting for it when it is still starting.
+    //
     // Audio rescue: MediaMTX serves the AAC audio of an RTMP/SRT source to
     // nobody over WebRTC, so the native path plays VIDEO-ONLY for viewers of
     // such a broadcast. When the source audio is not Opus and the bridge's
@@ -1569,7 +2310,7 @@ document.addEventListener('DOMContentLoaded', () => {
     //
     // Returns a path name, or null when the source is up but no compatible
     // rendition exists yet (codec_bridge.js is still starting).
-    function chooseStreamPath(items, av1Capable, av1Smooth = true, preference = 'auto') {
+    function chooseStreamPath(items, av1Capable, av1Smooth = true, preference = 'auto', h265Capable = true) {
         if (!Array.isArray(items)) return null;
         const source = items.find((item) => item && item.name === 'live');
         if (!source || !(source.ready === true || source.online === true)) return null;
@@ -1605,6 +2346,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 return ready('live-h264') ? 'live-h264' : null;
             }
             return ready('live-h264') ? 'live-h264' : null;
+        }
+        // H265 source + a browser without H265 receive capability: the native
+        // path is undecodable there, so route it to the AV1 rendition the
+        // bridge publishes for H265 sources (it also carries the rescued
+        // Opus audio of an RTMP/SRT broadcast), waiting when it is not up.
+        const sourceIsH265 = upperTracks.includes('H265') || upperTracks.includes('HEVC');
+        if (sourceIsH265 && h265Capable === false) {
+            return ready('live-av1') ? 'live-av1' : null;
         }
         // H264 (or other WebRTC-playable) source: when its audio cannot reach
         // WebRTC readers, the audio-rescue rendition is the only path with
@@ -1671,7 +2420,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 const chosenPath = chooseStreamPath(
                     data.items,
                     browserSupportsAv1(),
-                    await probeAv1DecodeSmooth()
+                    await probeAv1DecodeSmooth(),
+                    'auto',
+                    browserSupportsH265()
                 );
                 if (chosenPath) {
                     activeStreamPath = chosenPath;
@@ -1838,6 +2589,9 @@ document.addEventListener('DOMContentLoaded', () => {
     function startTelemetry() {
         lastBytesReceived = 0;
         lastFramesDecodedCount = 0;
+        lastFramesReceived = 0;
+        lastFramesDiscarded = 0;
+        decodeLagSec = 0;
         lastStatsTime = performance.now();
 
         // Fresh session → fresh supervision baselines (measurements from a
@@ -1852,26 +2606,54 @@ document.addEventListener('DOMContentLoaded', () => {
         stressRunSec = 0;
         calmRunSec = 0;
         rejoinDriftSec = 0;
-        adaptiveRaiseUntil = 0;
+        adaptiveRaiseLevelMs = 0;
         lastNetJitterMs = null;
         lastLossPct = null;
         avgPlayoutDelayMs = null;
+        avgPlayoutDelayAt = 0;
         lastJitterDelayTotal = 0;
         lastJitterEmittedTotal = 0;
         lastAppliedTargetMs = null;
+        lastAppliedTargetChangeAt = 0;
+        jitterFloorTick = 0;
+        stage2AttemptedThisSession = false;
+        returnDriftChecks = 0;
+        recentDropAt = -Infinity;
         bufferNoticeState = '';
         accommodationTargetMs = 0;
         accommodationCalmTicks = 0;
+        // noMediaRejoinCount is deliberately NOT reset here. It used to be, and
+        // that made the "connected-but-black" budget unreachable: the limiter
+        // calls switchRendition(), which reconnects through this very function,
+        // so the count could never exceed 1 — the cap of 3 and the
+        // "broadcast may be incompatible" notice at the 4th attempt were dead
+        // code, and a permanently black broadcast instead looped a full WHEP
+        // teardown + reconnect + a user-visible message every ~11s, forever.
+        // The budget is per-BROADCAST, not per-session: it is restored by the
+        // `decoded > 0` branch in the stats loop, so a broadcast that works
+        // (now or later) hands the budget back, which is exactly what the
+        // original per-session reset was trying to achieve.
         jitterFloorEmaMs = 0;
         abrBadSec = 0;
         abrCalmSec = 0;
-        lastRenditionSwitchAt = -60000;
+        // lastRenditionSwitchAt is deliberately NOT reset here. It is a rate limit
+        // on switch ACTIONS, not a measurement baseline. switchRendition() and
+        // maybeRejoinOnReturn() stamp it and then reconnect through this function
+        // (handleConnected -> startTelemetry), so clearing it here reopened the
+        // 60s cooldown on the very next stats tick: a link that stayed under
+        // stress could switch renditions every ~8s (abrBadSec >= 8) instead of at
+        // most once a minute — the exact reconnect storm the cooldown exists to
+        // prevent. Fresh sessions are unaffected either way, because the anchor is
+        // initialised to -60000 at declaration and an anchor from a long-gone
+        // session is already older than the cooldown.
         renditionPathsItems = null;
         lastPresentedFrames = 0;
         lastPresentedFramesAtTick = 0;
         lastPresentedTickAt = 0;
         lastRouteText = '--';
         lastRecoveryCounts = null;
+        // Never let the previous session's counters be the watchdog's baseline.
+        inboundSnapshot = null;
         if (hudRoute) hudRoute.innerText = '--';
 
         beginStatsLoop();
@@ -1893,6 +2675,16 @@ document.addEventListener('DOMContentLoaded', () => {
         dropTickPending = true;
         statsInterval = setInterval(async () => {
             if (!peerConnection || peerConnection.connectionState !== 'connected') return;
+
+            // A slow getStats() (low-end receiver under decode load — the
+            // exact viewer this session is trying to protect) must not let
+            // the next 1s tick run while this one is mid-flight: overlapping
+            // ticks both compute their deltas from the SAME baseline and
+            // double-count one window of loss/jitter/drops into the ABR,
+            // accommodation and Eco Mode state machines. Skipping a tick is
+            // free; a spurious stress spike is not.
+            if (statsTickInFlight) return;
+            statsTickInFlight = true;
 
             try {
                 const stats = await peerConnection.getStats();
@@ -1958,7 +2750,44 @@ document.addEventListener('DOMContentLoaded', () => {
                     const decoded = videoStats.framesDecoded || 0;
                     const dropped = videoStats.framesDropped || 0;
                     const received = videoStats.framesReceived || 0;
+                    // The decoder's OWN drops. This is a per-second gauge in the
+                    // spec, not a cumulative counter, so it is read as a level and
+                    // differenced against the previous level. Absent in browsers
+                    // that do not implement it, hence the 0 fallback.
+                    const discardedLevel = Number.isFinite(videoStats.framesDiscarded)
+                        ? videoStats.framesDiscarded : 0;
+                    // Publish for the freeze watchdog (one getStats walk per
+                    // second, shared) — see inboundSnapshot above.
+                    inboundSnapshot = {
+                        decoded,
+                        bytes: videoStats.bytesReceived || 0,
+                        at: performance.now()
+                    };
                     if (hudFrames) hudFrames.innerText = `${decoded} / ${dropped} (Recv:${received})`;
+
+                    // Connected-but-black limbo: the WHEP handshake and ICE
+                    // both succeeded yet no frame EVER decoded — the publisher
+                    // vanished between the status probe and the handshake, or
+                    // the offered codec cannot decode on this device. The
+                    // freeze watchdog cannot fire here (it needs bytes to flow
+                    // AND at least one decoded frame), so this state would sit
+                    // black forever. Rejoin the session, capped so a genuinely
+                    // broken broadcast cannot rejoin in an unbounded loop.
+                    if (decoded === 0 && performance.now() - connectionStartTime > 10000) {
+                        noMediaRejoinCount += 1;
+                        if (noMediaRejoinCount <= 3) {
+                            console.warn('[FreezeGuard] No video frame decoded 10s after connecting — rejoining the session.');
+                            switchRendition(activeStreamPath,
+                                'No video arrived on this session — rejoining at the live edge…');
+                            return;
+                        }
+                        if (noMediaRejoinCount === 4) {
+                            addSystemMessage('⚠️ Still no video after several rejoin attempts — this broadcast may be '
+                                + 'incompatible with this browser. Try reloading the page or another browser.');
+                        }
+                    } else if (decoded > 0) {
+                        noMediaRejoinCount = 0;
+                    }
 
                     // Sustained frame-drop pressure means decode/render is losing to
                     // everything else on the GPU; maybeAutoPerfMode() strips the
@@ -1975,6 +2804,15 @@ document.addEventListener('DOMContentLoaded', () => {
                     // ticks inside a live-edge catch-up count zero: those are
                     // the supervisor's intentional late-frame discards, not
                     // decode pressure.
+                    // This flag is read TWICE in one tick: once here to seed the
+                    // rolling drop window, and again ~100 lines below to decide
+                    // whether the accommodation controller may act. The first
+                    // read cleared it, so the second was statically always
+                    // false and the tab-return re-baseline never ran — the
+                    // guard's own comment describes the exact damage it exists
+                    // to prevent, and it was dead code. Capture the intent once
+                    // and use it for both.
+                    const rebaseThisTick = dropTickPending;
                     if (dropTickPending) {
                         dropTickPending = false;
                     } else {
@@ -2005,7 +2843,17 @@ document.addEventListener('DOMContentLoaded', () => {
                         // produce wild estimates that would pin the floor at
                         // its cap for half a minute of stepwise decay.
                         if (decoded > lastFramesDecodedCount) {
-                            jitterFloorEmaMs = jitterBufferFloorMs(lastNetJitterMs, jitterFloorEmaMs);
+                            // The floor ratchets UP on any tick (a bigger buffer
+                            // is always safe) but is only allowed to step back
+                            // down every JITTER_FLOOR_DECAY_EVERY_TICKS ticks.
+                            // Decaying 25ms every tick meant 24 consecutive
+                            // jitterBufferTarget writes after one spike.
+                            jitterFloorTick += 1;
+                            jitterFloorEmaMs = jitterBufferFloorMs(
+                                lastNetJitterMs,
+                                jitterFloorEmaMs,
+                                jitterFloorTick % JITTER_FLOOR_DECAY_EVERY_TICKS === 0
+                            );
                         }
                     }
                     if (hudJitter) {
@@ -2026,24 +2874,65 @@ document.addEventListener('DOMContentLoaded', () => {
                             lastJitterDelayTotal,
                             lastJitterEmittedTotal
                         );
-                        if (windowedDelayMs !== null) avgPlayoutDelayMs = windowedDelayMs;
+                        if (windowedDelayMs !== null) {
+                            avgPlayoutDelayMs = windowedDelayMs;
+                            // Stamped so the drift supervisor can tell a live
+                            // reading from one that has been latched through a
+                            // quiet window.
+                            avgPlayoutDelayAt = performance.now();
+                        }
+                        const emittedDelta = videoStats.jitterBufferEmittedCount - lastJitterEmittedTotal;
                         lastJitterDelayTotal = videoStats.jitterBufferDelay;
                         lastJitterEmittedTotal = videoStats.jitterBufferEmittedCount;
                         // Accommodation feeds off the measured delay but only
                         // RAISES while late frames are actually being
-                        // discarded (droppedDelta > 0) and the buffer has
-                        // outgrown the base target — the measured delay
-                        // otherwise just tracks the hint, and chasing it
-                        // inflated every session to the cap. Sustained calm
-                        // drains the extra latency back 50ms per tick.
-                        if (droppedDelta > 0) {
+                        // discarded and the buffer has outgrown the base
+                        // target. Sustained calm drains the extra latency back
+                        // 50ms per tick.
+                        //
+                        // The raise needs an INDEPENDENT late-frame signal.
+                        // windowedPlayoutDelayMs is a mean over the frames that
+                        // LEFT the jitter buffer, so late-discarded frames are
+                        // excluded from both numerator and denominator — the
+                        // mean is computed over exactly the frames that were
+                        // not late, and systematically under-reports. Gating on
+                        // it (plus a 150ms margin) made the anti-stutter path
+                        // structurally unreachable: simulated end to end, a slow
+                        // link discarding 13 frames in 60s peaked at 153ms
+                        // against a 180+150ms requirement, and the target never
+                        // moved once — the controller was blind to the exact
+                        // condition it exists to catch. `emitted < received`
+                        // counts frames that arrived but did not make it out of
+                        // the buffer, which no mean can hide.
+                        const lateFrameEvidence = Number.isFinite(videoStats.framesReceived)
+                            && Number.isFinite(emittedDelta)
+                            && (videoStats.framesReceived - lastFramesReceived) > emittedDelta;
+                        // The first tick after a (re)start — including a tab
+                        // return — spans the whole hidden span, so its drop and
+                        // delay figures are not this window's. The stats loop is
+                        // off while hidden, so using them would let every
+                        // background-tab return snap the accommodation to
+                        // ~2200ms (the code's own comment puts a hidden span at
+                        // 1.7-2.8s) and leave it inert for the rest of the
+                        // session. Re-baseline instead of acting.
+                        if (rebaseThisTick) {
                             accommodationCalmTicks = 0;
                         } else {
-                            accommodationCalmTicks += 1;
+                            if (droppedDelta > 0) {
+                                // Marks the current window as one where late
+                                // frames are genuinely being discarded, which is
+                                // what lets reapplyBufferTargets() skip its dwell
+                                // for the protective raise.
+                                recentDropAt = performance.now();
+                                accommodationCalmTicks = 0;
+                            } else {
+                                accommodationCalmTicks += 1;
+                            }
+                            accommodationTargetMs = bufferAccommodationMs(
+                                avgPlayoutDelayMs, accommodationTargetMs,
+                                baseBufferTargetMs(), droppedDelta > 0 || lateFrameEvidence,
+                                accommodationCalmTicks);
                         }
-                        accommodationTargetMs = bufferAccommodationMs(
-                            avgPlayoutDelayMs, accommodationTargetMs,
-                            baseBufferTargetMs(), droppedDelta > 0, accommodationCalmTicks);
                     }
 
                     const now = performance.now();
@@ -2062,12 +2951,14 @@ document.addEventListener('DOMContentLoaded', () => {
                     // AV1 at high resolution on a loaded machine). Sustained,
                     // it drives the supervisor's hardware-path switch.
                     const receivedDelta = received - lastFramesReceived;
+                    const discardedDelta = Math.max(0, discardedLevel - lastFramesDiscarded);
                     if (timeDiffSec > 0.5 && receivedDelta >= 15) {
-                        decodeLagSec = updateDecodeLag(decodeLagSec, decodedDiff, receivedDelta);
+                        decodeLagSec = updateDecodeLag(decodeLagSec, decodedDiff, receivedDelta, discardedDelta);
                     } else if (timeDiffSec > 0.5) {
                         decodeLagSec = decayDecodeLag(decodeLagSec);
                     }
                     lastFramesReceived = received;
+                    lastFramesDiscarded = discardedLevel;
 
                     if (lastStatsTime > 0 && timeDiffSec > 0 && bytes >= lastBytesReceived) {
                         currentMbps = Number((((bytes - lastBytesReceived) * 8) / timeDiffSec / 1_000_000).toFixed(1));
@@ -2117,6 +3008,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
             } catch (err) {
                 console.error("[WebRTC] Error reading WebRTC stats:", err);
+            } finally {
+                statsTickInFlight = false;
             }
         }, 1000);
     }
@@ -2126,6 +3019,9 @@ document.addEventListener('DOMContentLoaded', () => {
             clearInterval(statsInterval);
             statsInterval = null;
         }
+        // The freeze watchdog reads this snapshot; a stopped loop must not leave
+        // a live-looking one behind for it to keep comparing against.
+        inboundSnapshot = null;
         currentBitrateMbps = null;
         currentFrameRate = null;
         renderStreamSummary('offline');
@@ -2140,6 +3036,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 iceConnectionState: peerConnection ? peerConnection.iceConnectionState : 'null',
                 iceRoute: lastRouteText,
                 recovery: lastRecoveryCounts,
+                iceCandidateError: iceErrorNoticed ? 'STUN/TURN unreachable this session (see console)' : 'none',
+                noMediaRejoins: noMediaRejoinCount,
                 renditionPath: activeStreamPath,
                 player: {
                     paused: player.paused,
@@ -2201,7 +3099,7 @@ document.addEventListener('DOMContentLoaded', () => {
         ensureVideoFrameCallback();
 
         if (freezeCheckInterval) clearInterval(freezeCheckInterval);
-        freezeCheckInterval = setInterval(async () => {
+        freezeCheckInterval = setInterval(() => {
             // Skip all freeze detection while the user deliberately paused playback:
             // frames stop presenting and decode can suspend, which would read as a false stall.
             if (!isConnected || isRecovering || !peerConnection || player.paused || document.hidden) return;
@@ -2209,19 +3107,17 @@ document.addEventListener('DOMContentLoaded', () => {
             const now = performance.now();
             const frameStaleness = now - lastFrameTime;
 
-            let currentDecoded = 0;
-            let currentBytes = 0;
-            try {
-                const stats = await peerConnection.getStats();
-                stats.forEach(report => {
-                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                        currentDecoded = report.framesDecoded || 0;
-                        currentBytes = report.bytesReceived || 0;
-                    }
-                });
-            } catch (e) {
+            // Read the stats loop's snapshot instead of issuing a second
+            // getStats() walk of its own. A snapshot older than the staleness
+            // bound means the producing loop is not running, which is itself a
+            // fault but not a decoder stall — re-baseline and try again rather
+            // than reading a frozen reading as "bytes stopped".
+            const snapshot = inboundSnapshot;
+            if (!snapshot || now - snapshot.at > INBOUND_SNAPSHOT_MAX_AGE_MS) {
                 return;
             }
+            const currentDecoded = snapshot.decoded;
+            const currentBytes = snapshot.bytes;
 
             const decodedDelta = currentDecoded - lastDecodedFrames;
             const bytesDelta = currentBytes - lastBytesCount;
@@ -2320,7 +3216,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // STAGE 1: Playout Kick (try playing element directly)
         try {
-            await player.play();
+            // Time-bounded: on a session with no media the play() promise
+            // stays pending forever (nothing will ever reach HAVE_FUTURE_DATA),
+            // and awaiting it unconditionally would wedge recovery here with
+            // isRecovering stuck true — disabling the watchdog for good.
+            await Promise.race([
+                player.play(),
+                new Promise((resolve) => setTimeout(resolve, 1500))
+            ]).catch(() => {});
             lastFrameTime = performance.now();
             await new Promise(r => setTimeout(r, 150));
             if (player.readyState >= 3 && !player.paused) {
@@ -2334,8 +3237,21 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         // STAGE 2: Decoder Flush (re-bind tracks without breaking WHEP session)
-        if (peerConnection && peerConnection.connectionState === 'connected') {
+        // Gated, and only ONCE per session. Reassigning srcObject is not a cheap
+        // "flush": it tears down and rebuilds the whole media element pipeline
+        // (readyState -> 0, decoder reset, new renderer), so it GUARANTEES a
+        // multi-hundred-millisecond picture freeze and throws away the jitter
+        // buffer that was carefully sized for this link. Run on every watchdog
+        // trip (up to MAX_RECOVERIES) it turned a marginal link — the exact
+        // link that trips the watchdog repeatedly — into visible stutter on top
+        // of whatever it was already struggling with. It is worth attempting
+        // only when the element has genuinely lost its media, and never twice.
+        const canAttemptStage2 = !stage2AttemptedThisSession
+            && peerConnection
+            && peerConnection.connectionState === 'connected';
+        if (canAttemptStage2) {
             try {
+                stage2AttemptedThisSession = true;
                 console.log("[FreezeGuard] Attempting Stage 2 decoder flush...");
                 const videoReceivers = peerConnection.getReceivers().filter(r => r.track && r.track.kind === 'video');
                 if (videoReceivers.length > 0) {
@@ -2344,12 +3260,24 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (r.track) freshStream.addTrack(r.track);
                     });
                     player.srcObject = freshStream;
-                    await player.play();
-                    lastFrameTime = performance.now();
-                    isRecovering = false;
-                    ensureVideoFrameCallback();
-                    console.log("[FreezeGuard] Stage 2 decoder flush succeeded!");
-                    return;
+                    elementStreamSessionId = currentSessionId;
+                    // Same bound as stage 1, and the flush now has to PROVE it
+                    // restored playback — an unchecked return skipped stage 3
+                    // (the only stage that can fix a broken session) whenever
+                    // the rebind resolved without actually producing frames.
+                    await Promise.race([
+                        player.play(),
+                        new Promise((resolve) => setTimeout(resolve, 1500))
+                    ]).catch(() => {});
+                    await new Promise(r => setTimeout(r, 150));
+                    if (player.readyState >= 3 && !player.paused) {
+                        lastFrameTime = performance.now();
+                        isRecovering = false;
+                        ensureVideoFrameCallback();
+                        console.log("[FreezeGuard] Stage 2 decoder flush succeeded!");
+                        return;
+                    }
+                    console.warn("[FreezeGuard] Stage 2 flush did not restore playback, proceeding to Stage 3.");
                 }
             } catch (e) {
                 console.warn("[FreezeGuard] Stage 2 flush did not resolve, proceeding to Stage 3:", e);
@@ -2440,6 +3368,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // Every programmatic and user-driven mute/volume change fires volumechange
     // on the media element, which covers all of those entry points at once.
     player.addEventListener('volumechange', syncUnmuteOverlay);
+
+    // The level meter stops its own rAF loop when there is nothing to measure
+    // (muted, paused, disconnected) instead of spinning at display rate. These
+    // two events are every path back into a measurable state, so they re-arm it.
+    player.addEventListener('volumechange', startAudioMeter);
+    player.addEventListener('play', startAudioMeter);
+    player.addEventListener('playing', startAudioMeter);
 
     function togglePlayPause() {
         initAudioContext();
@@ -2553,7 +3488,13 @@ document.addEventListener('DOMContentLoaded', () => {
         let newVol = Math.min(1, Math.max(0, parseFloat(volumeSlider.value) + delta));
         newVol = Math.round(newVol * 20) / 20; // 5% step snap
         volumeSlider.value = newVol;
-        player.volume = newVol;
+        // setMasterGain owns player.volume on both paths (it sets 1.0 once the
+        // WebAudio graph is wired, so the element is only the multiplier
+        // before that). Writing it here too fired TWO volumechange events per
+        // wheel notch whose net effect was zero, and each fanned out to
+        // syncUnmuteOverlay (a style write + setAttribute on the overlay
+        // layered over the video) and to the audio meter — a burst of overlay
+        // style writes inside the same task as video presentation.
         setMasterGain(newVol);
         player.muted = (newVol === 0);
 
@@ -2591,19 +3532,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // A manual mode selection resets the adaptive raise and the
             // accommodation, then the button's own target applies at once.
-            adaptiveRaiseUntil = 0;
+            adaptiveRaiseLevelMs = 0;
             accommodationTargetMs = 0;
             accommodationCalmTicks = 0;
             bufferNoticeState = '';
             lastAppliedTargetMs = null;
             updateBufferHud(null);
 
-            // Apply immediately to active receivers
+            // Apply immediately to active receivers. An explicit user choice is
+            // never gated by the churn limiter — but it does stamp the dwell
+            // anchor, so the very next adaptive tick cannot immediately undo it.
             if (peerConnection) {
                 peerConnection.getReceivers().forEach(r => {
-                    applyPlayoutDelay(r, r.track ? r.track.kind : 'media');
+                    // Video receivers only — see reapplyBufferTargets().
+                    if (r.track && r.track.kind === 'video') {
+                        applyPlayoutDelay(r, 'video');
+                    }
                 });
                 lastAppliedTargetMs = currentBufferTargetMs();
+                lastAppliedTargetChangeAt = performance.now();
             }
         });
 
@@ -2733,32 +3680,59 @@ document.addEventListener('DOMContentLoaded', () => {
         stopAudioMeter();
     });
 
+    // Single place that turns Eco Mode on or off, so the manual toggle, the
+    // stored preference and the device heuristic can never disagree about the
+    // resulting class/label/pressed state.
+    function applyPerfMode(on) {
+        if (!perfToggleBtn) return;
+        document.body.classList.toggle('perf-mode', on);
+        perfToggleBtn.classList.toggle('active', on);
+        perfToggleBtn.setAttribute('aria-pressed', String(on));
+        if (perfToggleLabel) perfToggleLabel.innerText = on ? 'Eco Mode' : 'Turbo GPU';
+    }
+
     // Reduce decorative effects for a simpler, lower-motion display.
     if (perfToggleBtn) {
         perfToggleBtn.addEventListener('click', () => {
-            document.body.classList.toggle('perf-mode');
-            const isPerf = document.body.classList.contains('perf-mode');
-            perfToggleBtn.classList.toggle('active', isPerf);
-            perfToggleBtn.setAttribute('aria-pressed', String(isPerf));
-            if (perfToggleLabel) {
-                perfToggleLabel.innerText = isPerf ? 'Eco Mode' : 'Turbo GPU';
-            }
+            const isPerf = !document.body.classList.contains('perf-mode');
+            applyPerfMode(isPerf);
             // Persist the manual choice so the low-end auto heuristic never overrides it
             try { localStorage.setItem('rydius_perf_mode', isPerf ? '1' : '0'); } catch (e) {}
             addSystemMessage(isPerf ? "Eco Mode enabled (GPU optimized)" : "Turbo GPU enabled (Full visual fidelity)");
         });
 
-        // Auto-enable perf mode on low-core devices unless the user has made a manual choice:
-        // blurred ambient orbs + animated noise steal GPU from 4K60 decode and cause dropped frames.
         let storedPerfChoice = null;
         try { storedPerfChoice = localStorage.getItem('rydius_perf_mode'); } catch (e) {}
-        const cpuCores = navigator.hardwareConcurrency || 8;
-        if (storedPerfChoice === null && cpuCores <= 4 && !document.body.classList.contains('perf-mode')) {
-            document.body.classList.add('perf-mode');
-            perfToggleBtn.classList.add('active');
-            perfToggleBtn.setAttribute('aria-pressed', 'true');
-            if (perfToggleLabel) perfToggleLabel.innerText = 'Eco Mode';
-            console.log(`[UI] Low-end device detected (${cpuCores} CPU cores). Performance mode auto-enabled.`);
+
+        if (storedPerfChoice === '1' || storedPerfChoice === '0') {
+            // An EXPLICIT choice is restored verbatim, in both directions. The
+            // stored-Eco case was never restored at all (the heuristic below
+            // re-enabled it only on a <=4-core device), so a viewer who had let
+            // Eco switch itself on paid full-price compositing from page load
+            // until the first drop storm. The stored-Turbo case was worse: the
+            // guard read `!== '1'`, so an explicit "Turbo GPU" was treated as
+            // "no choice" and the heuristic below switched Eco back on, which is
+            // the exact opposite of what this block's own comment promises.
+            applyPerfMode(storedPerfChoice === '1');
+        } else {
+            // No stored choice: infer from what the device advertises.
+            // `hardwareConcurrency <= 4` alone is a poor test for the viewers
+            // this project actually has — a modern iPhone (A14 and later)
+            // reports SIX cores, so every current iPhone sailed past it and ran
+            // the full blur/blur/animated-noise stack while software-decoding
+            // or hardware-decoding a 1080p60 stream. deviceMemory is a better
+            // proxy for the phones that matter, and a coarse pointer is a decent
+            // "this is a thermally-constrained handheld" signal.
+            const cores = navigator.hardwareConcurrency || 8;
+            const memoryGb = Number(navigator.deviceMemory) || 8; // spec clamps to 0.25-8
+            const handheld = typeof matchMedia === 'function'
+                && matchMedia('(pointer: coarse)').matches;
+            const weakDevice = cores <= 4 || memoryGb <= 4 || (handheld && cores <= 6);
+            if (weakDevice && !document.body.classList.contains('perf-mode')) {
+                applyPerfMode(true);
+                console.log(`[UI] Constrained device detected (${cores} cores, ${memoryGb}GB, `
+                    + `coarse pointer: ${handheld}). Eco Mode auto-enabled before first paint cost.`);
+            }
         }
     }
 
@@ -2776,9 +3750,20 @@ document.addEventListener('DOMContentLoaded', () => {
     // cursor=pointer at getComputedStyle despite being the highest-priority
     // rule in the file, so the cursor state must not depend on :fullscreen
     // matching — this toggle covers it unconditionally.
+    //
+    // The write is guarded because it targets the ROOT element's inline style,
+    // and a root custom-property/style write is the broadest invalidation
+    // Blink offers. This runs on every qualifying mousemove (>=25px of travel,
+    // which a viewer moving a mouse generates many times per second), and
+    // outside fullscreen `hide` is always false — so the value being written
+    // was identical to the value already there, over and over. Skipping the
+    // no-op write costs nothing and removes the question entirely.
+    let lastCursorHidden = null;
     function applyCursorState() {
         const inFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
         const hide = inFs && !videoContainer.classList.contains('controls-active');
+        if (lastCursorHidden === hide) return;
+        lastCursorHidden = hide;
         document.documentElement.style.setProperty('cursor', hide ? 'none' : '', 'important');
     }
 
@@ -2802,11 +3787,21 @@ document.addEventListener('DOMContentLoaded', () => {
             controlsHideTimeout = null;
             controlsArmStreak = 0;
             const inFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+            // Never fade the bar out from UNDER a focused control. The idle state
+            // is `visibility: hidden` (so the layer leaves the render tree instead
+            // of compositing over live video every frame), and visibility:hidden
+            // also unfocuses its descendants — so a bar that faded while the
+            // volume slider held focus would silently throw keyboard focus back
+            // to <body> mid-interaction. Tab still reveals the bar (the document
+            // keydown handler re-arms it on any key), so this covers the case
+            // after focus has already landed.
+            if (videoContainer.contains(document.activeElement)) {
+                resetControlsTimer('focus-held');
+                return;
+            }
             // In fullscreen NOTHING may block the fade: a stale focus or an
-            // open HUD pinned the bar in earlier builds. Keyboard access
-            // survives because every keypress re-shows the bar for another
-            // 2.5 s; windowed mode still keeps it up while paused so the play
-            // button stays obvious. hud/focus are logged as diagnostics only.
+            // open HUD pinned the bar in earlier builds. windowed mode still
+            // keeps it up while paused so the play button stays obvious.
             if (!player.paused || inFullscreen) {
                 videoContainer.classList.remove('controls-active');
                 applyCursorState();
@@ -3042,24 +4037,53 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
+    // A reaction spawns a composited, animated layer ON TOP of the live video.
+    // Aggregate rate here is (per-viewer reaction rate x viewer count), so a
+    // hype train could put 100+ drop-shadowed layers over the picture at once
+    // — the single most reliable way to make good playback look bad. Cap the
+    // live count; the button pop and counter still fire for every reaction, so
+    // the social signal survives, only the overlay density is bounded.
+    const MAX_FLYING_EMOJI = 8;
+    let liveFlyingEmoji = 0;
+    let videoContainerWidth = 0;
+    function measureVideoContainer() {
+        videoContainerWidth = videoContainer ? (videoContainer.clientWidth || 320) : 320;
+    }
+    if (videoContainer && typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(measureVideoContainer).observe(videoContainer);
+    } else if (videoContainer) {
+        window.addEventListener('resize', measureVideoContainer);
+    }
+    measureVideoContainer();
+
     function spawnFloatingEmoji(emojiChar) {
         if (!videoContainer) return;
+        // Forced layout: clientWidth after a DOM write costs a synchronous
+        // reflow. The container only changes size on resize, so the width is
+        // measured there instead of on every reaction.
+        if (!videoContainerWidth) measureVideoContainer();
+        // Counted rather than querySelectorAll'd: this runs on a broadcast that
+        // can arrive many times a second, and a subtree query per spawn is both
+        // a needless DOM walk and a reflow trigger.
+        if (liveFlyingEmoji >= MAX_FLYING_EMOJI) return;
         const floating = document.createElement('div');
         floating.className = 'flying-emoji';
         floating.innerText = emojiChar;
-        
-        const width = videoContainer.clientWidth || 320;
+
+        const width = videoContainerWidth;
         const randomX = Math.floor(Math.random() * Math.max(40, width - 80)) + 30;
         const swayX = (Math.random() * 60 - 30).toFixed(1) + 'px';
         const swayRot = (Math.random() * 24 - 12).toFixed(1) + 'deg';
-        
+
         floating.style.left = `${randomX}px`;
         floating.style.setProperty('--sway-x', swayX);
         floating.style.setProperty('--sway-rot', swayRot);
-        
+
         videoContainer.appendChild(floating);
-        
+        liveFlyingEmoji += 1;
+
         setTimeout(() => {
+            liveFlyingEmoji = Math.max(0, liveFlyingEmoji - 1);
             if (floating.parentNode) {
                 floating.remove();
             }
@@ -3414,6 +4438,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const clientMsgId = 'm_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
         seenClientMsgIds.add(clientMsgId);
+        // Prune here too, not only on the receive path. The sender's own echoed
+        // message hits the early `return` above, so it never reaches the prune
+        // there — a viewer sending alone grew this set 1:1 with their own
+        // messages and the stated 500 cap never held.
+        if (seenClientMsgIds.size > 500) {
+            const oldest = seenClientMsgIds.values().next().value;
+            seenClientMsgIds.delete(oldest);
+        }
 
         if (activityEmpty) {
             activityEmpty.style.display = 'none';
@@ -3444,6 +4476,25 @@ document.addEventListener('DOMContentLoaded', () => {
             addSystemMessage('Network error: message may not have been delivered.');
         }
     });
+
+    // Autoscroll the log to the newest message. Reading scrollHeight immediately
+    // after appendChild is a forced SYNCHRONOUS layout: the DOM has been
+    // mutated and the next geometry read forces Blink to lay out the whole
+    // sidebar right there, on the main thread, mid-frame. One per message means
+    // a chat burst costs one full layout per message — and the reader is
+    // decoding video on the same thread. Deferring the read to the next
+    // animation frame lets a whole burst coalesce into ONE layout before the
+    // next paint, which is what the browser would have done anyway. The log
+    // already caps at 100 children, so the deferred read stays cheap.
+    let chatScrollScheduled = false;
+    function scheduleChatAutoscroll() {
+        if (chatScrollScheduled) return;
+        chatScrollScheduled = true;
+        requestAnimationFrame(() => {
+            chatScrollScheduled = false;
+            if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
+        });
+    }
 
     function addMessage(author, body, isSelf, badge = 'USER', timeStr = null) {
         const msgDiv = document.createElement('div');
@@ -3481,7 +4532,7 @@ document.addEventListener('DOMContentLoaded', () => {
         msgDiv.appendChild(bodyDiv);
 
         chatMessages.appendChild(msgDiv);
-        chatMessages.scrollTop = chatMessages.scrollHeight;
+        scheduleChatAutoscroll();
 
         // Prune older chat messages to prevent unbounded DOM memory growth
         while (chatMessages.children.length > 100) {
@@ -3499,7 +4550,7 @@ document.addEventListener('DOMContentLoaded', () => {
         
         msgDiv.appendChild(bodyDiv);
         chatMessages.appendChild(msgDiv);
-        chatMessages.scrollTop = chatMessages.scrollHeight;
+        scheduleChatAutoscroll();
 
         // Prune older messages to prevent unbounded DOM memory growth
         while (chatMessages.children.length > 100) {
@@ -3512,6 +4563,17 @@ document.addEventListener('DOMContentLoaded', () => {
         console.log("[Network] Browser reports connectivity restored. Probing stream immediately.");
         addSystemMessage("Network restored. Reconnecting...");
         reconnectAttempts = 0;
+        // A session that was limping through the outage is torn down at once:
+        // its ICE path belongs to a network that no longer exists, so waiting
+        // out the 2.5s disconnected-grace cannot self-heal anything.
+        if (isConnected && peerConnection && peerConnection.connectionState === 'disconnected') {
+            if (disconnectGraceTimer) {
+                clearTimeout(disconnectGraceTimer);
+                disconnectGraceTimer = null;
+            }
+            handleDisconnected();
+            return;
+        }
         if (!isConnected && !isConnecting) {
             if (streamActiveCheckTimeout) {
                 clearTimeout(streamActiveCheckTimeout);

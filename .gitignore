@@ -13,5 +13,8 @@ __pycache__/
 *.log
 *.err
 _e2e_*
+# Scratch dirs from manual audits — includes a real Chrome profile (Login Data,
+# Cookies, History, Preferences). Never commit.
+_audit_tmp/
 JS_CHECKS_REBUILD_NOTE.md
 repo_checkout/
