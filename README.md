@@ -107,6 +107,45 @@ A dedicated pass looked only for things that make a viewer's picture not smooth,
 - Webfonts use `display=optional`. The Google Fonts sheet is cross-origin and therefore render-blocking, so with the default `swap` the fonts arrive *after* the handshake has started playback and the swap re-metrics every header/chat/HUD string — a full relayout in the first seconds of a live stream.
 - The cursor-hide helper wrote the **root** element's inline style on every qualifying mousemove, while writing the same value it had already written (outside fullscreen `hide` is always false). It now skips the no-op write.
 
+## Fourth-pass audit — the seam was dead code, and drift cost a black screen
+
+The third pass fixed a rendition switch that blacked out for 2–4 s. That fix regressed on the very next change, in a way the existing tests could not see, and the result was worse than the bug it replaced.
+
+### Every rendition switch ended in a permanent black screen
+`switchRendition` armed the seam and *then* called `cleanupConnection(true)`:
+
+```js
+switchSeamPending = true;
+cleanupConnection(true);      // <- and this sets switchSeamPending = false
+```
+
+`cleanupConnection` **owns** the seam's lifetime — it cancels the 12 s safety net and clears the flag on every teardown path, and it must, because Stage 2 and every graceful ICE teardown run through it. So that call destroyed the flag one statement after it was set, and `if (switchSeamPending && …)` in `ontrack` was **provably unreachable on every switch**. The comment beside the code claimed the flag "stays TRUE here"; the code said otherwise. The teardown now runs first and the seam is armed after it.
+
+The consequence cascaded. The 12 s net's only success-path cancel lived *inside* that unreachable branch, so **the net fired on every switch, including perfectly healthy ones**, and when it fired it could not recover:
+
+```js
+if (player.srcObject) { player.pause(); player.srcObject = null; }
+cleanupConnection();
+connectStream();              // <- returns immediately
+```
+
+`cleanupConnection` only releases resources; it never touches `isConnected`/`isConnecting`, and `handleConnected()` had set `isConnected = true` for the replacement session. So `connectStream()` hit its own duplicate guard and did nothing. The page was left with `player.srcObject === null`, `peerConnection === null`, `isConnected === true` — and **every** recovery path is gated off by exactly that combination: the freeze watchdog needs a peer connection *and* an unpaused element, the stats loop needs a connected peer connection, rVFC needs frames, and the status poll skips while `isConnected`. A black screen only a manual reload could clear. The net now clears the flags before reconnecting, so it is a recovery rather than a self-wound-down session.
+
+Separately, that cancel sat *inside* the `if (keepPicture)` early-return, so a **full** teardown (Stage 3, `handleDisconnected`) left the orphan armed: the page painted offline and then, 12 s later, reconnected itself — offline → connecting → live, by itself. Both statements moved above the branch, because the net belongs to the *session*, not to the `keepPicture` choice.
+
+The test that was supposed to catch this could not: it scanned the text between `switchSeamPending = true;` and the first `await` for a clearing statement, and the clearing statement lives in a *different function*. Only the **order of the two calls** proves anything, so that is what is now asserted.
+
+### Drift was answered with a full session teardown
+The latency-mode table's own comment described "the stepwise catch-up drains it back at 150 ms/s". **That code did not exist** — `playbackRate` appeared nowhere in `app.js`. Drift had exactly one response: tear the WHEP session down and rebuild it. That is a 2–4 s hard black screen plus a full ICE + WHEP renegotiation to recover what is purely accumulated latency, and the dominant source of that latency is an ordinary Alt-Tab, which this project's own measurements put at **1.7–2.8 s**.
+
+Every production low-latency player (Twitch, YouTube Live, Meet) instead speeds the media element up so the jitter buffer drains itself, then returns to 1.0×. That is now implemented, and it changes the common case completely:
+
+- `catchUpPlaybackRate()` ramps `playbackRate` toward **1.08×**, 1 % per stats tick in either direction. A step change is audible as a click and a raw per-tick formula would step on every noisy reading; the ramp avoids both. At 1.08× the drain is ~80 ms/s, so **1.5 s of drift is gone in 26 s with no black frame and no renegotiation** (measured in `js_checks.js catchup-rate-drains-without-a-teardown`).
+- The gain has a deliberate **5 % floor**. A pure proportional law tends to zero as the delay approaches the dead band: simulated against the real function, a floorless curve sat at 1.01× from 330 ms down to 180 ms — 20 ms/s, a 15-second crawl to close 150 ms, and *formally never converging*, because each tick's excess is smaller than the last. The floor is what makes it terminate.
+- The hard rejoin is **kept**, as the escalation for when the drain genuinely cannot keep up, so the safety net is unchanged — it is just no longer the first thing that happens.
+- The controller **proves it works before trusting it**. If the delay has not fallen 5 s after catch-up engaged — an engine that accepts the write and ignores it, or a link too congested for 8 % to matter — it disables itself permanently for the session rather than leaving the viewer watching a permanently fast stream while the real problem goes untreated.
+- `playbackRate` is a property of the **media element**, not of the peer connection, so it survives every teardown in the file. It is reset when a new session starts and when the tab is backgrounded (where presentation is suspended and there is nothing to drain).
+
 ## Second-pass audit — bugs the first pass introduced, and more
 
 A second, deeper pass ran four parallel audits over areas the first one never touched (SDP/ICE handshake, audio, long-session stability, bridge ingest) and re-verified everything the first pass shipped. It found four regressions **in the first pass's own fixes**, all now fixed and all pinned by tests:
