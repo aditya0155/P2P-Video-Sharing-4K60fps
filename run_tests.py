@@ -987,6 +987,33 @@ class CrossFileConsistencyChecks(unittest.TestCase):
         self.assertIn("Test-LocalTcpPort {}".format(ports["webrtc"]), self.launcher)
         self.assertIn("http://127.0.0.1:{}/v3/paths/list".format(ports["api"]), self.launcher)
 
+    def test_every_mediamtx_config_disables_moq(self):
+        """MoQ binds fixed WILDCARD ports, so any config that omits it leaks.
+
+        The bundled MediaMTX ships MoQ on by default (:8892 TCP+UDP and :8893
+        UDP, wildcard on every interface). mediamtx.yml sets `moq: no`, but a
+        config that lists only the keys it cares about inherits the default -
+        which is exactly how the suite's sandboxed instance came to hold 8892
+        and collide with anything else on the machine. Pin the flag everywhere a
+        config is authored, including the literals the tests generate.
+        """
+        with self.subTest(config="mediamtx.yml"):
+            self.assertRegex(self.config, r"(?m)^moq:\s*no\s*$",
+                             "mediamtx.yml must disable MoQ (:8892/:8893 on the wildcard)")
+
+        source = read_text(Path(__file__).resolve().parent / "run_tests.py")
+        blocks = re.findall(r'"logLevel: warn\\n"[\s\S]{0,4000}?"paths:\\n"', source)
+        self.assertTrue(blocks, "expected at least one generated MediaMTX config in the suite")
+        for index, block in enumerate(blocks):
+            with self.subTest(generated_config=index):
+                self.assertIn('"moq: no\\n"', block,
+                              "a generated MediaMTX config leaves MoQ enabled and inherits "
+                              "fixed wildcard ports :8892/:8893")
+
+        e2e = read_text(ROOT / "e2e_bridge_check.py")
+        self.assertNotIn("MTX_MOQ", e2e,
+                         "the e2e sandbox must not re-enable MoQ through the environment")
+
     def test_html_assets_are_all_in_the_static_allowlist(self):
         references = re.findall(r"(?:href|src)=\"(/streaming/[^\"]+)\"", self.html)
         self.assertTrue(references, "expected at least one local asset reference in index.html")
@@ -1052,6 +1079,19 @@ class MediaMTXControlApiContractChecks(unittest.TestCase):
             "hls: no\n"
             "rtmp: no\n"
             "srt: no\n"
+            # MoQ (Media over QUIC) is ON by default in the bundled binary and
+            # binds FIXED, NON-LOOPBACK addresses (:8892 TCP/UDP and :8893 UDP,
+            # wildcard on every interface) that this config never declares. The
+            # three ports above are drawn with find_free_port(), so they cannot
+            # collide, but these inherited ones can: any other process, another
+            # test run, or a second sandbox on the box holding 8892 made
+            # MediaMTX exit at startup with
+            #   listen tcp :8892: bind: Only one usage of each socket address ...
+            # which surfaced as a real, reproducible suite failure rather than
+            # an environment quirk. It is also the only listener the test binds
+            # on 0.0.0.0 instead of loopback. The production mediamtx.yml already
+            # disables it (moq: no); the test config must say the same.
+            "moq: no\n"
             "webrtc: yes\n"
             "webrtcAddress: 127.0.0.1:{webrtc}\n"
             "webrtcLocalUDPAddress: 127.0.0.1:{media}\n"
@@ -1103,6 +1143,100 @@ class MediaMTXControlApiContractChecks(unittest.TestCase):
                 body="v=0\r\n", headers={"Content-Type": "application/sdp"},
             )
             self.assertEqual(status, 404)
+        finally:
+            stop_process(process)
+            config_path.unlink(missing_ok=True)
+
+    def test_sandboxed_mediamtx_binds_nothing_on_a_wildcard_address(self):
+        """The generated config must not inherit a fixed, non-loopback listener.
+
+        The bundled MediaMTX enables MoQ by default, binding :8892 (TCP+UDP) and
+        :8893 (UDP) on the wildcard address. Those ports are not drawn by
+        find_free_port(), so they are the one thing in this sandbox that can
+        collide with another process - and when they do, MediaMTX exits at
+        startup and the failure is reported as a broken control-API contract
+        rather than a port clash. It is also the only socket the tests open to
+        the whole network instead of loopback. Asserted here against the real
+        binary so the inherited default cannot come back unnoticed.
+        """
+        if not MEDIAMTX_PATH.is_file():
+            self.skipTest("MediaMTX binary is not installed")
+        if os.name != "nt":
+            self.skipTest("listener inspection is Windows-specific")
+
+        api_port = find_free_port()
+        webrtc_port = find_free_port()
+        media_port = find_free_port()
+        config = (
+            "logLevel: warn\n"
+            "logDestinations: [stdout]\n"
+            "api: yes\n"
+            "apiAddress: 127.0.0.1:{api}\n"
+            "rtsp: no\n"
+            "hls: no\n"
+            "rtmp: no\n"
+            "srt: no\n"
+            "moq: no\n"
+            "webrtc: yes\n"
+            "webrtcAddress: 127.0.0.1:{webrtc}\n"
+            "webrtcLocalUDPAddress: 127.0.0.1:{media}\n"
+            "webrtcLocalTCPAddress: 127.0.0.1:{media}\n"
+            "webrtcIPsFromInterfaces: no\n"
+            "webrtcAdditionalHosts: [127.0.0.1]\n"
+            "paths:\n"
+            "  live:\n"
+            "    overridePublisher: yes\n"
+        ).format(api=api_port, webrtc=webrtc_port, media=media_port)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="ascii") as handle:
+            handle.write(config)
+            config_path = Path(handle.name)
+
+        process = None
+        try:
+            process = subprocess.Popen(
+                [str(MEDIAMTX_PATH), str(config_path)],
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            payload = None
+            deadline = time.time() + 15
+            while time.time() < deadline and payload is None:
+                if process.poll() is not None:
+                    self.fail("MediaMTX exited during startup:\n{}".format(
+                        (process.communicate()[0] or b"").decode("utf-8", "replace")))
+                try:
+                    with urlopen("http://127.0.0.1:{}/v3/paths/list".format(api_port), timeout=1) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                except (URLError, OSError, ValueError):
+                    time.sleep(0.2)
+            self.assertIsNotNone(payload, "MediaMTX control API never answered on port {}".format(api_port))
+
+            # Every socket this process owns must be loopback-scoped. A wildcard
+            # (0.0.0.0 / ::) listener here is exactly the inherited MoQ default.
+            # Built by concatenation, not .format(): the script is full of
+            # PowerShell braces that .format() would try to interpret.
+            script = (
+                "$p = " + str(process.pid) + "; "
+                "$bad = @(); "
+                "Get-NetTCPConnection -State Listen -OwningProcess $p -ErrorAction SilentlyContinue "
+                "| ForEach-Object { if ($_.LocalAddress -ne '127.0.0.1') "
+                "{ $bad += ('tcp ' + $_.LocalAddress + ':' + $_.LocalPort) } }; "
+                "Get-NetUDPEndpoint -OwningProcess $p -ErrorAction SilentlyContinue "
+                "| ForEach-Object { if ($_.LocalAddress -ne '127.0.0.1') "
+                "{ $bad += ('udp ' + $_.LocalAddress + ':' + $_.LocalPort) } }; "
+                "$bad -join ','"
+            )
+            listing = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True, text=True, timeout=60,
+            )
+            offenders = [item for item in listing.stdout.strip().split(",") if item]
+            self.assertEqual(
+                offenders, [],
+                "the sandboxed MediaMTX opened non-loopback sockets: {}".format(offenders),
+            )
         finally:
             stop_process(process)
             config_path.unlink(missing_ok=True)

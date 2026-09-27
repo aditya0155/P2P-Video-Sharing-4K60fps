@@ -187,3 +187,16 @@ Recording these so they are not "fixed" later:
 - **`av1_nvenc` already defaults to 8-bit `yuv420p`** and `rc-lookahead` already 0; the default vsync does **not** duplicate or drop frames on this FLV output (75-in/75-out on a VFR source). Three plausible smoothness bugs, all absent.
 - **`tune=ull` vs `hq` vs `ll` is byte-identical** at these settings — the rate control is saturated, so the tuning profile is inert.
 - Audio gain is now **ramped, not stepped** (`setValueAtTime` moves gain within one 128-sample render quantum, so mute/unmute was a full-scale 0 dBFS click and a volume drag was 60–200 clicks/second of zipper noise).
+
+## Fourth-pass audit — inherited defaults in the test sandbox
+
+### The suite opened a wildcard listener, and could die on a port clash
+`mediamtx.yml` sets `moq: no`, but the config the suite generates for its sandboxed MediaMTX listed only the keys it cared about (api/webrtc/rtsp/rtmp/srt/hls) and let the rest fall back to the bundled binary's defaults. MoQ is **on** by default there, and its addresses are not loopback: `moqHTTP2Address: :8892`, `moqHTTP3Address: :8892`, `moqQUICAddress: :8893`.
+
+Two consequences, both verified by running the real binary on that exact config:
+- **The tests bound the wildcard address.** While the sandbox was up it held `0.0.0.0`/`::` on 8892 (TCP + UDP) and 8893 (UDP) — the only sockets in the suite not scoped to `127.0.0.1`, on a machine whose whole point is a shared hotspot LAN.
+- **The suite could fail for a reason that had nothing to do with the code.** Those three ports are fixed, unlike the three the test draws with `find_free_port()`, so anything else on the box holding 8892 made MediaMTX exit at startup. The suite surfaced that as `test_paths_api_and_whep_match_what_the_player_expects` FAIL with `listen tcp :8892: bind: Only one usage of each socket address ...` — a control-API *contract* failure manufactured by a port collision, pointing at `app.js` instead of at the sandbox. It reproduced on a clean checkout and passed on a re-run, i.e. a coin flip dressed up as a test.
+
+Both generated configs now set `moq: no`. Two tests pin it: `test_sandboxed_mediamtx_binds_nothing_on_a_wildcard_address` boots the real binary and asserts via `Get-NetTCPConnection`/`Get-NetUDPEndpoint` that it owns **no** non-loopback socket (reverting the fix reports exactly `tcp :::8892`, `udp :::8892`, `udp :::8893`), and `test_every_mediamtx_config_disables_moq` pins the flag in `mediamtx.yml` and in every config literal the suite generates.
+
+The general lesson, and the reason the second test exists: a config that only lists the keys it cares about is not a sandbox, it is an inheritance chain through whatever the binary ships as default. The production `mediamtx.yml` is the same shape and is safe **only** because it happens to spell out `moq: no`; that is now asserted rather than assumed.
