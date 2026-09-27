@@ -1,0 +1,17 @@
+# Machine-local secrets — never commit
+secrets.local.env
+*.crt
+*.key
+cloudflared_config.yml
+
+# Heavy local binaries (re-downloadable; see README one-time setup)
+ffmpeg_win/
+mediamtx_win.zip
+
+# Runtime & test artifacts
+__pycache__/
+*.log
+*.err
+_e2e_*
+JS_CHECKS_REBUILD_NOTE.md
+repo_checkout/

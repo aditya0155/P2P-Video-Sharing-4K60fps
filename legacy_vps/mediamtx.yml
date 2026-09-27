@@ -1,0 +1,62 @@
+###############################################
+# MediaMTX Configuration for 4K 60fps WebRTC
+###############################################
+
+# Log level and destination
+logLevel: info
+logDestinations: [stdout, file]
+logFile: /var/log/mediamtx.log
+
+# API for stats/metrics
+api: yes
+apiAddress: 127.0.0.1:8888
+
+# Circular buffer queue size between publisher and readers to absorb spikes
+writeQueueSize: 2048
+
+# Global timeouts for high bitrate streams
+readTimeout: 10s
+writeTimeout: 10s
+
+###############################################
+# Protocols configuration
+###############################################
+
+# Protocols toggle: RTMP enabled, others disabled for minimum resource usage
+rtsp: no
+rtmp: yes
+rtmpAddress: :1935
+hls: no
+moq: no
+
+# SRT config (Ingest from OBS)
+srt: yes
+srtAddress: :8890
+
+# WebRTC config (Egress to browsers & WHIP ingress)
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189 # WebRTC TCP candidate transport fallback for reliability
+webrtcIPsFromInterfaces: no # Do not leak local network interface IPs
+webrtcAdditionalHosts: [65.20.78.237] # Public IP advertised to browser clients
+webrtcAllowStreamPush: yes # Enable WHIP stream pushing
+webrtcHandshakeTimeout: 10s
+
+# STUN servers to assist NAT traversal for friends
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+
+###############################################
+# Paths configuration
+###############################################
+paths:
+  # 'live' path: matches the stream URL srt://...?streamid=publish:live or rtmp://.../live
+  live:
+    # Allow publisher to reconnect instantly if connection drops or OBS restarts
+    overridePublisher: yes
+    # Public viewer consumption with no reader auth (protected by access code gate)
+    publishUser:
+    publishPass:
+    readUser:
+    readPass:

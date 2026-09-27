@@ -1,0 +1,721 @@
+'use strict';
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
+
+const PORT = Number.parseInt(process.env.PORT || '3000', 10);
+const MEDIAMTX_HOST = '127.0.0.1';
+// Overridable only so local checks can point the proxy at a stub upstream;
+// production always uses MediaMTX's default signaling port 8889.
+const MEDIAMTX_PORT = Number.parseInt(process.env.MEDIAMTX_PORT || '8889', 10);
+// MediaMTX's control API (used by the player's status probe at /stream-api/v3/**)
+// listens on a separate port from WebRTC signaling.
+const MEDIAMTX_API_PORT = Number.parseInt(process.env.MEDIAMTX_API_PORT || '8888', 10);
+const STATIC_DIR = __dirname;
+const CACHE_CONTROL = 'no-store, no-cache, must-revalidate, max-age=0';
+// Static page assets are version-busted via ?v= in index.html, so browsers may
+// keep them but must revalidate (ETag) before reuse. This turns every repeat
+// page load into a ~200-byte 304 instead of a full re-download of app.js +
+// style.css, without ever serving a stale file. Proxied signaling/API
+// responses above and below keep CACHE_CONTROL (no-store): a stale path-state
+// answer would make the player wrongly believe the stream is online or offline.
+const STATIC_CACHE_CONTROL = 'no-cache, must-revalidate';
+
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+    throw new Error(`PORT must be a valid TCP port; received ${process.env.PORT}`);
+}
+
+if (!Number.isInteger(MEDIAMTX_PORT) || MEDIAMTX_PORT < 1 || MEDIAMTX_PORT > 65535) {
+    throw new Error(`MEDIAMTX_PORT must be a valid TCP port; received ${process.env.MEDIAMTX_PORT}`);
+}
+
+if (!Number.isInteger(MEDIAMTX_API_PORT) || MEDIAMTX_API_PORT < 1 || MEDIAMTX_API_PORT > 65535) {
+    throw new Error(`MEDIAMTX_API_PORT must be a valid TCP port; received ${process.env.MEDIAMTX_API_PORT}`);
+}
+
+// Cloudflare TURN relay (README: "Cloudflare Tunnel + TURN"). The API token
+// stays on this server: browsers only ever see short-lived credentials minted
+// at /stream-api/turn. When the key/token are unset (LAN or Tailscale-only
+// hosting) the endpoint answers with an empty list, so ICE behaves exactly as
+// it did before (interface host candidates, no external servers).
+const CF_TURN_KEY_ID = process.env.CF_TURN_KEY_ID || '';
+const CF_TURN_KEY_TOKEN = process.env.CF_TURN_KEY_TOKEN || '';
+// Overridable only so local checks can point the mint call at a stub upstream.
+const CF_TURN_API_BASE = process.env.CF_TURN_API_BASE || 'https://rtc.live.cloudflare.com';
+const CF_TURN_TTL_SECONDS = Number.parseInt(process.env.CF_TURN_TTL_SECONDS || '3600', 10);
+
+if (!Number.isInteger(CF_TURN_TTL_SECONDS) || CF_TURN_TTL_SECONDS < 60 || CF_TURN_TTL_SECONDS > 86400) {
+    throw new Error(`CF_TURN_TTL_SECONDS must be an integer between 60 and 86400; received ${process.env.CF_TURN_TTL_SECONDS}`);
+}
+
+// Cloudflare's public STUN (no account or credentials needed): it gives every
+// viewer a server-reflexive (public) candidate so it can hole-punch a direct
+// path to this host — the primary remote-viewing path that needs no card.
+// Verified reachable from this network (binding request answered with a public
+// mapped address). It is the only STUN server allowed anywhere in this
+// project; Google STUN was historically unreliable from here.
+const CF_STUN_ENTRY = Object.freeze({ urls: ['stun:stun.cloudflare.com:3478'] });
+
+const MIME_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8'
+};
+
+// Pool TCP connections to MediaMTX instead of opening a fresh loopback
+// connection per request. Every viewer generates a steady request flow
+// (status probe every 5s, ICE config, WHEP handshakes) — reusing warm
+// sockets removes the connect/teardown jitter from each of those round
+// trips and keeps signaling latency flat as the room grows. maxSockets is
+// left generous so a burst of simultaneous WHEP handshakes never queues.
+const MEDIAMTX_AGENT = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 64 });
+
+const STATIC_FILES = new Map([
+    ['/', 'index.html'],
+    ['/index.html', 'index.html'],
+    ['/streaming', 'index.html'],
+    ['/streaming/', 'index.html'],
+    ['/streaming/index.html', 'index.html'],
+    ['/style.css', 'style.css'],
+    ['/streaming/style.css', 'style.css'],
+    ['/app.js', 'app.js'],
+    ['/streaming/app.js', 'app.js']
+]);
+
+function setCorsHeaders(headers) {
+    headers['Access-Control-Allow-Origin'] = '*';
+    headers['Access-Control-Allow-Methods'] = 'GET, POST, PATCH, DELETE, OPTIONS';
+    headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, If-Match';
+    headers['Access-Control-Expose-Headers'] = 'Location';
+    return headers;
+}
+
+function proxyToMediaMTX(req, res, requestUrl) {
+    const targetPath = requestUrl.pathname.slice('/stream-api'.length) || '/';
+    // MediaMTX splits its HTTP surfaces: the control API (status probes) listens on
+    // MEDIAMTX_API_PORT, WebRTC/WHIP signaling on MEDIAMTX_PORT. Route by prefix so
+    // /stream-api/v3/** reaches the API.
+    const targetPort = requestUrl.pathname.startsWith('/stream-api/v3/') ? MEDIAMTX_API_PORT : MEDIAMTX_PORT;
+    const headers = { ...req.headers, host: `${MEDIAMTX_HOST}:${targetPort}` };
+    const proxyReq = http.request({
+        host: MEDIAMTX_HOST,
+        port: targetPort,
+        path: `${targetPath}${requestUrl.search}`,
+        method: req.method,
+        headers,
+        agent: MEDIAMTX_AGENT
+    }, (proxyRes) => {
+        const responseHeaders = { ...proxyRes.headers };
+        // Never let browsers cache proxied signaling/API responses — a stale path-state
+        // answer would make the player wrongly believe the stream is online or offline.
+        responseHeaders['cache-control'] = CACHE_CONTROL;
+
+        if (responseHeaders.location) {
+            try {
+                const upstreamOrigin = `http://${MEDIAMTX_HOST}:${targetPort}`;
+                const location = new URL(responseHeaders.location, upstreamOrigin);
+                if (location.origin === upstreamOrigin) {
+                    responseHeaders.location = `/stream-api${location.pathname}${location.search}${location.hash}`;
+                }
+            } catch (error) {
+                console.warn('[Proxy] Could not rewrite MediaMTX Location header:', error.message);
+            }
+        }
+
+        res.writeHead(proxyRes.statusCode, setCorsHeaders(responseHeaders));
+        proxyRes.pipe(res);
+    });
+
+    // Cap the wait on MediaMTX: a hung response would stall the player's status
+    // probe indefinitely and freeze its reconnect loop. Normal WHEP handshakes
+    // and API answers complete in well under a second (ICE gathering is capped
+    // client-side at 3s), so 30s only binds on a genuinely stuck upstream.
+    proxyReq.setTimeout(30000, () => {
+        proxyReq.destroy(new Error('no response from MediaMTX within 30s'));
+    });
+
+    proxyReq.on('error', (error) => {
+        // The viewer navigated away or aborted the probe; the socket is gone.
+        if (res.destroyed || res.writableEnded) return;
+        if (res.headersSent) {
+            // Upstream failed mid-stream: cut the partial response instead of
+            // appending an error body to already-sent bytes (which would
+            // corrupt the payload the client is downloading).
+            res.destroy();
+            return;
+        }
+        console.error(`[Proxy] MediaMTX at ${MEDIAMTX_HOST}:${targetPort} is unavailable:`, error.message);
+        res.writeHead(502, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL
+        });
+        res.end(JSON.stringify({ error: 'MediaMTX is not running. Start the host with start_host.bat.' }));
+    });
+
+    // Forward client aborts upstream. Without this, a WHEP POST abandoned by a
+    // closing tab still completes against MediaMTX and leaves a reader session
+    // forwarding video to nobody, burning upload bandwidth until it times out.
+    // On a normal completed response writableFinished is true and nothing is
+    // destroyed, so pooled sockets are never touched.
+    res.on('close', () => {
+        if (!res.writableFinished && !proxyReq.destroyed) {
+            proxyReq.destroy();
+        }
+    });
+
+    req.pipe(proxyReq);
+}
+
+// --- Cloudflare TURN credential minting ------------------------------------
+// One mint is shared by every viewer until half its TTL has elapsed, so
+// a full room costs a single Cloudflare API call per hour, not one per viewer.
+let turnMintCache = { iceServers: null, renewAt: 0, retryAt: 0 };
+
+// Mints may include STUN entries and the alternate port-53 URL (blocked by
+// browsers); only turn:/turns: URLs pass through here — the handler prepends
+// the canonical Cloudflare STUN entry itself.
+function turnOnlyIceServers(servers) {
+    if (!Array.isArray(servers)) {
+        return [];
+    }
+    return servers
+        .map((entry) => {
+            if (!entry) {
+                return null;
+            }
+            const urls = Array.isArray(entry.urls) ? entry.urls : (entry.urls ? [entry.urls] : []);
+            const kept = urls.filter((url) => typeof url === 'string'
+                && (url.startsWith('turn:') || url.startsWith('turns:'))
+                && !/:53(?:\?|$)/.test(url));
+            return kept.length ? { ...entry, urls: kept } : null;
+        })
+        .filter(Boolean);
+}
+
+async function mintTurnIceServers() {
+    if (!CF_TURN_KEY_ID || !CF_TURN_KEY_TOKEN) {
+        return [];
+    }
+    const now = Date.now();
+    if (turnMintCache.iceServers && now < turnMintCache.renewAt) {
+        return turnMintCache.iceServers;
+    }
+    if (now < turnMintCache.retryAt) {
+        return [];
+    }
+    try {
+        const response = await fetch(
+            `${CF_TURN_API_BASE}/v1/turn/keys/${encodeURIComponent(CF_TURN_KEY_ID)}/credentials/generate-ice-servers`,
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${CF_TURN_KEY_TOKEN}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ ttl: CF_TURN_TTL_SECONDS }),
+                signal: AbortSignal.timeout(4000)
+            }
+        );
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        turnMintCache.iceServers = turnOnlyIceServers(payload && payload.iceServers);
+        // Renew at half-life instead of TTL-300s: under the old schedule a
+        // mint served at the tail of its window carried only ~5 minutes of
+        // validity, while viewers cache this answer for 10 minutes (app.js) —
+        // so a reconnect could present Cloudflare with EXPIRED credentials,
+        // which kills the TURN allocation (Cloudflare FAQ: allocations are
+        // disconnected once their credentials expire). At TTL/2 every served
+        // mint keeps at least TTL/2 of validity (default 30 min vs the 10 min
+        // viewer cache), making an expired-credential reconnect impossible.
+        turnMintCache.renewAt = now + Math.max(60000, (CF_TURN_TTL_SECONDS / 2) * 1000);
+        console.log(`[TURN] Minted relay credentials (${turnMintCache.iceServers.length} TURN entries).`);
+    } catch (error) {
+        // Any failure just means "host candidates only" for the next 30s; a
+        // viewer on the LAN or in the tailnet never needs TURN to connect.
+        console.error(`[TURN] Credential mint failed (${error.message}); serving host-candidate-only ICE.`);
+        turnMintCache.retryAt = now + 30000;
+    }
+    return turnMintCache.iceServers || [];
+}
+
+function handleTurnCredentials(req, res) {
+    mintTurnIceServers().then((turnEntries) => {
+        // Cloudflare STUN is served unconditionally (free, cardless); TURN
+        // entries are appended only when CF_TURN_KEY_* credentials exist.
+        const iceServers = [CF_STUN_ENTRY, ...turnEntries];
+        const body = JSON.stringify({ iceServers });
+        res.writeHead(200, setCorsHeaders({
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL,
+            'Content-Length': Buffer.byteLength(body)
+        }));
+        if (req.method === 'HEAD') {
+            res.end();
+            return;
+        }
+        res.end(body);
+    }).catch((error) => {
+        console.error(`[TURN] Unexpected error while serving credentials: ${error.message}`);
+        res.writeHead(502, setCorsHeaders({ 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+        res.end('502 TURN credentials unavailable');
+    });
+}
+
+// --- Realtime Chat System --------------------------------------------------
+const MAX_CHAT_HISTORY = 100;
+const MAX_MESSAGE_LENGTH = 200;
+const MAX_AUTHOR_LENGTH = 30;
+const chatHistory = [];
+const chatSubscribers = new Set();
+const reactionCounts = { heart: 0, fire: 0, clap: 0, laugh: 0, thumbs: 0 };
+const chatRateLimits = new Map();
+let lastChatMessageId = 0;
+
+function isDirectLocal(req) {
+    const ip = req.socket && req.socket.remoteAddress;
+    const isLoopbackIp = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+    const hasProxyHeaders = Boolean(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']);
+    return isLoopbackIp && !hasProxyHeaders;
+}
+
+function broadcastChatEvent(eventType, data, eventId) {
+    // The SSE id: line is what EventSource replays through Last-Event-ID on a
+    // native auto-reconnect — the server already honors that header, so a
+    // viewer that blips offline mid-broadcast receives exactly the messages
+    // it missed instead of a generic history slice. Non-message events carry
+    // no id (EventSource ignores them for replay bookkeeping).
+    const payload = (eventId !== undefined ? `id: ${eventId}\n` : '')
+        + `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const sub of chatSubscribers) {
+        if (!sub.destroyed && !sub.writableEnded) {
+            try {
+                const buffered = sub.write(payload);
+                // Backpressure guard: a viewer that stops reading (dead tab,
+                // broken tunnel) would otherwise buffer unbounded memory on
+                // this process. HTTPServerResponse buffers internally, so
+                // write()===false is the only signal; one slow event is
+                // normal (socket momentarily busy), a long run of them means
+                // the consumer is gone. The 'error'/'close' handlers clean up.
+                if (!buffered) {
+                    sub._slowWrites = (sub._slowWrites || 0) + 1;
+                    if (sub._slowWrites > 64) {
+                        console.warn('[Chat] Destroying a stalled SSE subscriber after repeated backpressure.');
+                        sub.destroy();
+                        continue;
+                    }
+                } else {
+                    sub._slowWrites = 0;
+                }
+            } catch (err) {
+                console.warn('[Chat] Failed to write event to subscriber:', err.message);
+            }
+        }
+    }
+}
+
+// Connected-viewer count, derived from live SSE subscriptions (every page
+// open holds one for its whole lifetime). Broadcast on every change so the
+// header viewer counter updates in real time — until now the server only
+// sent the count once in the init event and the UI kept a permanent "—".
+function broadcastViewerCount() {
+    broadcastChatEvent('viewers', { count: chatSubscribers.size });
+}
+
+// Sweep stale rate-limit entries: the map is keyed per client IP and each
+// entry only matters for a 2s window, so without this it would grow with
+// every distinct visitor for the lifetime of the process.
+setInterval(() => {
+    const cutoff = Date.now() - 2000;
+    for (const [ip, stamps] of chatRateLimits) {
+        const kept = stamps.filter((ts) => ts > cutoff);
+        if (kept.length === 0) {
+            chatRateLimits.delete(ip);
+        } else if (kept.length !== stamps.length) {
+            chatRateLimits.set(ip, kept);
+        }
+    }
+}, 60000).unref();
+
+function readJsonBody(req, maxBytes = 16384) {
+    return new Promise((resolve, reject) => {
+        let size = 0;
+        const chunks = [];
+        req.on('data', (chunk) => {
+            size += chunk.length;
+            if (size > maxBytes) {
+                req.destroy(new Error('Payload too large'));
+                reject(new Error('Payload too large'));
+                return;
+            }
+            chunks.push(chunk);
+        });
+        req.on('end', () => {
+            try {
+                const bodyStr = Buffer.concat(chunks).toString('utf8');
+                if (!bodyStr.trim()) {
+                    resolve({});
+                    return;
+                }
+                resolve(JSON.parse(bodyStr));
+            } catch (err) {
+                reject(new Error('Invalid JSON'));
+            }
+        });
+        req.on('error', reject);
+    });
+}
+
+function handleChat(req, res, requestUrl) {
+    const subpath = requestUrl.pathname.slice('/stream-api/chat'.length);
+
+    if (subpath === '/events' || subpath === '/events/') {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+            res.writeHead(405, setCorsHeaders({
+                'Allow': 'GET, HEAD',
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL
+            }));
+            res.end('405 Method Not Allowed');
+            return;
+        }
+
+        res.writeHead(200, setCorsHeaders({
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'
+        }));
+
+        if (req.method === 'HEAD') {
+            res.end();
+            return;
+        }
+
+        const isHost = isDirectLocal(req);
+        const lastEventId = Number.parseInt(req.headers['last-event-id'] || requestUrl.searchParams.get('lastId') || '0', 10);
+        let initialHistory;
+        if (lastEventId > 0) {
+            initialHistory = chatHistory.filter((m) => m.id > lastEventId);
+        } else {
+            initialHistory = chatHistory.slice(-50);
+        }
+
+        res.write(`event: init\ndata: ${JSON.stringify({
+            isHost,
+            history: initialHistory,
+            reactionCounts,
+            subscriberCount: chatSubscribers.size + 1
+        })}\n\n`);
+
+        chatSubscribers.add(res);
+        broadcastViewerCount();
+
+        const keepAliveTimer = setInterval(() => {
+            if (res.destroyed || res.writableEnded) {
+                clearInterval(keepAliveTimer);
+                chatSubscribers.delete(res);
+                return;
+            }
+            res.write(':keepalive\n\n');
+        }, 15000);
+
+        req.on('close', () => {
+            clearInterval(keepAliveTimer);
+            if (chatSubscribers.delete(res)) {
+                broadcastViewerCount();
+            }
+        });
+        return;
+    }
+
+    if (subpath === '/messages' || subpath === '/messages/') {
+        if (req.method === 'GET' || req.method === 'HEAD') {
+            const sinceId = Number.parseInt(requestUrl.searchParams.get('since') || '0', 10);
+            const messages = sinceId > 0 ? chatHistory.filter((m) => m.id > sinceId) : chatHistory;
+            const body = JSON.stringify({ ok: true, messages });
+            res.writeHead(200, setCorsHeaders({
+                'Content-Type': 'application/json; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL,
+                'Content-Length': Buffer.byteLength(body)
+            }));
+            if (req.method === 'HEAD') {
+                res.end();
+                return;
+            }
+            res.end(body);
+            return;
+        }
+
+        if (req.method === 'POST') {
+            const clientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || 'unknown';
+            const now = Date.now();
+            const rateInfo = chatRateLimits.get(clientIp) || [];
+            const recent = rateInfo.filter((ts) => now - ts < 2000);
+            if (recent.length >= 5) {
+                res.writeHead(429, setCorsHeaders({
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL
+                }));
+                res.end(JSON.stringify({ error: 'You are sending messages too quickly. Please wait a moment.' }));
+                return;
+            }
+            recent.push(now);
+            chatRateLimits.set(clientIp, recent);
+
+            readJsonBody(req).then((data) => {
+                const rawText = typeof data.text === 'string' ? data.text.trim() : '';
+                if (!rawText) {
+                    res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                    res.end(JSON.stringify({ error: 'Message text cannot be empty' }));
+                    return;
+                }
+                if (rawText.length > MAX_MESSAGE_LENGTH) {
+                    res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                    res.end(JSON.stringify({ error: `Message exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` }));
+                    return;
+                }
+
+                let author = typeof data.author === 'string' ? data.author.trim() : 'Viewer';
+                if (!author) author = 'Viewer';
+                if (author.length > MAX_AUTHOR_LENGTH) author = author.slice(0, MAX_AUTHOR_LENGTH);
+
+                const isHost = isDirectLocal(req);
+                let badge = 'USER';
+                if (isHost && (data.badge === 'HOST' || author.toLowerCase() === 'host')) {
+                    badge = 'HOST';
+                } else if (data.badge === 'VIP') {
+                    badge = 'VIP';
+                }
+
+                const message = {
+                    id: ++lastChatMessageId,
+                    author,
+                    badge,
+                    text: rawText,
+                    time: new Date().toISOString(),
+                    clientId: typeof data.clientId === 'string' ? data.clientId : null,
+                    clientMsgId: typeof data.clientMsgId === 'string' ? data.clientMsgId : null
+                };
+
+                chatHistory.push(message);
+                if (chatHistory.length > MAX_CHAT_HISTORY) {
+                    chatHistory.shift();
+                }
+
+                // The id makes EventSource replay this exact message through
+                // Last-Event-ID after a native reconnect (see broadcastChatEvent).
+                broadcastChatEvent('message', message, message.id);
+
+                const body = JSON.stringify({ ok: true, message });
+                res.writeHead(200, setCorsHeaders({
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL,
+                    'Content-Length': Buffer.byteLength(body)
+                }));
+                res.end(body);
+            }).catch((err) => {
+                res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                res.end(JSON.stringify({ error: err.message || 'Invalid request body' }));
+            });
+            return;
+        }
+
+        res.writeHead(405, setCorsHeaders({
+            'Allow': 'GET, POST, HEAD',
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL
+        }));
+        res.end('405 Method Not Allowed');
+        return;
+    }
+
+    if (subpath === '/reactions' || subpath === '/reactions/') {
+        if (req.method === 'POST') {
+            readJsonBody(req).then((data) => {
+                const emoji = typeof data.emoji === 'string' ? data.emoji.trim() : '';
+                const validEmojis = ['heart', 'fire', 'clap', 'laugh', 'thumbs'];
+                if (!validEmojis.includes(emoji)) {
+                    res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                    res.end(JSON.stringify({ error: 'Invalid emoji reaction' }));
+                    return;
+                }
+
+                reactionCounts[emoji] = (reactionCounts[emoji] || 0) + 1;
+                broadcastChatEvent('reaction', {
+                    emoji,
+                    clientId: typeof data.clientId === 'string' ? data.clientId : null,
+                    totalCount: reactionCounts[emoji]
+                });
+
+                const body = JSON.stringify({ ok: true, count: reactionCounts[emoji] });
+                res.writeHead(200, setCorsHeaders({
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL,
+                    'Content-Length': Buffer.byteLength(body)
+                }));
+                res.end(body);
+            }).catch((err) => {
+                res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                res.end(JSON.stringify({ error: err.message || 'Invalid request body' }));
+            });
+            return;
+        }
+
+        res.writeHead(405, setCorsHeaders({
+            'Allow': 'POST',
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL
+        }));
+        res.end('405 Method Not Allowed');
+        return;
+    }
+
+    if (subpath === '/identity' || subpath === '/identity/') {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+            res.writeHead(405, setCorsHeaders({
+                'Allow': 'GET, HEAD',
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL
+            }));
+            res.end('405 Method Not Allowed');
+            return;
+        }
+        const isHost = isDirectLocal(req);
+        const body = JSON.stringify({ isHost });
+        res.writeHead(200, setCorsHeaders({
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL,
+            'Content-Length': Buffer.byteLength(body)
+        }));
+        if (req.method === 'HEAD') {
+            res.end();
+            return;
+        }
+        res.end(body);
+        return;
+    }
+
+    res.writeHead(404, setCorsHeaders({ 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+    res.end('404 Not Found');
+}
+
+const server = http.createServer((req, res) => {
+    let requestUrl;
+    try {
+        requestUrl = new URL(req.url, 'http://localhost');
+    } catch {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('400 Bad Request');
+        return;
+    }
+
+    if (requestUrl.pathname.startsWith('/stream-api/')) {
+        if (req.method === 'OPTIONS') {
+            res.writeHead(204, setCorsHeaders({ 'Cache-Control': CACHE_CONTROL }));
+            res.end();
+            return;
+        }
+        if (requestUrl.pathname === '/stream-api/turn') {
+            // Minted TURN credentials are served here instead of being proxied;
+            // MediaMTX has no such route and would answer 404.
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+                res.writeHead(405, setCorsHeaders({
+                    'Allow': 'GET, HEAD',
+                    'Content-Type': 'text/plain; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL
+                }));
+                res.end('405 Method Not Allowed');
+                return;
+            }
+            handleTurnCredentials(req, res);
+            return;
+        }
+        if (requestUrl.pathname === '/stream-api/chat' || requestUrl.pathname.startsWith('/stream-api/chat/')) {
+            handleChat(req, res, requestUrl);
+            return;
+        }
+        proxyToMediaMTX(req, res, requestUrl);
+        return;
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { Allow: 'GET, HEAD', 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('405 Method Not Allowed');
+        return;
+    }
+
+    const fileName = STATIC_FILES.get(requestUrl.pathname);
+    if (!fileName) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': CACHE_CONTROL });
+        res.end('404 Not Found');
+        return;
+    }
+
+    const filePath = path.join(STATIC_DIR, fileName);
+    fs.stat(filePath, (statError, stats) => {
+        if (statError || !stats.isFile()) {
+            res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': CACHE_CONTROL });
+            res.end('404 Not Found');
+            return;
+        }
+
+        // ETag revalidation: identical content answers 304 with no body, so
+        // repeat viewers over Tailscale skip re-downloading the page assets.
+        // Any edit changes size/mtime and therefore the ETag, so stale content
+        // can never be served from cache.
+        const etag = `W/"${stats.size}-${Math.floor(stats.mtimeMs)}"`;
+        if (req.headers['if-none-match'] === etag) {
+            res.writeHead(304, {
+                'Cache-Control': STATIC_CACHE_CONTROL,
+                'CDN-Cache-Control': 'no-store',
+                'ETag': etag,
+                'X-Content-Type-Options': 'nosniff'
+            });
+            res.end();
+            return;
+        }
+
+        res.writeHead(200, {
+            'Content-Type': MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
+            'Content-Length': stats.size,
+            'Cache-Control': STATIC_CACHE_CONTROL,
+            'CDN-Cache-Control': 'no-store',
+            'ETag': etag,
+            'X-Content-Type-Options': 'nosniff'
+        });
+        if (req.method === 'HEAD') {
+            res.end();
+            return;
+        }
+        fs.createReadStream(filePath).pipe(res);
+    });
+});
+
+// A second launcher (or any other process grabbing the port) must fail with
+// a readable reason, not a raw EADDRINUSE stack trace in the launcher window.
+server.on('error', (error) => {
+    if (error && error.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use. Stop the other site server or set PORT to a free port before starting.`);
+        process.exit(1);
+    }
+    console.error('Rydius Stream host server error:', error);
+    process.exit(1);
+});
+
+server.listen(PORT, '127.0.0.1', () => {
+    console.log('Rydius Stream host is running on this laptop.');
+    console.log(`Local page:    http://127.0.0.1:${PORT}/streaming/`);
+    console.log(`WebRTC signal: http://127.0.0.1:${MEDIAMTX_PORT} (proxied at /stream-api/**)`);
+    console.log(`MediaMTX API:  http://127.0.0.1:${MEDIAMTX_API_PORT} (proxied at /stream-api/v3/**)`);
+    if (CF_TURN_KEY_ID && CF_TURN_KEY_TOKEN) {
+        console.log(`TURN relay: Cloudflare credentials minted at /stream-api/turn (TTL ${CF_TURN_TTL_SECONDS}s).`);
+    } else {
+        console.log('TURN relay: not configured — remote viewers use free Cloudflare STUN punch-through. Set CF_TURN_KEY_ID/CF_TURN_KEY_TOKEN to add a relay fallback.');
+    }
+    console.log('Remote viewers: share https://stream.rydius.in once setup_cloudflared.ps1 has been run (the Tailscale URL also still works).');
+    console.log('Keep this window open while streaming.');
+});
