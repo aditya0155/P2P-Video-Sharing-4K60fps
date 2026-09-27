@@ -1398,6 +1398,31 @@ class ChatFeatureChecks(_SiteUnderTest):
         self.assertIn(b"Hello stream viewers!", b_msg_event)
         conn_b.close()
 
+    def test_reactions_are_rate_limited_per_ip(self):
+        self.start_site()
+        codes = []
+        for _ in range(12):
+            status, _, body = http_request(
+                self.port,
+                "POST",
+                "/stream-api/chat/reactions",
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"emoji": "fire", "clientId": "client-a"}),
+            )
+            codes.append(status)
+        self.assertIn(200, codes, "the first reactions must succeed")
+        self.assertIn(429, codes, "reactions past the per-IP budget must be rejected")
+        # Rejections are JSON with a friendly message, not a stack trace.
+        status, _, body = http_request(
+            self.port,
+            "POST",
+            "/stream-api/chat/reactions",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"emoji": "fire", "clientId": "client-a"}),
+        )
+        self.assertEqual(status, 429)
+        self.assertIn(b"slow down", body)
+
     def test_chat_history_and_validation(self):
         self.start_site()
         # Empty message should be rejected

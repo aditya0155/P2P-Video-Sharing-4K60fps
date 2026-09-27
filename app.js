@@ -696,7 +696,21 @@ document.addEventListener('DOMContentLoaded', () => {
                     && (item.ready === true || item.online === true));
                 hwPath = h264Ready ? 'live-h264' : null;
             } else if (!dpSourceIsAv1 && activeStreamPath === 'live-av1') {
-                hwPath = 'live';
+                // A viewer of a non-Opus (RTMP/SRT AAC) source must not be
+                // "recovered" onto the muted native path: prefer the
+                // audio-rescue video-copy rendition (full quality + sound)
+                // when it is ready, and only fall back to 'live' when the
+                // source audio already reaches WebRTC readers.
+                const dpTracksUpper = dpTracks.map((t) => typeof t === 'string' ? t.toUpperCase() : '');
+                const dpHasOpus = dpTracksUpper.includes('OPUS');
+                const dpHasAudio = dpTracksUpper.some((t) => t && !['AV1', 'H264', 'H265', 'HEVC', 'VP8', 'VP9'].includes(t));
+                if (dpHasOpus || !dpHasAudio) {
+                    hwPath = 'live';
+                } else {
+                    const rescueReady = renditionPathsItems.some((item) => item && item.name === 'live-h264'
+                        && (item.ready === true || item.online === true));
+                    hwPath = rescueReady ? 'live-h264' : null;
+                }
             }
             if (hwPath && hwPath !== activeStreamPath) {
                 decodeLagSec = 0;

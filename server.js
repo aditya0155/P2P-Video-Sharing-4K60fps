@@ -14,6 +14,7 @@ const MEDIAMTX_PORT = Number.parseInt(process.env.MEDIAMTX_PORT || '8889', 10);
 // listens on a separate port from WebRTC signaling.
 const MEDIAMTX_API_PORT = Number.parseInt(process.env.MEDIAMTX_API_PORT || '8888', 10);
 const STATIC_DIR = __dirname;
+
 const CACHE_CONTROL = 'no-store, no-cache, must-revalidate, max-age=0';
 // Static page assets are version-busted via ?v= in index.html, so browsers may
 // keep them but must revalidate (ETag) before reuse. This turns every repeat
@@ -273,6 +274,7 @@ const chatHistory = [];
 const chatSubscribers = new Set();
 const reactionCounts = { heart: 0, fire: 0, clap: 0, laugh: 0, thumbs: 0 };
 const chatRateLimits = new Map();
+const reactionRateLimits = new Map();
 let lastChatMessageId = 0;
 
 function isDirectLocal(req) {
@@ -336,6 +338,14 @@ setInterval(() => {
             chatRateLimits.delete(ip);
         } else if (kept.length !== stamps.length) {
             chatRateLimits.set(ip, kept);
+        }
+    }
+    for (const [ip, stamps] of reactionRateLimits) {
+        const kept = stamps.filter((ts) => ts > cutoff);
+        if (kept.length === 0) {
+            reactionRateLimits.delete(ip);
+        } else if (kept.length !== stamps.length) {
+            reactionRateLimits.set(ip, kept);
         }
     }
 }, 60000).unref();
@@ -535,6 +545,19 @@ function handleChat(req, res, requestUrl) {
 
     if (subpath === '/reactions' || subpath === '/reactions/') {
         if (req.method === 'POST') {
+            // Reactions are cheap but broadcast to every viewer; unbounded,
+            // one rogue client floods every screen with emoji animations.
+            const reactionIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || 'unknown';
+            const nowMs = Date.now();
+            const reactionStamps = (reactionRateLimits.get(reactionIp) || []).filter((ts) => nowMs - ts < 2000);
+            if (reactionStamps.length >= 10) {
+                res.writeHead(429, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                res.end(JSON.stringify({ error: 'Too many reactions — slow down a little.' }));
+                return;
+            }
+            reactionStamps.push(nowMs);
+            reactionRateLimits.set(reactionIp, reactionStamps);
+
             readJsonBody(req).then((data) => {
                 const emoji = typeof data.emoji === 'string' ? data.emoji.trim() : '';
                 const validEmojis = ['heart', 'fire', 'clap', 'laugh', 'thumbs'];
@@ -704,6 +727,20 @@ server.on('error', (error) => {
     }
     console.error('Rydius Stream host server error:', error);
     process.exit(1);
+});
+
+// Long-lived-host resilience: a single stray rejected promise (a socket write
+// racing a client disconnect, a half-closed SSE stream) would otherwise kill
+// the whole process mid-broadcast — Node's default for unhandled rejections
+// is exit. The per-request handlers above already contain the expected
+// failure modes; these two are the last line of defense, so the stream and
+// chat keep serving whatever happens. Logged loudly: anything reaching here
+// is a bug that should be fixed, not suppressed silently.
+process.on('unhandledRejection', (reason) => {
+    console.error('[Resilience] Unhandled rejection (host kept alive):', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[Resilience] Uncaught exception (host kept alive):', err);
 });
 
 server.listen(PORT, '127.0.0.1', () => {
