@@ -3017,7 +3017,15 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         down — so no ontrack could ever fire in between and the whole seam was
         provably unreachable. Every rendition switch silently fell through to
         appending to the stale stream, which is what the seam exists to prevent
-        (and is why the audio-drop fix inside it had no effect at all)."""
+        (and is why the audio-drop fix inside it had no effect at all).
+
+        The same failure recurred with the clear in a DIFFERENT function: the
+        flag was armed, then `cleanupConnection(true)` was called on the very
+        next line, and cleanupConnection's own unconditional seam reset cleared
+        it again. Scanning only the text between the arm and the first `await`
+        cannot see that, so the original form of this test was a false negative
+        — it passed against code where the seam was dead. The call to
+        cleanupConnection now has to be accounted for explicitly."""
         code = self._strip_comments(self.app, "js")
         start = code.find("switchSeamPending = true;")
         self.assertGreater(start, 0, "the seam is never armed")
@@ -3026,6 +3034,22 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         between = code[start:end]
         self.assertNotIn("switchSeamPending = false", between,
                          "clearing the flag before the first await makes the seam dead code")
+
+        # The teardown that runs between arming and the first await must not be
+        # able to clear the flag. cleanupConnection resets it unconditionally
+        # (that is what disarms the orphan on a hard teardown), so arming has to
+        # happen AFTER the call.
+        window = code[max(0, start - 1200):start]
+        self.assertIn("cleanupConnection(true)", window,
+                      "switchRendition must still tear the old session down")
+        arm = code.rfind("switchSeamPending = true;", 0, start + 40)
+        teardown = code.rfind("cleanupConnection(true)", 0, start)
+        self.assertGreater(teardown, -1, "the keepPicture teardown call was not found")
+        self.assertGreater(arm, teardown,
+                           "switchSeamPending must be armed AFTER cleanupConnection(true): "
+                           "teardown clears the seam state unconditionally, so arming "
+                           "before it leaves the flag false at ontrack and the 12s "
+                           "safety net armed but never cancelled on every switch")
 
     def test_seam_safety_timer_is_cancelled_by_teardown(self):
         """cleanupConnection did not know about the seam's 12s safety net, so an
@@ -3296,8 +3320,21 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertNotIn("offsetWidth", helper,
                          "the restart helper must not force a layout")
         self.assertIn("getAnimations", helper,
-                      "the restart must cancel the running animation instead of "
+                      "the restart must address the running animation instead of "
                       "flushing layout")
+        # REPLAY, not just "no forced layout". Cancelling a CSS animation does
+        # not restart it: the class stays applied, so the computed animation-name
+        # never changes and the engine never re-creates it. Verified in Chrome
+        # against this exact stylesheet — cancel+add animated the FIRST reaction
+        # only, and the button's `forwards` fill made cancel() actively kill a
+        # finished animation. Seeking currentTime back to 0 is what replays it,
+        # and both animations need a fill-mode so a finished one still exists in
+        # getAnimations() to be seeked.
+        self.assertNotIn(".cancel()", helper,
+                         "cancel() removes the animation without replaying it; "
+                         "seek currentTime to 0 instead")
+        self.assertIn("currentTime = 0", helper,
+                      "the restart must seek the animation back to its start")
         # The animation name is not always the class name (btn-popping vs
         # emoji-btn-pop), so it has to be passed explicitly rather than derived.
         self.assertIn("'btn-popping', 'emoji-btn-pop'", code,
@@ -3316,6 +3353,31 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertNotIn("!important", rule,
                          "the old static !important styles are what made this "
                          "unreplayable; they belong in the keyframes now")
+        # A fill-mode is REQUIRED, not cosmetic: without it the finished
+        # animation is dropped from getAnimations(), so there is nothing left to
+        # seek on the second reaction onward and the bump plays exactly once.
+        self.assertRegex(rule, r"animation:[^;]*\bforwards\b",
+                         "count-bump needs fill-mode:forwards so a finished "
+                         "animation still exists in getAnimations() to be replayed")
+        pop_rule = self._css_rule(css, ".emoji-btn.btn-popping")
+        self.assertIsNotNone(pop_rule, ".emoji-btn.btn-popping rule not found")
+        self.assertRegex(pop_rule, r"animation:[^;]*\bforwards\b",
+                         "the button pop needs fill-mode:forwards for the same reason")
+        # A filled animation outranks every normal author declaration, so a 100%
+        # frame that restates `transform: scale(1)` would win over `.emoji-btn:hover`
+        # and `:active` for the rest of the page's life — the buttons would lose
+        # their hover lift and press feedback after the viewer's first reaction.
+        # Measured in Chrome: computed transform stayed matrix(1,0,0,1,0,0) on
+        # every reaction afterwards. The 100% frame must therefore declare no
+        # transform at all, letting the cascade decide the resting state.
+        keyframes = re.search(r"@keyframes\s+emoji-btn-pop\s*\{(.*?)\n\}", css, re.DOTALL)
+        self.assertIsNotNone(keyframes, "the emoji-btn-pop keyframes were not found")
+        final = re.search(r"100%\s*\{([^}]*)\}", keyframes.group(1))
+        self.assertIsNotNone(final, "the pop keyframes have no 100% frame")
+        self.assertNotIn("transform", final.group(1),
+                         "the 100% frame must not declare a transform: a filled "
+                         "animation outranks :hover/:active and would pin the "
+                         "button to its resting transform permanently")
         # No removal timer should be left behind for the bump.
         self.assertNotIn("classList.remove('count-bump')", code,
                          "the bump ends at its natural state, so it needs no timer")

@@ -1005,10 +1005,17 @@ body.perf-mode .action-feedback {
     /* The transition on .emoji-count covers the same three properties, and a
        running CSS animation outranks a transition for the properties it
        covers — but the two together mean the element carries two timers for
-       one visual change. Suppressing the transition while the bump is applied
-       leaves the keyframes in sole control. */
+       one visual change. Suppressing the transition while the class is
+       applied leaves the keyframes in sole control. The class is never
+       removed (the keyframes end at the natural state, and it must stay
+       applied for restartCssAnimation to seek it), so this suppression is
+       permanent rather than scoped to the animation. */
     transition: none;
-    animation: count-bump 0.32s ease;
+    /* `forwards` is REQUIRED, not cosmetic. Without a fill-mode the finished
+       animation is dropped from getAnimations(), so restartCssAnimation would
+       have nothing to seek on the second reaction onward and the bump would
+       play exactly once per session. */
+    animation: count-bump 0.32s ease forwards;
 }
 
 /* Floating Particle from Button */
@@ -1488,17 +1495,39 @@ kbd {
     50% { transform: scaleY(1); opacity: 0.7; }
 }
 
+/* The 100% frame deliberately OMITS `transform` rather than restating
+   `scale(1) rotate(0deg)`.
+
+   This rule needs `fill-mode: forwards` (see .emoji-count.count-bump): without
+   a fill the finished animation is dropped from getAnimations(), leaving
+   nothing to seek, so the pop would play once per session. But a filled
+   animation outranks ALL normal author declarations, so a 100% frame of
+   `transform: scale(1)` keeps winning over `.emoji-btn:hover`'s
+   `translate3d(0,-3px,0) scale(1.05)` and `:active` for the rest of the page
+   life — the buttons would silently lose their hover lift and press feedback
+   after the viewer's first reaction. Verified in Chrome: the computed
+   transform stayed `matrix(1,0,0,1,0,0)` on every reaction afterwards.
+
+   Ending with no transform declaration means the fill retains whatever the
+   cascade would compute anyway, so the resting state is correct AND :hover
+   and :active work again. `0%` still needs the explicit `scale(1)` so the
+   pop does not animate in from the hovered transform. */
 @keyframes emoji-btn-pop {
     0% { transform: scale(1); }
     40% { transform: scale(1.28) rotate(-4deg); }
     75% { transform: scale(0.95) rotate(2deg); }
-    100% { transform: scale(1) rotate(0deg); }
+    100% { }
 }
 
 /* Ends back at the natural state, so the class can stay applied forever and
    needs no timer to remove it. The colour/background that used to be static
    !important declarations ride along in the keyframes instead, which is what
-   lets the whole bump be replayed by cancelling and re-adding the class. */
+   lets the whole bump be replayed by seeking currentTime to 0.
+
+   The 100% frame restates the natural colour/background rather than omitting
+   them, which is safe here because `.emoji-count` has no :hover/:active rule of
+   its own to shadow. (`.emoji-btn.btn-popping` DOES have one, which is why its
+   100% frame omits transform instead.) */
 @keyframes count-bump {
     0% {
         color: var(--text-muted);

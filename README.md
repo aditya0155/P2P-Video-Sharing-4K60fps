@@ -217,6 +217,10 @@ Both fixes below live in exactly that dead zone: the seam's safety net was "asse
 
 The clear is now unconditional, before the branch. The old test only proved the tokens appeared *somewhere* in the function — which the `keepPicture` branch satisfied — so it could not have caught this; the new one asserts the clear is positioned **before** the branch.
 
+Making that clear unconditional exposed a second, older instance of the same class of bug, and the seam had been dead in a different way. `switchRendition` armed `switchSeamPending = true` and then called `cleanupConnection(true)` on the very next line, which cleared it again in the same synchronous block. The flag was therefore always false by the time `ontrack` fired, the seam branch was skipped, and control fell through to the generic session-id branch — **which does not cancel the safety net**. So the 12 s timer stayed armed and fired on *every successful switch*, nulling `srcObject` and forcing a reconnect. It went unnoticed because the fallthrough branch happens to rebuild the stream too, so the picture survived. The arm now happens **after** the teardown.
+
+`test_seam_pending_is_actually_left_set` had been scanning only the text between the arm and the first `await`, which cannot see a clear in a different function — a false negative that passed against code where the seam was dead. It now asserts the teardown call precedes the arm.
+
 ### The bridge's circuit breaker fired on the first ffmpeg failure of every process
 `noHealthyRunFor` fell back to `Infinity` when the bridge had not yet produced a ≥300 s run, and `Infinity > 15 * 60 * 1000` is **true**. So the give-up branch fired on the first exit of any fresh process, whatever the real failure count.
 
@@ -230,7 +234,12 @@ The ICE-config fetch aborted at **2500 ms**; `server.js` mints Cloudflare creden
 ### Reactions forced up to 75 synchronous layouts per second
 Every reaction from every viewer (aggregate capped at 25/s) restarted its animations with `classList.remove(c); void el.offsetWidth; classList.add(c)`, which forces Blink to run `UpdateStyleAndLayout` inside the frame. The count bump was the expensive one: it followed a text write that changes the element's intrinsic width, dirtying the flex chain up to `.reaction-section`, which carries a `backdrop-filter`. The barriers land exactly when the decoder is closest to its limit — "the stream stutters when people react".
 
-`restartCssAnimation` now cancels the running animation via `getAnimations()` and re-adds the class, which needs no reflow. That required making `count-bump` a real `@keyframes` animation ending at its natural state — a static class cannot be replayed by re-adding it, and previously needed a `setTimeout` to be removed. The animation name is passed explicitly because the button's class (`btn-popping`) and its keyframes (`emoji-btn-pop`) are not the same string.
+`restartCssAnimation` now seeks the running animation's `currentTime` back to 0 and calls `play()`, which needs no reflow. Two properties turned out to be load-bearing rather than cosmetic, both established by driving the real production functions in headless Chrome against this stylesheet:
+
+- **It must seek, not cancel.** `cancel()` does not replay. The class stays applied, so the computed `animation-name` never changes and the engine never re-creates the animation. Measured over four reactions spaced beyond the 320 ms: `cancel()` animated the **first one only**; seeking animated all four. Worse, the button's `forwards` fill means a *finished* animation is still returned by `getAnimations()`, so `cancel()` actively killed it.
+- **Both animations need `fill-mode: forwards`.** Without one, a finished animation is dropped from `getAnimations()` entirely, leaving nothing to seek, so the bump would play exactly once per session.
+
+`count-bump` also had to become a real `@keyframes` animation — a static class cannot be replayed by re-adding it, and previously needed a `setTimeout` to be removed. The animation name is passed explicitly because the button's class (`btn-popping`) and its keyframes (`emoji-btn-pop`) are not the same string.
 
 ### Two assertions that could only fail
 Resurrecting the dead tests exposed two that contradicted the very comments they protect. The webfont test banned the literal `display=optional`, which the HTML comment explaining its removal quotes verbatim; the write-queue test banned `3.3s at 6 Mbps`, which the corrected comment cites to explain what changed. Both now check the live markup/config only — the first by stripping HTML comments, the second by requiring any surviving mention of the stale figure to be marked as the corrected claim.

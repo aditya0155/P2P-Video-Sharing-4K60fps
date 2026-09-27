@@ -135,7 +135,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let peerConnection = null;
     let whepSessionUrl = null;           // Location header URL for WHEP DELETE teardown
     let whepAbortController = null;      // Cancels an in-flight WHEP POST when the session is torn down
-    let whepPostTimeout = null;          // Aborts a hung WHEP POST quickly instead of waiting for the 16s watchdog
+    let whepPostTimeout = null;          // Aborts a hung WHEP POST quickly instead of waiting for the 26s connect watchdog
     let gatherTimeout = null;            // ICE-gather window timer; module-scoped so teardown can cancel it
     let switchSeamTimer = null;          // Safety net for a seamless rendition switch that never lands
     let switchSeamPending = false;       // A replacement session is expected to take over the element
@@ -150,7 +150,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let isConnected = false;
     let isConnecting = false;
     let connectionStartTime = 0;
-    let connectTimeout = null;           // 12s connection watchdog timer
+    let connectTimeout = null;           // 26s connection watchdog timer
     let statsInterval = null;
     let statsTickInFlight = false;      // Overlap guard: a slow getStats() must not double-count deltas
     let streamActiveCheckTimeout = null;
@@ -1240,10 +1240,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 // difference between connecting and never connecting.
                 //
                 // 6s leaves real headroom over the 4s upstream while still
-                // bounding the wait; it is inside the 22s connect budget, which
-                // already accounts a 2.5s ICE fetch (now 6s) + 6s gather + 10s
-                // POST = 22s exactly, so the watchdog cap was raised to 26s to
-                // keep the same margin over the worst legitimate stack.
+                // bounding the wait. It is the largest term in the connect
+                // budget, which now accounts 6s ICE fetch + 6s gather + 10s
+                // POST = 22s, so the watchdog cap moved 22s -> 26s. That is not
+                // "the same margin" the old budget had — the previous one was
+                // NEGATIVE (15s cap against a 15.5s stack, which is what made it
+                // tear down slow viewers before they could finish); the new one
+                // is a 4s margin.
                 const timer = setTimeout(() => controller.abort(), 6000);
                 try {
                     const response = await fetch(window.location.origin + '/stream-api/turn', {
@@ -1351,11 +1354,11 @@ document.addEventListener('DOMContentLoaded', () => {
             // player.videoWidth is 0 for a track that produces nothing.
             //
             // It is reachable without any rendition switch at all: the freeze
-            // watchdog's Stage 2 and every graceful ICE teardown call
-            // cleanupConnection(true), which deliberately leaves the old stream
-            // on screen. The old first-track branch only replaced the stream
-            // when it was null, so on the next connect the tracks were appended
-            // to the stale one.
+            // watchdog's Stage 2 rebinds the element in place, and
+            // switchRendition (the ABR path) calls cleanupConnection(true),
+            // which deliberately leaves the old stream on screen. The old
+            // first-track branch only replaced the stream when it was null, so
+            // on the next connect the tracks were appended to the stale one.
             currentSessionId += 1;
             // GENERATION TOKEN. This function has an unavoidable ~3s await on ICE
             // gathering that cleanupConnection() cannot cancel, and it used to
@@ -1708,7 +1711,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             whepAbortController = new AbortController();
             // Bound the handshake round-trip: without this, a stalled POST would sit
-            // until the 16s watchdog fired. Signaling is a local ~10ms exchange, so
+            // until the 26s connect watchdog fired. Signaling is a local ~10ms exchange, so
             // 10s means something is genuinely broken and a fast retry helps sooner.
             whepPostTimeout = setTimeout(() => {
                 console.warn("[WebRTC] WHEP POST exceeded 10s without a response. Aborting handshake.");
@@ -1780,8 +1783,8 @@ document.addEventListener('DOMContentLoaded', () => {
             // Re-arm the connect watchdog to cover ICE ONLY, from the moment the
             // answer is applied. The original one is armed before signaling and
             // cleared in handleConnected, so it had to cover the whole sequence:
-            // 2.5s ICE-config fetch + 3s candidate wait + up to 10s WHEP POST =
-            // 15.5s of a 15s budget, leaving half a second for the actual ICE
+            // 6s ICE-config fetch + 6s candidate wait + up to 10s WHEP POST =
+            // 22s of a 26s budget, leaving 4s for the actual ICE
             // connection. A remote or relayed viewer — exactly the audience the
             // tunnel serves — that would connect at 16s was torn down at 15s, and
             // every retry repeated it identically, so it could never play. LAN
@@ -1813,7 +1816,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     console.log("[WebRTC] ...but this session was already superseded; leaving current state alone.");
                     return;
                 }
-                // Do NOT simply clear isConnecting here. The 16s connectTimeout
+                // Do NOT simply clear isConnecting here. The 26s connectTimeout
                 // is gated on `isConnecting && !isConnected`, and only
                 // handleDisconnected() re-arms the status poll — so clearing the
                 // flag alone leaves a hung-POST attempt with no watchdog, no
@@ -2080,8 +2083,22 @@ document.addEventListener('DOMContentLoaded', () => {
         // "stressed" forever), but a rebuild must not override their choice.
         const wasPaused = player.paused;
         viewerPausedByChoice = wasPaused;
-        switchSeamPending = true;
+        // ORDER MATTERS. cleanupConnection() now clears the seam state
+        // unconditionally (it must, or a hard teardown leaves a 12s orphan that
+        // blacks the picture and reconnects behind the viewer's back), so the
+        // flag has to be armed AFTER it, not before.
+        //
+        // It used to be set immediately above this call, which meant the very
+        // next line cleared it again in the same synchronous block. Nothing
+        // could observe it in between, so `switchSeamPending` was always false
+        // by the time ontrack fired: the seam branch was skipped, control fell
+        // through to the generic session-id branch, and — because that branch
+        // does not cancel the safety net — the 12s timer armed below stayed
+        // live and fired on EVERY successful switch, nulling srcObject and
+        // forcing a reconnect. It "worked" only because the fallthrough branch
+        // happens to rebuild the stream too.
         cleanupConnection(true);
+        switchSeamPending = true;
         // Safety net for the seam: if the replacement handshake never yields a
         // track, the stale (now-ended) stream would otherwise stay on screen
         // indefinitely. 12s is far beyond the 10s WHEP cap, so this only fires
@@ -4035,16 +4052,31 @@ document.addEventListener('DOMContentLoaded', () => {
     // so nothing is left to time out.
     function restartCssAnimation(el, className, animationName) {
         if (!el) return;
-        // Cancel the running instance so re-adding the class starts a fresh one.
-        // `getAnimations` is matched by the ANIMATION's name, which is not always
-        // the class's: the button's class is `btn-popping` but its keyframes are
-        // `emoji-btn-pop`, so the name is passed explicitly. Elements without
-        // getAnimations (or with none running) simply skip straight to the add.
+        // SEEK TO ZERO, do not cancel.
+        //
+        // Cancelling a CSS animation does NOT replay it: `cancel()` removes the
+        // effect, and since the class stays applied, `classList.add` afterwards
+        // is a no-op — the computed animation-name never changes, so the engine
+        // never re-creates the animation. Verified in Chrome against this exact
+        // stylesheet: the HEAD remove/reflow/add idiom animated on all 4
+        // reactions, while cancel+add animated on the FIRST one only. Two
+        // further traps make cancel impossible in principle here:
+        //   - `.emoji-btn.btn-popping` uses `forwards`, so a FINISHED animation
+        //     is still returned by getAnimations() and cancel() kills it dead;
+        //   - `count-bump` (no fill-mode) is dropped from getAnimations()
+        //     entirely once finished, so there is nothing to cancel.
+        // Seeking to 0 restarts the existing animation in place, needs no
+        // layout, and is a no-op only if nothing is currently running.
         if (el.getAnimations) {
             el.getAnimations().forEach((anim) => {
-                if (anim.animationName === animationName) anim.cancel();
+                if (anim.animationName === animationName) {
+                    anim.currentTime = 0;
+                    anim.play();
+                }
             });
         }
+        // The class must be present for the FIRST run, when getAnimations() has
+        // nothing to seek yet.
         el.classList.add(className);
     }
 
