@@ -200,6 +200,24 @@ function gopSeconds() {
     return DEFAULT_GOP_SECONDS;
 }
 
+/*
+ * The GOP to use when the source frame rate is unknown.
+ *
+ * `-g` counts FRAMES, so the designed keyframe interval (DEFAULT_GOP_SECONDS,
+ * 0.5s) can only be honoured once the real rate is known. This is the same
+ * arithmetic probeGopFrames() already uses for its own last-resort fallback,
+ * pulled out so the two cannot drift apart.
+ *
+ * It replaces a hard-coded '60' in the encoder arg arrays. 60 frames is 1.0s
+ * at 60fps, 2.5s at 24fps and 5s at 12fps — two to ten times the designed
+ * interval — and it contradicted DEFAULT_GOP_SECONDS silently, in exactly the
+ * case where the probe could not answer. A viewer waiting up to 2.5s for the
+ * next keyframe after a loss reads that as a freeze.
+ */
+function assumedGopFrames() {
+    return String(Math.min(300, Math.max(1, Math.round(60 * gopSeconds()))));
+}
+
 function probeGopFrames() {
     if (process.env.BRIDGE_GOP) {
         const forced = String(process.env.BRIDGE_GOP).trim();
@@ -291,16 +309,57 @@ function decideBridge(tracks, env = {}) {
         // own on every rendition — which viewers report as the video being
         // "janky" when it is purely an audio offset.
         : ['-c:a', 'libopus', '-b:a', env.audioBitrate || AUDIO_BITRATE,
+            // WebRTC's Opus clock is 48000Hz by definition (RFC 7587
+            // "audio/opus" is always 48000/2), so anything else is resampled
+            // inside the encoder. Pinning it explicitly keeps the sample rate
+            // the browser's jitter buffer and AudioContext both assume, and
+            // `-ac 2` matches the stereo layout WebRTC negotiates.
+            '-ar', '48000', '-ac', '2',
+            // `lowdelay` is the right application for a live stream: the
+            // default `audio` permits the encoder lookahead that the VIDEO
+            // path deliberately refuses, which is audio latency the project
+            // has explicitly traded away everywhere else. A 20ms frame is the
+            // WebRTC convention and bounds the jitter buffer's granularity.
+            '-application', 'lowdelay', '-frame_duration', '20',
             '-af', 'aresample=async=1'];
 
     if (upper.includes('AV1')) {
         // Source is AV1: legacy browsers need an H264 fallback.
         const h264Rate = env.h264Bitrate || H264_BITRATE;
+        // `-g` counts FRAMES, so the designed 0.5s keyframe interval can only
+        // be expressed as a frame count once the source's real rate is known.
+        // The production caller always passes env.gopFrames from
+        // probeGopFrames(); this is the value to use when it does not.
+        //
+        // It used to be a hard-coded '60', which silently contradicts
+        // DEFAULT_GOP_SECONDS: 60 frames is 1.0s at 60fps, 2.5s at 24fps, and
+        // 5s at 12fps — two to ten times the designed interval, with nothing
+        // logged, exactly in the case where the probe could not answer. The
+        // probe has bounded, logged fallbacks of its own and is exported, so
+        // asking it is both honest and non-blocking here.
+        const gop = env.gopFrames || assumedGopFrames();
         return {
             sourceCodec: 'AV1',
             target: 'live-h264',
             videoArgs: [
                 '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'ull',
+                // Adaptive quantization is OFF by default in ffmpeg's NVENC
+                // wrapper (verified against the bundled n8.1:
+                // `-spatial_aq <boolean> ... (default false)`), so bits were
+                // being spread uniformly instead of by regional complexity. A/B
+                // measured on the bundled encoder, 1920x1080@60 testsrc2 at
+                // 6000k, 12s, -g 30 (worst case for I-frame size):
+                //
+                //   total  8804KB -> 8817KB  (+0.15%, flat)
+                //   avg     6.01 -> 6.02 Mbps (the -b:v target still governs)
+                //   100ms peak 8.96 -> 8.64 Mbps (LOWER)
+                //   max IDR  36.8 -> 39.8 KB
+                //
+                // So it is bitrate-neutral, and the peak it slightly reduces is
+                // the figure that matters: peaks overflow MediaMTX's per-reader
+                // write queue on keyframes and freeze receivers. -aq-strength 8
+                // is ffmpeg's own default for the scale (1 low - 15 aggressive).
+                '-spatial-aq', '1', '-aq-strength', '8',
                 '-b:v', h264Rate,
                 // -maxrate/-bufsize pin a 1s VBV window to the target rate:
                 // bare -b:v measured 2.4x-target 100ms bursts and +8% average
@@ -310,7 +369,29 @@ function decideBridge(tracks, env = {}) {
                 // hard-bounded (measured 1.4x, same as strict -rc cbr).
                 '-maxrate', h264Rate,
                 '-bufsize', h264Rate,
-                '-bf', '0', '-g', env.gopFrames || '60', '-forced-idr', '1',
+                // -g counts FRAMES, so the designed 0.5s interval is a frame
+                // count that depends on the source rate. `gopFrames()` derives
+                // it from a probe; this fallback previously hard-coded '60',
+                // which is 1.0s at 60fps and 2.5s at 24fps — double to five
+                // Probed frame count. The old `env.gopFrames || '60'` fallback
+                // silently contradicted DEFAULT_GOP_SECONDS — 60 frames is
+                // 1.0s at 60fps and 2.5s at 24fps — with nothing logged, in
+                // exactly the case where the probe could not answer.
+                '-bf', '0', '-g', gop, '-forced-idr', '1',
+                // ffmpeg's default -fps_mode is 'auto', which per the ffmpeg
+                // docs "chooses between cfr and vfr depending on muxer
+                // capabilities" — so with a constant-rate-capable muxer it
+                // silently resolves to cfr, whose documented behaviour is that
+                // "frames will be duplicated and dropped to achieve exactly the
+                // requested constant frame rate". Either branch rewrites the
+                // frame timing, which manufactures exactly the frame-count
+                // discontinuity this project exists to prevent: the browser's
+                // jitter buffer sees a source that does not match its own
+                // advertised frame rate. 'passthrough' passes each frame with
+                // its demuxer timestamp to the muxer — no duplication, no
+                // dropping, no timestamp rewriting — so a VFR source stays VFR
+                // end to end.
+                '-fps_mode', 'passthrough',
             ],
             audioArgs,
             // AV1 viewers playing the native path of an AAC source would get
@@ -357,11 +438,17 @@ function decideBridge(tracks, env = {}) {
 function buildAv1VideoArgs(env = {}, av1Rate = AV1_BITRATE) {
     return [
         '-c:v', 'av1_nvenc', '-preset', 'p4', '-tune', 'ull',
+        // Same AQ block and the same measurement as the H264 branch above.
+        '-spatial-aq', '1', '-aq-strength', '8',
         '-b:v', av1Rate,
         // Same burst cap as the H264 branch — see the comment there.
         '-maxrate', av1Rate,
         '-bufsize', av1Rate,
-        '-bf', '0', '-g', env.gopFrames || '60', '-forced-idr', '1',
+        // Probed frame count, not the old hard-coded 60-frame fallback — see
+        // the H264 branch for why the fallback has to stay rate-aware.
+        '-bf', '0', '-g', env.gopFrames || assumedGopFrames(), '-forced-idr', '1',
+        // One output frame per input frame; see the H264 branch.
+        '-fps_mode', 'passthrough',
     ];
 }
 

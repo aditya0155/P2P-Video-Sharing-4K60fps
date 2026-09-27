@@ -566,6 +566,39 @@ class JsLogicChecks(unittest.TestCase):
     def test_jitter_buffer_floor_tracks_measured_jitter(self):
         run_js_check(self, "jitter-buffer-floor")
 
+    def test_granted_playout_target_is_read_back(self):
+        """jitterBufferTarget is a hint with a UA-chosen min/max, so the value
+        written is not evidence of the value in force. See
+        ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "granted-target-readback")
+
+    def test_granted_target_gap_is_bounded_and_pure(self):
+        """A diagnostic, deliberately not a control input. See
+        ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "granted-target-gap")
+
+    def test_jitter_target_write_is_clamped_to_the_legal_range(self):
+        """The setter's range is [0, 4000] and outside it throws a RangeError.
+        See ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "jitter-target-clamp")
+
+    def test_effective_playback_rate_is_measured_and_smoothed(self):
+        """playbackRate reads 1.0 for a MediaStream, so it cannot see the
+        "speeds up / slows down" symptom. See ViewerSmoothnessRegressionChecks
+        for the full rationale."""
+        run_js_check(self, "effective-playback-rate")
+
+    def test_audio_clock_drift_is_measured_in_ppm(self):
+        """Audio time vs wall time. The app previously read no audio stats at
+        all. See ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "audio-clock-drift")
+
+    def test_spec_freeze_threshold_scales_with_frame_rate(self):
+        """The spec's freeze bound is frame-rate dependent. See
+        ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "spec-freeze-threshold")
+
+
     def test_abr_switching_state_machine(self):
         run_js_check(self, "abr-switching-state-machine")
 
@@ -1994,6 +2027,129 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.config = read_text(CONFIG_PATH)
         self.bridge = read_text(BRIDGE_PATH)
         self.launcher = read_text(LAUNCHER_PATH)
+
+    def test_playout_target_uses_only_the_standardized_api(self):
+        """`playoutDelayHint` is not a real API and must not be written.
+
+        It is in no W3C Recommendation, no engine IDL (Blink or Gecko) and no
+        WPT test — it belonged to an abandoned getPlayoutDelay()/
+        setTargetDelay() family. The old fallback branch could never be taken
+        and, worse, advertised a compatibility path that does not exist: a
+        maintainer reading it would believe non-Chromium receivers were
+        covered. `jitterBufferTarget` is the only standardized control, and it
+        is in milliseconds.
+        """
+        code = self._strip_comments(self.app, "js")
+        self.assertNotIn("playoutDelayHint", code,
+                         "playoutDelayHint does not exist in any browser; do not write it")
+        self.assertIn("jitterBufferTarget", code,
+                      "the standardized playout-delay control must still be used")
+        self.assertIn("clampJitterBufferTargetMs(currentBufferTargetMs())", code,
+                      "the write must clamp to the settler's legal range first")
+
+    def test_app_reads_media_time_from_rvfc(self):
+        """The rVFC callback must consume metadata.mediaTime, not just presentedFrames.
+
+        `presentedFrames` counts what reached the compositor; `mediaTime` is
+        the only field that says how FAST it is being consumed. Without it the
+        single most user-reported symptom in this class of bug is structurally
+        invisible to the app.
+        """
+        self.assertIn("metadata.mediaTime", self.app,
+                      "the rVFC callback must read mediaTime to measure playback rate")
+        self.assertIn("effectivePlaybackRate(", self.app,
+                      "the measured rate must go through the smoothing helper")
+
+    def test_stats_loop_reads_the_audio_report(self):
+        """The audio inbound-rtp report arrives in the same getStats() walk.
+
+        Filtering on kind === 'video' only threw it away for free. It carries
+        totalSamplesDuration (the audio clock), concealmentEvents (audible
+        gaps), and insertedSamplesForDeceleration — the UA stretching audio to
+        reach the video target, which the code comments reason about at length
+        but could not previously observe.
+        """
+        self.assertIn("report.kind === 'audio'", self.app,
+                      "the audio report must be captured from the same stats walk")
+        self.assertIn("measureAudioStats(", self.app,
+                      "the audio report must actually be consumed")
+        self.assertIn("concealmentEvents", self.app,
+                      "audio concealment (audible gaps) must be counted")
+        self.assertIn("insertedSamplesForDeceleration", self.app,
+                      "UA audio stretching must be observable, not just theorised about")
+
+    def test_audio_measurement_is_gated_on_audio_actually_being_pulled(self):
+        """Chromium only advances the audio jitter buffer once audio is pulled.
+
+        Before the WebAudio tap is attached, totalSamplesDuration is frozen
+        while wall time keeps moving, which would read as an enormous
+        audio-clock drift. This is the same class of guard the video
+        controllers already apply via document.hidden and player.paused.
+        """
+        self.assertIn("function audioIsPulled(", self.app,
+                      "audio measurement must be gated on audio being pulled")
+        body = self.app[self.app.index("function audioIsPulled("):]
+        body = body[:body.index("\n    }")]
+        self.assertIn("player.paused", body,
+                      "a paused viewer does not pull audio")
+        self.assertIn("audioSourceNode", body,
+                      "audio is not pulled until the WebAudio tap exists")
+
+    def test_granted_target_readback_is_never_a_control_input(self):
+        """The read-back observes the controller; it must not drive it.
+
+        If the granted-target gap fed the control law it would close a second,
+        faster loop around the very controller it is meant to audit, and a
+        transient read would move the buffer. The gap is computed into its own
+        state and surfaced in the HUD and the diagnostic export instead.
+        """
+        code = self._strip_comments(self.app, "js")
+        self.assertIn("grantedTargetDeltaMs = grantedTargetGapMs(", code,
+                      "the gap must be recorded, not returned into the control law")
+        supervisor = code[code.index("function superviseAdaptiveBuffer("):]
+        supervisor = supervisor[:supervisor.index("function updateBufferHud(")]
+        self.assertNotIn("grantedTargetDeltaMs", supervisor,
+                         "the buffer supervisor must not steer on the read-back")
+        self.assertNotIn("grantedTargetMs", supervisor,
+                         "the buffer supervisor must not steer on the read-back")
+
+    def test_separate_baselines_for_target_and_minimum_delay(self):
+        """jitterBufferTargetDelay and jitterBufferMinimumDelay are distinct series.
+
+        Both are cumulative and both are averaged against jitterBufferEmittedCount,
+        but differencing one against the other's baseline produces a garbage
+        average that can be enormous or negative. The project has already been
+        bitten exactly this way once (a cumulative average hiding fresh drift),
+        so the baselines are separate by construction.
+        """
+        self.assertIn("let lastJitterTargetTotal = 0;", self.app)
+        self.assertIn("let lastJitterMinTotal = 0;", self.app,
+                      "the minimum-delay series needs its own baseline")
+        self.assertIn("lastJitterMinTotal", self.app,
+                      "the minimum-delay read must use the minimum-delay baseline")
+
+    def test_per_session_measurement_state_is_reset(self):
+        """Cumulative counters are per session, not per app load.
+
+        Differencing a carried-over counter against a zero baseline yields one
+        enormous first-tick reading. For the audio clock that would look like a
+        huge drift, and for the granted target it would look like the UA
+        instantly applied a multi-second buffer.
+
+        Scoped to the startTelemetry() body and to the 8-space indent on
+        purpose. A bare `f"{state} = "` search is satisfied by the 4-space
+        `let` DECLARATION as well as by the reset, so it passes even with the
+        entire reset block deleted — a guard that cannot fail.
+        """
+        body = self.app[self.app.index("function startTelemetry("):]
+        body = body[:body.index("\n    function ")]
+        for state in ("lastJitterTargetTotal", "lastJitterMinTotal", "grantedTargetMs",
+                      "audioStatsReport", "lastAudioSamplesDuration", "audioDriftPpm",
+                      "lastMediaTimeSec", "playbackRate"):
+            # 8 spaces = the per-session reset inside startTelemetry(), not the
+            # 4-space declaration.
+            self.assertIn(f"\n        {state} = ", body,
+                          f"{state} must be reset when a new session starts")
 
     @staticmethod
     def _strip_comments(text, kind):

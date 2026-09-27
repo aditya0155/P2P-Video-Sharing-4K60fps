@@ -186,4 +186,170 @@ Recording these so they are not "fixed" later:
 - **Averaging over a longer keyframe window changes nothing in total bandwidth** (see the pipeline section above) — the win from 0.5 s is halved freeze time, not bandwidth.
 - **`av1_nvenc` already defaults to 8-bit `yuv420p`** and `rc-lookahead` already 0; the default vsync does **not** duplicate or drop frames on this FLV output (75-in/75-out on a VFR source). Three plausible smoothness bugs, all absent.
 - **`tune=ull` vs `hq` vs `ll` is byte-identical** at these settings — the rate control is saturated, so the tuning profile is inert.
+
+## Fourth-pass audit — closing the receiver measurement loop
+
+The first three passes made the *control* side of the receiver careful (delta-based
+measurement, hysteresis, dwell, a drop-gated accommodation, a video-only playout write).
+What none of them could do was **observe the result of its own writes**. Five signals
+that decide whether a viewer sees lag, drift, dropped audio or a "speeded-up" picture
+were either never read or read under the wrong name. Every spec claim below was checked
+against the W3C WebRTC-PC and WebRTC-Stats Recommendations rather than from memory;
+the audit notes, the spec quotes and the sources are in `_research/`.
+
+### The write is a hint, and nothing ever read back what it produced
+
+`RTCRtpReceiver.jitterBufferTarget` is the only standardized playout-delay control
+(WebRTC-PC: `attribute DOMHighResTimeStamp? jitterBufferTarget`, milliseconds, and
+"If target is negative or larger than 4000 milliseconds, then throw a RangeError"). The
+spec is also explicit that the UA holds a minimum and maximum target "reflecting what
+the user agent is able or willing to provide", that the value is "a target", and that
+the resulting change in delay is observed **gradually**. A write is therefore not a
+measurement. The app wrote a target up to 2200 ms and then regulated every downstream
+decision against that *request*.
+
+`jitterBufferTargetDelay` is the standardized read-back, defined in exactly the same
+cumulative terms as `jitterBufferDelay` — "increased by the target jitter buffer delay
+every time a sample is emitted... to get the average target delay, divide by
+`jitterBufferEmittedCount`" — so the same windowed-delta formula applies.
+`jitterBufferMinimumDelay` is the UA's own floor and is explicitly "not affected by
+external mechanisms that increase the jitter buffer target delay, such as
+`jitterBufferTarget`".
+
+Why it mattered: a UA that silently clamped a 350 ms request to 120 ms was
+**indistinguishable from one that honoured it**. The drop-gated accommodation then saw
+the resulting late frames, concluded the network was stressed, and kept raising —
+against a target that never landed. Both readings now go to the HUD (`180 ms → 120`)
+and to the diagnostic export, and the suite pins that the supervisor never steers on
+them, so the read-back cannot become a second feedback loop around the controller it
+audits.
+
+### The audio half of A/V sync was completely unobserved
+
+Every stats consumer filtered on `kind === 'video'`, so the audio report was discarded
+even though it arrives in the same `getStats()` walk. That left unmeasured: the audio
+clock (`totalSamplesDuration`), concealment (`concealedSamples`, `concealmentEvents` —
+audible gaps), and `insertedSamplesForDeceleration`, which is the UA stretching audio to
+reach the video target — the exact mechanism the existing comments reason about at
+length but could not see. Audio drift is now measured in **ppm** against wall time; a
+few hundred ppm walks tens of milliseconds per minute and the browser then
+micro-corrects continuously, which reads as jank while every video stat is clean.
+
+`totalSamplesDuration` is a *receive*-side measure ("all samples that have been
+received"), so the reading absorbs drift in the source's clock as well as the
+receiver's, and it is not a signal for "is audio being rendered". The measurement is
+gated on element state and the WebAudio tap instead (`audioIsPulled()`), because what
+freezes when a track is not rendered is the audio **jitter buffer** and its emitted
+counters — mixing the two in one measurement produces a reading that looks like an
+enormous clock drift and is really just "nothing has been played yet".
+
+### "The video speeds up / slows down" was structurally unobservable
+
+`player.playbackRate` reads `1.0` for a `MediaStream` and cannot see this. The
+mechanism is real and lives in this app's own control path: per the spec, a lowered
+`jitterBufferTarget` is reached by **discarding** buffered frames, and a buffer surplus
+is spent rather than sitting still. `rVFC`'s `metadata.mediaTime` was never read — the
+callback used only `presentedFrames`. It now computes a smoothed
+`d(mediaTime)/d(wall)`: the rate of **presented** media per unit wall time. A rate
+persistently above 1 means the element is spending surplus, which is the visible
+hitch-then-jump.
+
+It is a presented-rate measure, not a playback-rate reading: rVFC fires per frame sent
+to the compositor, so a source that is itself dropping frames reports a *lower* ratio
+while still running at exactly 1.0×. That is why it is reported alongside the presented
+
+### Encoder: three verified defects
+
+Checked against the bundled ffmpeg (`ffmpeg -h encoder=h264_nvenc`) rather than assumed:
+
+- **`-spatial-aq` defaults to `false`.** The pipeline has been spreading bits uniformly
+  instead of by regional complexity. A/B measured on the bundled encoder, 1920x1080@60
+  testsrc2, 6000k, 12 s, `-g 30`: total 8804 KB → 8817 KB (+0.15%), average
+  6.01 → 6.02 Mbps, **100 ms peak 8.96 → 8.64 Mbps**, max IDR 36.8 → 39.8 KB. It is
+  bitrate-neutral and it *lowers* the peak, which is the figure that overflows
+  MediaMTX's per-reader write queue on keyframes.
+- **`env.gopFrames || '60'` contradicted `DEFAULT_GOP_SECONDS`.** 60 frames is 1.0 s at
+  60 fps, 2.5 s at 24 fps and 5 s at 12 fps — two to ten times the designed 0.5 s
+  interval — silently, in exactly the case where the probe could not answer. It now
+  falls back through the same arithmetic the probe itself uses, so the two cannot drift
+  apart. (The suite pinned `'60'` as correct; that assertion was pinning the
+  contradiction and was corrected to `30`, with a second case proving an explicit
+  `env.gopFrames` still wins.)
+- **No `-fps_mode passthrough`.** ffmpeg's default `auto` "chooses between cfr and vfr
+  depending on muxer capabilities", so with a constant-rate-capable muxer it resolves
+  to cfr, whose documented behaviour duplicates and drops frames to hit an exact
+  constant rate. Either branch rewrites frame timing, manufacturing frame-count
+  discontinuities. This is the encoder-side twin of the 24 fps measurement above.
+
+Opus is now pinned to the WebRTC clock: `-ar 48000 -ac 2 -application lowdelay
+-frame_duration 20`. RFC 7587 fixes `audio/opus` at 48 kHz, and the default `audio`
+application permits encoder lookahead — audio latency the video path deliberately
+refuses to accept.
+
+### What was checked and deliberately left alone
+
+- **`-preset p4` is a no-op** (verified: it is the NVENC default). Changing it to `p1`
+  trades real quality for encode speed, the wrong trade for a project whose stated goal
+  is smoothness. Left in place as an explicit pin.
+- **`tune=ull` is not what removes lookahead.** `rc-lookahead` already defaults to 0
+  (verified). The conclusion is right and the cause is mis-attributed, but the
+  behaviour is correct, so nothing was changed on the strength of a comment edit.
+- **The drift "catch-up" is a reconnect, not a ramp.** Reducing surplus by *lowering*
+  the target discards frames, and the staged reconnect avoids that but costs 2–4 s of
+  black. Both are worse than the surplus. Left as-is and documented rather than
+  "fixed" into something that trades one artefact for another.
+
+### Open, and not done
+
+- The browser probe in `_probe/` is scaffolding, not a shipped tool. It was written to
+  get ground-truth viewer stats out of a real headless-Chrome WHEP session and could
+  not be completed on this host: headless Chrome needs ~10 s to open its debug port
+  here, and it could not load the loopback page origin, so the WHEP POST failed with a
+  bare "Failed to fetch". The numbers in this section therefore come from
+  `ffprobe`/`ffmpeg` against the running MediaMTX, not from a browser. Re-running the
+  probe against a live broadcast is the obvious next step and would confirm or refute
+  the read-back and presented-rate instruments on real `getStats()` output rather than
+  on unit fixtures.
+- `start_host.ps1` raises only MediaMTX to `AboveNormal`. The bridge's ffmpeg (NVDEC +
+  NVENC + mux) and `server.js` stay at Normal, even though a preempted encoder thread
+  makes every viewer hitch at once — the same reasoning the file already applies to
+  MediaMTX.
+
+frame count rather than acted on alone.
+
+### The freeze bound is frame-rate dependent and was a single constant
+
+The stats spec defines a freeze as a rendered-frame gap of at least
+`Max(3 * avg_frame_duration_ms, avg_frame_duration_ms + 150)`. In the 10–120 fps range a
+real broadcast uses, the `+150` term dominates: the bound is 166.7 ms at 60 fps,
+183.3 ms at 30 fps and 191.7 ms at 24 fps, and the 3× term only takes over below
+~13.3 fps — so one constant is wrong everywhere. (This host's own live source measured
+1080p at a true 24 fps CFR — 41.71 ms PTS deltas — while the container advertised
+48 fps, so the two are not always close.) `specFreezeThresholdMs()` now derives the
+bound from the measured frame rate.
+
+**It is reported, not acted on.** `triggerFreezeRecovery()` costs 2–4 s of black, worse
+than the freeze it would "fix", so a short freeze should widen the buffer rather than
+tear the session down. The staged recovery keeps its existing threshold for a genuine
+*decoder* stall (bytes flowing, nothing decoding).
+
+
+### `playoutDelayHint` was written, and it does not exist
+
+`applyPlayoutDelay` carried a fallback writing `receiver.playoutDelayHint =
+targetMs / 1000`. That property is not in the WebRTC-PC Recommendation, not in MDN's
+`RTCRtpReceiver` member list, and appears in no W3C WebRTC specification or extension.
+The branch could never be taken — and its presence advertised a compatibility path that
+does not exist, so a maintainer reading it would have believed non-Chromium receivers
+were covered. Removed; `jitterBufferTarget` is the only control and it is in
+milliseconds.
+
+Related: nothing enforced the setter's documented `[0, 4000]` range, and an
+out-of-range write throws a `RangeError` that the existing `catch` reported as "this
+browser has no such API". The accommodation cap (2200) sits under 4000 today, so this
+was a latent trap rather than a live bug — but a future constant bump, or summing the
+base terms instead of `max()`ing them, would have thrown on *every* write and silently
+disabled buffer control while the HUD kept advertising a target. Now clamped at the
+call site.
+
 - Audio gain is now **ramped, not stepped** (`setValueAtTime` moves gain within one 128-sample render quantum, so mute/unmute was a full-scale 0 dBFS click and a volume drag was 60–200 clicks/second of zipper noise).
