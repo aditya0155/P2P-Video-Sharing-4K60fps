@@ -1226,7 +1226,25 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!iceFetchInFlight) {
             iceFetchInFlight = (async () => {
                 const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), 2500);
+                // The client cap must be LONGER than the server's own TURN-mint
+                // budget, or the browser gives up on a request the server is
+                // still legitimately serving. server.js mints Cloudflare
+                // credentials with AbortSignal.timeout(4000), and it only mints
+                // on a cache miss — the first viewer, or the first viewer after
+                // the half-life renewal. At 2500ms the client aborted ~1.5s
+                // before the server's own deadline, so a cold cache always lost:
+                // the fetch threw AbortError, the catch below set the cache to
+                // null, and the handshake proceeded with host candidates only.
+                // For exactly the viewers who need the relay — remote/mobile
+                // networks that cannot be punched through — that is the
+                // difference between connecting and never connecting.
+                //
+                // 6s leaves real headroom over the 4s upstream while still
+                // bounding the wait; it is inside the 22s connect budget, which
+                // already accounts a 2.5s ICE fetch (now 6s) + 6s gather + 10s
+                // POST = 22s exactly, so the watchdog cap was raised to 26s to
+                // keep the same margin over the worst legitimate stack.
+                const timer = setTimeout(() => controller.abort(), 6000);
                 try {
                     const response = await fetch(window.location.origin + '/stream-api/turn', {
                         cache: 'no-store',
@@ -1294,10 +1312,11 @@ document.addEventListener('DOMContentLoaded', () => {
         
         // Arm a connection-timeout watchdog to prevent an infinite connecting
         // spinner. The budget covers the worst legitimate stack: ICE-config
-        // fetch (2.5s cap) + candidate gathering (6s cap, because the window
+        // fetch (6s cap, which must exceed the server's own 4s TURN-mint
+        // budget) + candidate gathering (6s cap, because the window
         // now waits for a ROUTABLE candidate so a network that blocks UDP STUN
         // is not cut off before its srflx or TURN candidate lands) + WHEP POST
-        // (10s cap) = 18.5s, so the cap is 22s. Leaving this at 16s guaranteed
+        // (10s cap) = 22s, so the cap is 26s. Leaving this at 16s guaranteed
         // the watchdog fired BEFORE the attempt could possibly finish on a slow
         // link — the exact viewer this change was meant to help.
         // Real ICE failures still tear down immediately via the
@@ -1306,11 +1325,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if (connectTimeout) clearTimeout(connectTimeout);
         connectTimeout = setTimeout(() => {
             if (isConnecting && !isConnected) {
-                console.warn("[WebRTC] Connection attempt timed out after 16s without ICE handshake. Triggering disconnect recovery.");
+                console.warn("[WebRTC] Connection attempt timed out after 26s without ICE handshake. Triggering disconnect recovery.");
                 addSystemMessage("⚠️ Connection timed out. Re-attempting handshake...");
                 handleDisconnected();
             }
-        }, 22000);
+        }, 26000);
         
         console.log("[WebRTC] Starting connection sequence...");
         
@@ -1966,25 +1985,37 @@ document.addEventListener('DOMContentLoaded', () => {
             clearInterval(renditionPollInterval);
             renditionPollInterval = null;
         }
+        // The seam's own 12s safety net must be cancelled on EVERY path out of
+        // teardown, not only the one that keeps the picture.
+        //
+        // The clear used to sit INSIDE the keepPicture branch below, which is
+        // exactly backwards. Only switchRendition() uses keepPicture=true, and
+        // that is the single call where nothing goes offline. The callers the
+        // hazard was written for — handleDisconnected() and the freeze
+        // watchdog's Stage 3 — both call this with keepPicture=false, so the
+        // orphan stayed armed precisely when it is dangerous:
+        //
+        //   - a rendition switch whose replacement fails fast painted OFFLINE
+        //     and then, 12s later, had the orphan fire and reconnect on its own,
+        //     flipping the page offline -> connecting -> live with no user action;
+        //   - on a healthy live session the orphan did `player.srcObject = null`
+        //     (black screen, audio dead) and then called connectStream(), which
+        //     no-ops because isConnected is still true — leaving a dead
+        //     connection that neither watchdog can see;
+        //   - it also forced `viewerPausedByChoice = false`, so a viewer who
+        //     had deliberately paused got resumed, with audio, unprompted.
+        //
+        // The pending flag has to go with the timer, or the NEXT session's
+        // first ontrack takes the seam branch and swaps in a stream on a
+        // teardown that never asked for a switch.
+        if (switchSeamTimer) {
+            clearTimeout(switchSeamTimer);
+            switchSeamTimer = null;
+        }
+        switchSeamPending = false;
         if (keepPicture) {
-            // Leave the element alone. `clearSeamWatchdog()` in switchRendition
-            // guarantees the stale stream cannot survive if the replacement
-            // handshake never produces a track.
-            //
-            // The seam's own 12s safety net IS cancelled, though. It was the
-            // only timer cleanupConnection did not know about, so an ICE failure
-            // or grace expiry landing inside the 12s window after a switch tore
-            // everything down, painted offline, and then — 12 seconds later —
-            // had the orphan fire and reconnect on its own, flipping the page
-            // offline -> connecting -> live by itself. It also has to clear the
-            // pending flag, or the NEXT session's first ontrack would take the
-            // seam branch and swap in a stream on a teardown that never asked
-            // for a switch.
-            if (switchSeamTimer) {
-                clearTimeout(switchSeamTimer);
-                switchSeamTimer = null;
-            }
-            switchSeamPending = false;
+            // Leave the element alone, so the last decoded frame stays on screen
+            // until the replacement session's ontrack swaps in the new stream.
             return;
         }
         player.pause();
@@ -3984,17 +4015,45 @@ document.addEventListener('DOMContentLoaded', () => {
         setTimeout(() => createOne(0), 85);
     }
 
+    // Restart a CSS keyframe animation without forcing a synchronous layout.
+    //
+    // The classic `el.classList.remove(c); void el.offsetWidth;
+    // el.classList.add(c)` idiom forces Blink to run UpdateStyleAndLayout right
+    // there, in the middle of the frame, to make the re-add count as a fresh
+    // animation. Reactions run this for EVERY reaction from EVERY viewer (the
+    // server caps the aggregate at 25/s), and the count element's own bump
+    // follows a textContent write that changes the element's intrinsic width
+    // (`.emoji-count` has padding and min-width but no fixed width), so that
+    // one dirtied a whole flex chain up to `.reaction-section`, which carries a
+    // `backdrop-filter: blur(12px)` — a real relayout plus a re-blur of the
+    // backdrop, on the same thread that decodes video. Three such barriers per
+    // reaction is up to 75/s during a hype train, and they land exactly when the
+    // decoder is closest to its limit.
+    //
+    // The Web Animations API needs no reflow to restart: cancelling the previous
+    // animation and starting a new one is compositor-driven and self-cleaning,
+    // so nothing is left to time out.
+    function restartCssAnimation(el, className, animationName) {
+        if (!el) return;
+        // Cancel the running instance so re-adding the class starts a fresh one.
+        // `getAnimations` is matched by the ANIMATION's name, which is not always
+        // the class's: the button's class is `btn-popping` but its keyframes are
+        // `emoji-btn-pop`, so the name is passed explicitly. Elements without
+        // getAnimations (or with none running) simply skip straight to the add.
+        if (el.getAnimations) {
+            el.getAnimations().forEach((anim) => {
+                if (anim.animationName === animationName) anim.cancel();
+            });
+        }
+        el.classList.add(className);
+    }
+
     function triggerButtonPop(btn) {
         if (!btn) return;
-        btn.classList.remove('btn-popping');
-        void btn.offsetWidth;
-        btn.classList.add('btn-popping');
+        restartCssAnimation(btn, 'btn-popping', 'emoji-btn-pop');
         const countEl = btn.querySelector('.emoji-count');
         if (countEl) {
-            countEl.classList.remove('count-bump');
-            void countEl.offsetWidth;
-            countEl.classList.add('count-bump');
-            setTimeout(() => countEl.classList.remove('count-bump'), 320);
+            restartCssAnimation(countEl, 'count-bump', 'count-bump');
         }
     }
 
@@ -4389,11 +4448,16 @@ document.addEventListener('DOMContentLoaded', () => {
                         const countEl = document.getElementById(`count-${data.emoji}`);
                         if (countEl) {
                             const cur = parseInt(countEl.innerText || '0', 10);
-                            countEl.innerText = String(data.totalCount || (cur + 1));
-                            countEl.classList.remove('count-bump');
-                            void countEl.offsetWidth;
-                            countEl.classList.add('count-bump');
-                            setTimeout(() => countEl.classList.remove('count-bump'), 320);
+                            const next = String(data.totalCount || (cur + 1));
+                            // Only write when the number actually changes. Every
+                            // reaction is broadcast with the same totalCount, so a
+                            // busy room produces a long run of identical values —
+                            // each of which used to dirty layout and then be
+                            // forced through a synchronous reflow one line below.
+                            if (countEl.innerText !== next) {
+                                countEl.innerText = next;
+                            }
+                            restartCssAnimation(countEl, 'count-bump', 'count-bump');
                         }
                         playSfx('pop');
                     }

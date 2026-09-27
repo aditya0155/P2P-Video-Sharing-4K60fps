@@ -200,3 +200,51 @@ Two consequences, both verified by running the real binary on that exact config:
 Both generated configs now set `moq: no`. Two tests pin it: `test_sandboxed_mediamtx_binds_nothing_on_a_wildcard_address` boots the real binary and asserts via `Get-NetTCPConnection`/`Get-NetUDPEndpoint` that it owns **no** non-loopback socket (reverting the fix reports exactly `tcp :::8892`, `udp :::8892`, `udp :::8893`), and `test_every_mediamtx_config_disables_moq` pins the flag in `mediamtx.yml` and in every config literal the suite generates.
 
 The general lesson, and the reason the second test exists: a config that only lists the keys it cares about is not a sandbox, it is an inheritance chain through whatever the binary ships as default. The production `mediamtx.yml` is the same shape and is safe **only** because it happens to spell out `moq: no`; that is now asserted rather than assumed.
+## Fifth-pass audit — guards that fired on the wrong side, and 20 tests that never ran
+
+Four defects, all found by reading for *guards whose condition is satisfied when it should not be* (the theme the third pass established), plus a fault in the harness that hid two of them.
+
+### ~20 tests were dead code, so the suite was green for the wrong reason
+A stray `if __name__ == "__main__":` sat **in the middle** of `ViewerSmoothnessRegressionChecks`, ending the class body. Everything defined after it — 20 methods including the ABR-seam, chat-autoscroll, cursor-write and switch-cooldown guards — was parsed as a module-level `if` block, so `unittest` never collected them. `Ran 42 tests` was reported as `OK` while a fifth of the class did not exist as far as the runner was concerned.
+
+Both fixes below live in exactly that dead zone: the seam's safety net was "asserted" cancelled by a test that never ran. Moving the block to the end of the file takes the class to **62 collected tests** and immediately surfaced three genuine failures, two of which were the assertion style described at the end of this section.
+
+### The ABR seam's 12s safety net was disarmed only where it was harmless
+`cleanupConnection` cleared `switchSeamTimer` **inside** its `keepPicture` branch — and `keepPicture=true` is passed by exactly one caller, `switchRendition`, which is the only teardown where nothing goes offline. The callers the hazard was written for (`handleDisconnected`, and the freeze watchdog's Stage 3) pass nothing, so the orphan stayed armed precisely when it was dangerous:
+- a rendition switch whose replacement failed fast painted **offline**, then had the orphan reconnect 12 s later on its own — the page flipping offline → connecting → live with no user action;
+- on a healthy live session the orphan ran `player.srcObject = null` (black, audio dead) and then called `connectStream()`, which **no-ops** because `isConnected` is still true — a dead connection neither watchdog can see;
+- it also forced `viewerPausedByChoice = false`, resuming a viewer who had deliberately paused, with audio.
+
+The clear is now unconditional, before the branch. The old test only proved the tokens appeared *somewhere* in the function — which the `keepPicture` branch satisfied — so it could not have caught this; the new one asserts the clear is positioned **before** the branch.
+
+### The bridge's circuit breaker fired on the first ffmpeg failure of every process
+`noHealthyRunFor` fell back to `Infinity` when the bridge had not yet produced a ≥300 s run, and `Infinity > 15 * 60 * 1000` is **true**. So the give-up branch fired on the first exit of any fresh process, whatever the real failure count.
+
+That is a room-wide outage, not a bridge-local one: this is MediaMTX's `runOnAvailable` hook with `runOnAvailableRestart`, and a publisher drop closes every WHEP reader on the path. One transient cold-start ffmpeg error — RTSP setup racing the new publisher, the first keyframe missing the 20 s startup watchdog, NVENC contention with OBS on the same GPU — took the whole rendition tier down, then slept `GIVE_UP_BACKOFF_MS` (60 s) and exited. It also made three documented safeguards unreachable: the 10-strike cap, the NVDEC→CPU fallback (which needs a second iteration), and the in-process retry.
+
+The window is now measured from the process's own start, via a named `NO_HEALTHY_RUN_GRACE_MS` so the grace cannot drift below the 300 s health mark it is measured against.
+
+### The browser gave up on the TURN fetch before the server finished serving it
+The ICE-config fetch aborted at **2500 ms**; `server.js` mints Cloudflare credentials with `AbortSignal.timeout(4000)` and only mints on a cache miss — the first viewer, or the first after the half-life renewal. A cold cache therefore **always** lost: the fetch threw `AbortError`, the cache was set to null, and the handshake continued with host candidates only. For precisely the viewers who need the relay, that is the difference between connecting and never connecting. The client cap is now 6 s, and the connect watchdog moved 22 s → 26 s so it still exceeds ICE fetch + gather + POST.
+
+### Reactions forced up to 75 synchronous layouts per second
+Every reaction from every viewer (aggregate capped at 25/s) restarted its animations with `classList.remove(c); void el.offsetWidth; classList.add(c)`, which forces Blink to run `UpdateStyleAndLayout` inside the frame. The count bump was the expensive one: it followed a text write that changes the element's intrinsic width, dirtying the flex chain up to `.reaction-section`, which carries a `backdrop-filter`. The barriers land exactly when the decoder is closest to its limit — "the stream stutters when people react".
+
+`restartCssAnimation` now cancels the running animation via `getAnimations()` and re-adds the class, which needs no reflow. That required making `count-bump` a real `@keyframes` animation ending at its natural state — a static class cannot be replayed by re-adding it, and previously needed a `setTimeout` to be removed. The animation name is passed explicitly because the button's class (`btn-popping`) and its keyframes (`emoji-btn-pop`) are not the same string.
+
+### Two assertions that could only fail
+Resurrecting the dead tests exposed two that contradicted the very comments they protect. The webfont test banned the literal `display=optional`, which the HTML comment explaining its removal quotes verbatim; the write-queue test banned `3.3s at 6 Mbps`, which the corrected comment cites to explain what changed. Both now check the live markup/config only — the first by stripping HTML comments, the second by requiring any surviving mention of the stale figure to be marked as the corrected claim.
+
+`_js_function_body` also gained an optional `async` prefix. It anchored on `function name(`, so a lookup for an async function returned `None` and the caller's `assertIsNotNone` reported "not found" for a function that was present and correct.
+
+### The harness threw away the evidence, and raced for its ports
+
+Found while verifying the round above, and the same shape as the fourth pass's finding from the other side: that one fixed the suite *inheriting* a wildcard listener, this one fixes the suite *discarding the child's output*. `wait_until_ready()` reported only `Node site server exited before becoming ready` and threw away the very stdout/stderr that explains the death, so a startup failure of any kind surfaced as an opaque message against whichever test happened to be running — `test_host_source_files_are_never_served` failed that way on a full run and passed in isolation, with the cause visible nowhere. Startup failures now raise `SiteStartupError` carrying the child's output, and `start_site()` retries a fresh port when the child reports the port was taken.
+
+Two supporting facts, both measured rather than assumed:
+
+- **`find_free_port()` is a time-of-check/time-of-use race.** It binds a probe socket, reads the number and closes it, so the port is free when drawn and *unreserved* by the time `server.js` binds it a moment later. Anything else on the box can take it in that window — and since these are ephemeral-range ports, the host's own outbound connections draw from the same range — after which `server.js` exits 1 with `Port N is already in use`. A collision in the harness is not a defect in the code under test, so it earns a fresh port (up to `BOOT_ATTEMPTS`); a caller that pins `PORT` deliberately still gets a hard failure.
+- **The readiness probe's per-attempt budget sat on top of the median cold start.** A cold `server.js` answers its first request in ~0.52 s (median of 25 boots on this host, max 1.05 s) while every later request takes 3–25 ms, and each attempt was allowed **0.5 s** — so the probe discarded its first attempt on most boots and only ever succeeded on a retry. The attempt budget is now 2 s inside a 15 s overall deadline.
+
+Pinned by `test_a_taken_port_is_retried_and_then_reported_with_the_childs_words` (a real listening socket holds the port; the suite must retry it *and* surface `already in use`) and `test_the_readiness_probe_outlasts_a_cold_first_response` (a server that takes 1.2 s to answer must still be recognised as ready). The blocker in the first test deliberately does **not** set `SO_REUSEADDR`: on Windows that would let `server.js` bind the same port anyway, so the collision would never occur and the test would pass for the wrong reason. It also accepts-and-drops in a thread, so each retry fails in milliseconds instead of sitting out the full per-attempt timeout five times over.
+

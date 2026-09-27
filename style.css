@@ -994,10 +994,21 @@ body.perf-mode .action-feedback {
     transition: transform 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
 
+/* Reaction count bump. This is a real keyframe animation (not a static style)
+   for two reasons: it ends back at the element's natural state, so the class
+   can stay applied and never needs a setTimeout to remove it; and
+   `restartCssAnimation` can find and cancel it by animationName to replay it
+   without forcing a synchronous layout. A static class cannot be restarted
+   that way — re-adding an already-present class is a no-op and replays
+   nothing. */
 .emoji-count.count-bump {
-    color: var(--cyan) !important;
-    background: rgba(34, 211, 238, 0.25) !important;
-    transform: scale(1.22);
+    /* The transition on .emoji-count covers the same three properties, and a
+       running CSS animation outranks a transition for the properties it
+       covers — but the two together mean the element carries two timers for
+       one visual change. Suppressing the transition while the bump is applied
+       leaves the keyframes in sole control. */
+    transition: none;
+    animation: count-bump 0.32s ease;
 }
 
 /* Floating Particle from Button */
@@ -1482,6 +1493,28 @@ kbd {
     40% { transform: scale(1.28) rotate(-4deg); }
     75% { transform: scale(0.95) rotate(2deg); }
     100% { transform: scale(1) rotate(0deg); }
+}
+
+/* Ends back at the natural state, so the class can stay applied forever and
+   needs no timer to remove it. The colour/background that used to be static
+   !important declarations ride along in the keyframes instead, which is what
+   lets the whole bump be replayed by cancelling and re-adding the class. */
+@keyframes count-bump {
+    0% {
+        color: var(--text-muted);
+        background: rgba(255, 255, 255, 0.05);
+        transform: scale(1);
+    }
+    40% {
+        color: var(--cyan);
+        background: rgba(34, 211, 238, 0.25);
+        transform: scale(1.22);
+    }
+    100% {
+        color: var(--text-muted);
+        background: rgba(255, 255, 255, 0.05);
+        transform: scale(1);
+    }
 }
 
 @keyframes btn-burst-fly {

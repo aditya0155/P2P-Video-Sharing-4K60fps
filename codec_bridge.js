@@ -107,6 +107,14 @@ const GIVE_UP_BACKOFF_MS = (() => {
 // Wall clock of the last run long enough (>=300s) to count as a real broadcast.
 // A crash loop that never reaches that must eventually trip the breaker.
 let lastHealthyRunAt = 0;
+// Wall clock of THIS process. The no-healthy-run breaker below measures "how long
+// has the bridge gone without a real run", and it needs a floor for that question
+// to have a finite answer before the first long run ever happens.
+const bridgeStartedAt = Date.now();
+// How long the bridge may go without a single >=300s run before the breaker trips.
+// Must exceed the 300s health threshold itself, or a bridge that is merely between
+// two long runs could trip on its own healthy operation.
+const NO_HEALTHY_RUN_GRACE_MS = 15 * 60 * 1000;
 // A transcoder that has produced no rendition video this long is hung — most
 // commonly an OBS WHIP AV1 source whose fragmented keyframes never reassemble
 // on the RTSP leg (verified live: the pre-keyframe drop loop never syncs).
@@ -1012,13 +1020,29 @@ async function main() {
         // tripped, or the bridge has been crash-cycling without ever producing
         // a genuinely long run — which the strike counter cannot see, because a
         // 35s crash cycle keeps clearing it.
-        const noHealthyRunFor = lastHealthyRunAt
-            ? Date.now() - lastHealthyRunAt
-            : Infinity;
+        //
+        // The no-healthy-run window is measured from the last real run, or from
+        // THIS PROCESS'S OWN START when there has not been one yet. It used to
+        // fall back to `Infinity` in that case, and `Infinity > 15 * 60 * 1000`
+        // is true — so the breaker fired on the FIRST ffmpeg exit of every fresh
+        // process, no matter how many failures had actually accumulated. The
+        // strike cap of 10, the NVDEC->CPU fallback (which needs a second
+        // iteration to reach) and the in-process retry all sat behind that
+        // branch and were therefore unreachable dead code.
+        //
+        // The cost was a room-wide outage, because this runs as MediaMTX's
+        // runOnAvailable hook with runOnAvailableRestart: one transient
+        // cold-start ffmpeg error (RTSP setup racing the new publisher, the
+        // first keyframe not reassembling inside the 20s startup watchdog, NVENC
+        // contention with OBS on the same GPU) dropped both RTMP publishers, and
+        // a publisher drop closes EVERY WHEP reader session on the path. The
+        // bridge then slept GIVE_UP_BACKOFF_MS and exited, so the rendition tier
+        // stayed down ~60s at a time instead of retrying in 400ms.
+        const noHealthyRunFor = Date.now() - (lastHealthyRunAt || bridgeStartedAt);
         if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES
-            || noHealthyRunFor > 15 * 60 * 1000) {
+            || noHealthyRunFor > NO_HEALTHY_RUN_GRACE_MS) {
             logError(`giving up after ${failures} failed attempts`
-                + (noHealthyRunFor === Infinity ? '' : ` (no healthy run for ${Math.round(noHealthyRunFor / 1000)}s)`));
+                + ` (no healthy run for ${Math.round(noHealthyRunFor / 1000)}s)`);
             if (plan.sourceCodec === 'AV1') {
                 logError(`known limitation: an OBS WHIP AV1 source whose keyframes never reassemble on `
                     + `the RTSP leg cannot be bridged — AV1-capable viewers still play the native `
