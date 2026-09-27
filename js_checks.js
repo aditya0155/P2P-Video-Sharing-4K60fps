@@ -1629,6 +1629,126 @@ Object.assign(cases, {
         };
         compileFunction('syncUnmuteOverlay', nullSandbox).fn();
     },
+
+    // The ABR seam, run for real.
+    //
+    // `switchRendition` used to arm `switchSeamPending = true` and then call
+    // `cleanupConnection(true)`, whose keepPicture branch ends by running
+    // `switchSeamPending = false`. The flag therefore cleared itself one line
+    // later, in the same synchronous block, before the first `await` -- so
+    // `if (switchSeamPending && event.track.kind === 'video')` in ontrack was
+    // DEAD CODE. The string-assertion test in run_tests.py could not see this,
+    // because the clear is inside a *different function's* body: it only checked
+    // that the literal text `switchSeamPending = false` does not appear between
+    // the arm and the await inside switchRendition itself.
+    //
+    // It was worse than dead. The seam branch is the only place that clears
+    // switchSeamTimer, so the 12s safety net armed by switchRendition survived
+    // every switch and fired on its own, nulling player.srcObject and forcing a
+    // full hard WHEP reconnect 12s after a switch that had already succeeded --
+    // a guaranteed black screen on every rendition switch.
+    seam_survives_the_teardown_it_is_armed_across: async () => {
+        const pendingLog = [];
+        const timers = [];
+        const staleTrack = { kind: 'video', id: 'stale-video' };
+        const staleStream = { getTracks: () => [staleTrack] };
+
+        const sandbox = {
+            console: quietConsole(),
+            performance: { now: () => 1000 },
+            fetch: () => Promise.resolve({ ok: true }),
+            addSystemMessage() {},
+            playSfx() {},
+            stopFreezeWatchdog() {},
+            stopTelemetry() {},
+            updateUIState() {},
+            connectStream: async () => {},
+            setTimeout(fn, ms) {
+                // Real timers so the `await new Promise(r => setTimeout(r, 200))`
+                // inside switchRendition actually resolves; the handle is tagged
+                // so the assertions can read its delay and see it cleared.
+                const handle = setTimeout(fn, ms);
+                handle.__ms = ms;
+                timers.push(handle);
+                return handle;
+            },
+            clearTimeout(handle) {
+                if (handle) {
+                    handle.__cleared = true;
+                    clearTimeout(handle);
+                }
+            },
+            MediaStream: function () { return { getTracks: () => [], addTrack() {} }; },
+            // Session state a connected, non-paused viewer is in.
+            switchSeamPending: false,
+            switchSeamTimer: null,
+            isConnected: true,
+            isConnecting: false,
+            activeStreamPath: 'live',
+            abrBadSec: 8,
+            abrCalmSec: 0,
+            lastRenditionSwitchAt: -60000,
+            viewerPausedByChoice: false,
+            whepSessionUrl: null,
+            peerConnection: null,
+            connectTimeout: null,
+            disconnectGraceTimer: null,
+            muteConfirmTimeout: null,
+            whepAbortController: null,
+            whepPostTimeout: null,
+            gatherTimeout: null,
+            renditionPollInterval: null,
+            player: { paused: false, srcObject: staleStream, pause() {}, play: () => Promise.resolve() },
+        };
+        sandbox.window = sandbox;
+
+        // Record the value the flag holds at each transition so we can tell
+        // "armed then self-cleared" apart from "never cleared".
+        let armedAt = null;
+        let armedValue = false;
+        let sawArm = false;
+        Object.defineProperty(sandbox, 'switchSeamPending', {
+            get() { return armedValue; },
+            set(v) {
+                if (v === true && !sawArm) { sawArm = true; armedAt = 'armed'; }
+                if (v === false && sawArm && armedValue === true) armedAt = 'cleared-after-arm';
+                armedValue = v;
+            },
+            configurable: true
+        });
+        let timerValue = null;
+        Object.defineProperty(sandbox, 'switchSeamTimer', {
+            get() { return timerValue; },
+            set(v) { timerValue = v; },
+            configurable: true
+        });
+
+        // Both real functions are evaluated in the SAME context so
+        // switchRendition resolves cleanupConnection from its own scope.
+        const seamContext = vm.createContext(sandbox, { name: 'app.js#switchRendition' });
+        vm.runInContext(
+            `${extractFunction('cleanupConnection')}\n${extractFunction('switchRendition')}\n`
+            + 'seamUnderTest = switchRendition;',
+            seamContext, { filename: 'app.js#switchRendition' });
+        const switchRendition = sandbox.seamUnderTest;
+
+        try {
+            await switchRendition('live-av1', 'test rendition switch');
+        } finally {
+            timers.forEach((t) => clearTimeout(t));
+        }
+
+        assert(sawArm, 'switchRendition never armed the seam');
+        pendingLog.push(`arm state: ${armedAt}`);
+        assertEqual(armedAt, 'armed',
+            'switchSeamPending was cleared again before the replacement session could ontrack, '
+            + 'so the ontrack seam branch is dead code and the 12s safety net is orphaned');
+        assertEqual(armedValue, true,
+            'the seam must still be pending when connectStream() is awaited');
+        assert(timerValue, 'switchRendition must arm the 12s seam safety net');
+        assert(!timerValue.__cleared,
+            'the seam safety net was cleared without the seam ever closing');
+    },
 });
 
 /* --------------------------------------------------------------------------

@@ -124,6 +124,56 @@ def http_request(port, method, path, body=None, headers=None):
         connection.close()
 
 
+def read_response_until_terminal(port, path, timeout=6):
+    """Classify how a response ends, keeping "hung forever" distinguishable.
+
+    http_request() cannot express the interesting outcome: a proxy that leaves a
+    half-sent response open just blocks until the socket timeout, which reads
+    the same as a proxy that is merely slow. This returns one of
+
+      "end"       -- the server closed after sending every promised byte
+      "truncated" -- the server closed with the promised Content-Length unsatisfied
+      "reset"     -- the connection was torn down mid-response
+      "timeout"   -- nothing terminal happened within `timeout` seconds
+
+    so a test can assert the specific guarantee ("cut loose") rather than the
+ absence of a crash.
+    """
+    connection = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        connection.sendall(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n".format(
+                path, port
+            ).encode("ascii")
+        )
+        received = b""
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return "timeout", received
+            connection.settimeout(remaining)
+            try:
+                chunk = connection.recv(4096)
+            except socket.timeout:
+                return "timeout", received
+            except OSError:
+                return "reset", received
+            if not chunk:
+                break
+            received += chunk
+
+        head, _, body = received.partition(b"\r\n\r\n")
+        promised = 0
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                promised = int(value.strip() or b"0")
+        return ("end" if len(body) >= promised else "truncated"), received
+    finally:
+        connection.close()
+
+
 def run_js_check(test_case, case_name):
     """Run one js_checks.js case and fail with its diagnostics on error."""
     node = shutil.which("node")
@@ -152,6 +202,19 @@ class _QuietHTTPServer(HTTPServer):
         if isinstance(error, (ConnectionResetError, BrokenPipeError, TimeoutError)):
             return
         super().handle_error(request, client_address)
+
+
+class _DiesMidBody:
+    """Sentinel body for StubMediaMTX routes: promise bytes, send some, then die.
+
+    A plain route can only ever produce a well-formed response, so without this
+    the "upstream fails after its headers are already on the wire" path -- the
+    one shape a WHEP POST or a status probe can actually hit -- is unreachable
+    from a test.
+    """
+
+
+DIES_MID_BODY = _DiesMidBody()
 
 
 class StubMediaMTX:
@@ -188,6 +251,28 @@ class StubMediaMTX:
                     status, extra_headers, payload = 200, {}, b"stub-ok"
                 else:
                     status, extra_headers, payload = route(stub)
+                if payload is DIES_MID_BODY:
+                    # Send headers promising far more than follows, flush a
+                    # little of the body, then kill the connection. The pause
+                    # lets the proxy forward those bytes to the client before
+                    # the fault, so a test can assert the client really did
+                    # receive a partial response and was then cut loose --
+                    # rather than failing before any body existed.
+                    self.send_response(status)
+                    for key, value in extra_headers.items():
+                        self.send_header(key, value)
+                    self.send_header("Content-Length", "4096")
+                    self.end_headers()
+                    self.wfile.write(b"v=0\r\n")
+                    self.wfile.flush()
+                    time.sleep(0.2)
+                    self.close_connection = True
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    self.connection.close()
+                    return
                 self.send_response(status)
                 for key, value in extra_headers.items():
                     self.send_header(key, value)
@@ -584,6 +669,18 @@ class JsLogicChecks(unittest.TestCase):
     def test_unmute_overlay_follows_the_mute_state(self):
         run_js_check(self, "unmute-overlay-follows-mute-state")
 
+    def test_abr_seam_survives_the_teardown_it_is_armed_across(self):
+        """Runs the real switchRendition + cleanupConnection and watches the flag.
+
+        `switchSeamPending` was armed and then cleared one line later by
+        cleanupConnection(true), in the same synchronous block and before the
+        first await -- so the ontrack seam branch was dead code AND the 12s
+        safety net it was supposed to cancel was orphaned, firing on its own
+        into a hard reconnect 12s after every successful switch. The
+        string-only check below cannot see that, because the clear lives in a
+        different function's body."""
+        run_js_check(self, "seam_survives_the_teardown_it_is_armed_across")
+
 
 class StreamApiProxyChecks(_SiteUnderTest):
     """Every byte the player exchanges with MediaMTX crosses this proxy."""
@@ -602,6 +699,10 @@ class StreamApiProxyChecks(_SiteUnderTest):
         ),
         ("GET", "/rel-redirect"): lambda stub: (302, {"Location": "/live/other"}, b""),
         ("GET", "/ext-redirect"): lambda stub: (302, {"Location": "https://example.invalid/elsewhere"}, b""),
+        # MediaMTX that answers, then dies before the body is finished.
+        ("GET", "/live/truncated"): lambda stub: (
+            200, {"Content-Type": "application/sdp"}, DIES_MID_BODY,
+        ),
     })
 
     API_ROUTES = property(lambda self: {
@@ -707,6 +808,33 @@ class StreamApiProxyChecks(_SiteUnderTest):
         self.assertIn("Location", headers.get("Access-Control-Expose-Headers", ""))
         self.assertEqual(self.signaling.requests, [], "preflight must not reach MediaMTX")
         self.assertEqual(self.api.requests, [], "preflight must not reach MediaMTX")
+
+    def test_upstream_that_dies_mid_body_is_cut_loose_instead_of_hanging(self):
+        # A response that dies AFTER its headers is reported on Node's *response*
+        # object, never on the request, and pipe() does not forward source errors
+        # to the destination -- so the proxy used to simply leave the client's
+        # socket open forever. Measured against an upstream that destroys the
+        # socket mid-body, the client saw no end, no abort and no error in 40s,
+        # and the 30s request timeout never fired either, because it only arms
+        # while there is still no response. That is precisely the freeze the
+        # timeout's own comment says it exists to prevent: a status probe that
+        # hangs leaves the player's reconnect loop with no error to retry on.
+        outcome, received = read_response_until_terminal(self.port, "/stream-api/live/truncated")
+
+        self.assertIn(b"v=0", received,
+                      "the client must actually have received the partial body, otherwise this "
+                      "test is not exercising a mid-body death at all")
+        self.assertNotEqual(
+            outcome, "timeout",
+            "the proxy left the client's socket open after the upstream died mid-body; "
+            "the client will hang until the browser gives up",
+        )
+        self.assertIn(outcome, ("truncated", "reset"),
+                      "the partial response must be cut, not left dangling: got {!r}".format(outcome))
+
+        # Cutting the socket must not wedge the proxy for the next viewer.
+        status, _, _ = http_request(self.port, "GET", "/stream-api/live/whep")
+        self.assertEqual(status, 404, "the proxy must still serve normally after a cut response")
 
     def test_turn_endpoint_serves_cloudflare_stun_without_turn_config(self):
         # Without CF_TURN_KEY_* the endpoint must still answer 200 with the
@@ -2596,10 +2724,6 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertIn("display: none", unmute,
                       "the unmute prompt must be hidden by default and shown only by app.js")
 
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
     def test_self_sent_chat_ids_are_pruned(self):
         """A sender's own echoed message hits an early return before the prune,
         so the set grew 1:1 with self-sends and the stated 500 cap never held."""
@@ -2645,7 +2769,12 @@ if __name__ == "__main__":
         routinely miss that window and the brand fonts would silently never
         render for any viewer. That is a visible regression traded for one
         layout pass, so it was reverted to the default `swap`."""
-        html = read_text(HTML_PATH)
+        # HTML comments are stripped first: index.html carries a comment that
+        # NAMES `display=optional` precisely to record that it was tried and
+        # reverted. Asserting against the raw document flagged that explanation
+        # as if it were the defect -- the same false positive the rest of this
+        # file avoids by running assertions against _strip_comments() output.
+        html = re.sub(r"<!--.*?-->", "", read_text(HTML_PATH), flags=re.DOTALL)
         self.assertIn("fonts.googleapis.com", html)
         self.assertIn("display=swap", html,
                       "the brand fonts must still be able to load on a slow uplink")
@@ -2732,6 +2861,18 @@ if __name__ == "__main__":
         between = code[start:end]
         self.assertNotIn("switchSeamPending = false", between,
                          "clearing the flag before the first await makes the seam dead code")
+        # The bug then came BACK in a form the window above cannot see: the
+        # clear was moved into cleanupConnection(), which switchRendition calls
+        # on the very next line. Nothing between the arm and the await contains
+        # the literal text any more, so this check passed while the seam was
+        # still dead code. Forbid the actual defect -- arming before a teardown
+        # call -- and let the executed guarantee live in
+        # JsLogicChecks.test_abr_seam_survives_the_teardown_it_is_armed_across.
+        arm_line = code.rfind("\n", 0, start) + 1
+        self.assertNotIn("cleanupConnection(",
+                         code[arm_line:start],
+                         "the seam must be armed AFTER cleanupConnection(), which is the "
+                         "call that clears the flag and would undo the arm immediately")
 
     def test_seam_safety_timer_is_cancelled_by_teardown(self):
         """cleanupConnection did not know about the seam's 12s safety net, so an
@@ -2808,10 +2949,78 @@ if __name__ == "__main__":
         self.assertRegex(code, r"if \(runSeconds >= 300\) \{\s*\n\s*lastHealthyRunAt = Date\.now\(\);",
                          "only a genuinely long run should mark the bridge as healthy")
         check = code.find("if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES")
-        self.assertGreater(check, 0, "the give-up check was not found")
-        window = code[check:check + 400]
-        self.assertIn("noHealthyRunFor", window,
-                      "the breaker must also trip when the bridge never produces a long run")
+        if check > 0:
+            # Inline form: the second arm must sit in the same condition.
+            window = code[check:check + 400]
+            self.assertIn("noHealthyRunFor", window,
+                          "the breaker must also trip when the bridge never produces a long run")
+        else:
+            # Extracted form: the same guarantee now lives in a callable
+            # shouldGiveUp(), which test_bridge_retry_budget_is_reachable
+            # executes directly.
+            self.assertIn("function shouldGiveUp(", code,
+                          "the give-up check must be a single testable function")
+            self.assertIn("NO_HEALTHY_RUN_LIMIT_MS", code,
+                          "the no-healthy-run window must still exist and be named")
+            self.assertIn("shouldGiveUp(failures, lastHealthyRunAt",
+                          code[code.find("shouldGiveUp(failures"):][:120],
+                          "the retry loop must actually consult the breaker")
+
+    def test_bridge_retry_budget_is_reachable(self):
+        """The breaker tripped on the FIRST ffmpeg exit, not the tenth.
+
+        `lastHealthyRunAt` was seeded with 0 and the give-up site read it as
+        `lastHealthyRunAt ? now - lastHealthyRunAt : Infinity`, so the
+        "no healthy run yet" case became `Infinity > 900000` = true and the
+        bridge gave up after a single attempt. That made the
+        MAX_CONSECUTIVE_FFMPEG_FAILURES = 10 retry budget, the
+        `gpuFastFailures >= 2` NVDEC -> CPU fallback, and the 400ms/2s backoff
+        ladder unreachable: any one ffmpeg exit (a stall-watchdog kill, an OBS
+        reconnect) slept the full GIVE_UP_BACKOFF_MS and exited 1 with the
+        renditions dead instead of restarting.
+
+        This executes the real exported shouldGiveUp() over the whole failure
+        budget and over the 15-minute no-healthy-run window.
+        """
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise the bridge breaker")
+        script = """
+        const b = require('./codec_bridge.js');
+        if (typeof b.shouldGiveUp !== 'function') throw new Error('shouldGiveUp is not exported');
+        const T0 = 1750000000000;
+        const cap = b.MAX_CONSECUTIVE_FFMPEG_FAILURES;
+        // The full consecutive-failure budget must be usable.
+        for (let f = 1; f < cap; f++) {
+            if (b.shouldGiveUp(f, T0, T0 + f * 1000)) {
+                throw new Error('gave up after ' + f + ' failure(s); budget is ' + cap);
+            }
+        }
+        if (!b.shouldGiveUp(cap, T0, T0 + cap * 1000)) {
+            throw new Error('the consecutive-failure cap never fires');
+        }
+        // The second arm must still work: crash-cycling with few failures must
+        // still trip once the no-healthy-run window has elapsed...
+        if (!b.shouldGiveUp(3, T0, T0 + b.NO_HEALTHY_RUN_LIMIT_MS + 1000)) {
+            throw new Error('a crash cycle that never reaches 300s must eventually trip the breaker');
+        }
+        // ...but not before it.
+        if (b.shouldGiveUp(3, T0, T0 + b.NO_HEALTHY_RUN_LIMIT_MS - 60000)) {
+            throw new Error('the breaker fired inside its own window');
+        }
+        // The exact regression: a falsy stamp means "no long run yet", which
+        // must NOT be read as an infinitely long gap.
+        if (b.shouldGiveUp(1, 0, T0 + 1000)) {
+            throw new Error('a falsy lastHealthyRunAt must not trip the breaker on the first exit');
+        }
+        // And a real wall clock measured from the bridge start behaves the same.
+        if (b.shouldGiveUp(1, T0, T0 + 5000)) {
+            throw new Error('the first exit inside the window must be retried');
+        }
+        console.log('breaker budget OK');
+        """
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_launcher_stale_config_is_a_warning_not_a_site_outage(self):
         """The comparison used to `throw`, and the launcher's outer catch exits
@@ -2841,7 +3050,15 @@ if __name__ == "__main__":
         block = self.config[max(0, self.config.find("writeQueueSize") - 1400):
                             self.config.find("writeQueueSize")]
         self.assertIn("0.41s", block, "the queue-depth arithmetic must be correct")
-        self.assertNotIn("3.3s at 6 Mbps", block, "the 8x-wrong figure must not come back")
+        # The retraction itself has to NAME the wrong figure ("an earlier version
+        # of this comment claimed 3.3s ... would need ~16,500 packets"), so
+        # banning the bare substring flagged the correction as if it were the
+        # defect. What must never come back is the queue being *stated* as 3.3s,
+        # which is the shape the original bad comment used.
+        self.assertNotRegex(block, r"=\s*~?\s*3\.3s",
+                            "the 8x-wrong figure must not be stated as this queue's depth")
+        self.assertRegex(block, r"claimed 3\.3s",
+                         "the comment must keep explaining why 3.3s was wrong")
 
     def test_grain_background_has_no_fixed_attachment(self):
         """`background-attachment: fixed` is a no-op while html/body's background

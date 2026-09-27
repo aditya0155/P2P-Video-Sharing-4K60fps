@@ -2049,8 +2049,21 @@ document.addEventListener('DOMContentLoaded', () => {
         // "stressed" forever), but a rebuild must not override their choice.
         const wasPaused = player.paused;
         viewerPausedByChoice = wasPaused;
-        switchSeamPending = true;
         cleanupConnection(true);
+        // The seam flag is armed AFTER cleanupConnection, never before. Teardown
+        // deliberately ends by running `switchSeamPending = false` (so a teardown
+        // that nobody asked to switch cannot leave the NEXT session's first
+        // ontrack hijacking the element), and cleanupConnection(true) is the
+        // call that tears the old session down. Arming first therefore cleared
+        // itself one line later, in the same synchronous block and before the
+        // first await ~30 lines below -- so `if (switchSeamPending && ...)` in
+        // ontrack was DEAD CODE and the seam never ran, exactly the bug its own
+        // comment below claims to have fixed. It was worse than dead: because
+        // the seam branch is also the only place that clears switchSeamTimer,
+        // the 12s safety net below survived every switch and fired on its own,
+        // nulling srcObject and forcing a full hard reconnect 12s after a switch
+        // that had already succeeded -- a guaranteed black screen per switch.
+        switchSeamPending = true;
         // Safety net for the seam: if the replacement handshake never yields a
         // track, the stale (now-ended) stream would otherwise stay on screen
         // indefinitely. 12s is far beyond the 10s WHEP cap, so this only fires
