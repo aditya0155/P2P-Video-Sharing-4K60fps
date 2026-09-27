@@ -129,6 +129,23 @@ body.perf-mode .video-container {
     animation: none;
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.8);
 }
+/* Eco Mode also drops backdrop blur: the telemetry HUD, volume toast and
+   action ripple sit ON TOP of the video, so their backdrop-filter re-runs on
+   every decoded frame — exactly the GPU time Eco Mode exists to give back to
+   the decoder. Header/sidebar/reaction blurs sample the (already frozen)
+   ambient layer; dropping them guarantees the compositor never re-samples a
+   blur while the stream plays. Solid backgrounds stay, so nothing becomes
+   unreadable. */
+body.perf-mode .app-header,
+body.perf-mode .sidebar-section,
+body.perf-mode .reaction-section,
+body.perf-mode .telemetry-hud,
+body.perf-mode .unmute-btn,
+body.perf-mode .volume-toast,
+body.perf-mode .action-feedback {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+}
 
 /* ── App Container ──────────────────────────────────────────────────────── */
 .app-container {
@@ -451,20 +468,20 @@ body.perf-mode .video-container {
 }
 
 .signal-icon {
-    font-size: 48px; color: var(--text-muted);
-    margin-bottom: 16px;
+    font-size: 34px; color: var(--text-muted);
+    margin-bottom: 10px;
     filter: drop-shadow(0 0 8px var(--primary-glow));
 }
 
 .offline-content h2 {
     font-family: var(--font-display);
-    font-size: 18px; font-weight: 700;
-    margin-bottom: 8px; letter-spacing: 1.5px;
+    font-size: 16px; font-weight: 700;
+    margin-bottom: 6px; letter-spacing: 1.2px;
 }
 
 .offline-content p {
-    font-size: 13px; color: var(--text-secondary);
-    line-height: 1.6; margin-bottom: 20px;
+    font-size: 12px; color: var(--text-secondary);
+    line-height: 1.5; margin-bottom: 14px;
 }
 
 .offline-pulse-bar {
@@ -487,26 +504,48 @@ body.perf-mode .video-container {
 .offline-pulse-bar span:nth-child(4) { animation-delay: 0.45s; }
 .offline-pulse-bar span:nth-child(5) { animation-delay: 0.6s; }
 
-/* Unmute Button */
+/* Unmute Button — Clean video platform aesthetic (Twitch / YouTube style) */
 .unmute-btn {
     pointer-events: auto;
-    background: linear-gradient(135deg, rgba(139, 92, 246, 0.85), rgba(34, 211, 238, 0.6));
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    color: #fff; padding: 14px 32px;
+    background: rgba(15, 17, 26, 0.88);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    color: #ffffff;
+    padding: 10px 22px;
     border-radius: var(--radius-full);
-    font-size: 14px; font-weight: 600;
-    display: flex; align-items: center; gap: 10px;
+    font-family: var(--font-body);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
     cursor: pointer;
-    box-shadow: 0 0 20px var(--primary-glow), 0 8px 24px rgba(0,0,0,0.4);
-    animation: pulse-button 2.5s infinite;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.08);
     transition: all var(--speed-fast) var(--ease);
 }
 
+.unmute-btn i {
+    font-size: 14px;
+    color: var(--text-secondary);
+    transition: color var(--speed-fast);
+}
+
 .unmute-btn:hover {
-    transform: scale(1.06);
-    box-shadow: 0 0 30px var(--primary-glow), 0 0 15px var(--cyan-glow);
+    background: rgba(26, 29, 43, 0.95);
+    border-color: rgba(255, 255, 255, 0.3);
+    color: #ffffff;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.unmute-btn:hover i {
+    color: var(--cyan);
+}
+
+.unmute-btn:active {
+    transform: translateY(0) scale(0.97);
 }
 
 /* ── Telemetry HUD ──────────────────────────────────────────────────────── */
@@ -661,7 +700,7 @@ body.perf-mode .video-container {
 .video-container:fullscreen:not(.controls-active) *,
 .video-container:-webkit-full-screen:not(.controls-active),
 .video-container:-webkit-full-screen:not(.controls-active) * {
-    cursor: none;
+    cursor: none !important;
 }
 
 .controls-progress {
@@ -782,17 +821,30 @@ body.perf-mode .video-container {
 
 .reactions-title i { font-size: 14px; color: var(--text-secondary); }
 
-.emoji-bar { display: flex; gap: 8px; }
+.emoji-bar {
+    display: flex;
+    gap: 8px;
+    flex-wrap: nowrap;
+    align-items: center;
+}
 
 .emoji-btn {
+    position: relative;
+    overflow: visible;
     background: var(--bg-glass);
     border: 1px solid var(--border-subtle);
     color: #fff;
-    padding: 6px 12px;
+    padding: 6px 10px;
     border-radius: var(--radius-full);
     font-size: 13px; cursor: pointer;
-    display: flex; align-items: center; gap: 6px;
+    display: flex; align-items: center; gap: 5px;
     transition: all var(--speed-fast) var(--ease-bounce);
+    flex: 1 1 0;
+    min-width: 0;
+    justify-content: center;
+    white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
 }
 
 .emoji-btn:hover {
@@ -804,6 +856,10 @@ body.perf-mode .video-container {
 
 .emoji-btn:active { transform: translate3d(0, -1px, 0) scale(0.97); }
 
+.emoji-btn.btn-popping {
+    animation: emoji-btn-pop 0.32s cubic-bezier(0.175, 0.885, 0.32, 1.35) forwards;
+}
+
 .emoji-icon { font-size: 15px; }
 
 .emoji-count {
@@ -812,16 +868,49 @@ body.perf-mode .video-container {
     background: rgba(255,255,255,0.05);
     padding: 1px 6px; border-radius: var(--radius-full);
     min-width: 18px; text-align: center;
+    transition: transform 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
 
-/* Flying Emojis */
-.flying-emoji {
-    position: absolute; bottom: 50px;
-    font-size: 26px;
-    pointer-events: none; z-index: 4;
-    animation: fly-up 2.2s ease-out forwards;
-    filter: drop-shadow(0 0 4px rgba(0,0,0,0.4));
+.emoji-count.count-bump {
+    color: var(--cyan) !important;
+    background: rgba(34, 211, 238, 0.25) !important;
+    transform: scale(1.22);
+}
+
+/* Floating Particle from Button */
+.btn-burst-emoji {
+    position: absolute;
+    bottom: 50%;
+    left: 50%;
+    font-size: 32px;
+    pointer-events: none;
+    z-index: 999;
+    user-select: none;
+    -webkit-user-select: none;
+    animation: btn-burst-fly 1.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    filter: drop-shadow(0 4px 12px rgba(0,0,0,0.6));
     will-change: transform, opacity;
+}
+
+/* Flying Emojis inside Video Container */
+.flying-emoji {
+    position: absolute;
+    bottom: 24px;
+    font-size: 36px;
+    pointer-events: none;
+    z-index: 50;
+    animation: fly-up 2.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+    filter: drop-shadow(0 4px 12px rgba(0,0,0,0.7));
+    will-change: transform, opacity;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+@media (max-width: 600px) {
+    .flying-emoji {
+        font-size: 26px;
+        bottom: 16px;
+    }
 }
 
 /* ── Sidebar ────────────────────────────────────────────────────────────── */
@@ -889,6 +978,29 @@ body.perf-mode .video-container {
 
 .chat-header-title {
     display: flex; align-items: center; gap: 6px; font-weight: 600;
+}
+
+.chat-header-actions {
+    display: flex; align-items: center; gap: 8px;
+}
+
+.chat-nick-btn {
+    background: var(--bg-glass);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 11px;
+    font-family: var(--font-body);
+    padding: 3px 8px;
+    display: flex; align-items: center; gap: 5px;
+    transition: all var(--speed-fast);
+}
+
+.chat-nick-btn:hover {
+    color: var(--primary);
+    border-color: var(--primary);
+    background: rgba(139, 92, 246, 0.1);
 }
 
 .chat-sound-btn {
@@ -1234,10 +1346,49 @@ kbd {
     50% { transform: scaleY(1); opacity: 0.7; }
 }
 
+@keyframes emoji-btn-pop {
+    0% { transform: scale(1); }
+    40% { transform: scale(1.28) rotate(-4deg); }
+    75% { transform: scale(0.95) rotate(2deg); }
+    100% { transform: scale(1) rotate(0deg); }
+}
+
+@keyframes btn-burst-fly {
+    0% {
+        opacity: 0;
+        transform: translate3d(-50%, 0, 0) scale(0.5);
+    }
+    12% {
+        opacity: 1;
+        transform: translate3d(calc(-50% + var(--burst-drift-x, 0px) * 0.25), -50px, 0) scale(1.35) rotate(var(--burst-rot, 8deg));
+    }
+    55% {
+        opacity: 0.95;
+        transform: translate3d(calc(-50% + var(--burst-drift-x, 0px) * 0.7), -150px, 0) scale(1.15) rotate(calc(var(--burst-rot, 8deg) * -0.6));
+    }
+    100% {
+        opacity: 0;
+        transform: translate3d(calc(-50% + var(--burst-drift-x, 0px)), -260px, 0) scale(0.85) rotate(var(--burst-rot, 8deg));
+    }
+}
+
 @keyframes fly-up {
-    0% { transform: translate3d(0, 0, 0) scale(0.5); opacity: 0; }
-    8% { opacity: 1; transform: translate3d(0, -15px, 0) scale(1.15) rotate(4deg); }
-    100% { transform: translate3d(0, -280px, 0) scale(0.85) rotate(-12deg); opacity: 0; }
+    0% {
+        transform: translate3d(0, 0, 0) scale(0.4);
+        opacity: 0;
+    }
+    10% {
+        opacity: 1;
+        transform: translate3d(calc(var(--sway-x, 0px) * 0.3), -35px, 0) scale(1.25) rotate(var(--sway-rot, 6deg));
+    }
+    50% {
+        opacity: 0.95;
+        transform: translate3d(calc(var(--sway-x, 0px) * 0.8), -150px, 0) scale(1.1) rotate(calc(var(--sway-rot, 6deg) * -0.7));
+    }
+    100% {
+        transform: translate3d(var(--sway-x, 0px), -320px, 0) scale(0.85) rotate(var(--sway-rot, 6deg));
+        opacity: 0;
+    }
 }
 
 @keyframes msg-slide-in {
@@ -1287,11 +1438,11 @@ kbd {
     body, html { overflow-y: auto; }
     .app-container { height: auto; }
 
-    .emoji-bar { flex-wrap: wrap; }
+    .emoji-bar { flex-wrap: nowrap; width: 100%; gap: 6px; }
 
     .reaction-section {
         flex-direction: column; gap: 8px;
-        align-items: flex-start;
+        align-items: stretch;
     }
 }
 
@@ -1319,7 +1470,7 @@ kbd {
 .live-label[hidden] { display: none; }
 .reactions-title { gap: 8px; }
 .reactions-title small { color: var(--text-muted); font-size: 10px; font-weight: 400; }
-.emoji-btn { min-width: 40px; min-height: 38px; justify-content: center; padding: 6px 10px; }
+.emoji-btn { flex: 1 1 0; min-width: 0; min-height: 36px; justify-content: center; padding: 5px 6px; }
 .emoji-icon { line-height: 1; }
 .activity-empty {
     display: flex;
@@ -1339,7 +1490,12 @@ kbd {
 .activity-empty span { color: var(--text-muted); font-size: 11px; line-height: 1.5; }
 .badge-note { background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(34, 211, 238, 0.24); }
 .controls-row { min-height: 38px; }
-.video-container:has(:focus-visible) .player-controls { opacity: 1; pointer-events: auto; }
+/* Keyboard focus forces the bar up — but only in windowed mode: in fullscreen
+   the inactivity timer is the single source of truth. Chrome matches
+   :focus-visible on mouse clicks to range inputs (the volume slider), so an
+   unblurred slider would otherwise keep the bar painted forever regardless
+   of what the JS does — visible only when Alt+Tab re-evaluated focus. */
+.video-container:not(:fullscreen):not(:-webkit-full-screen):has(:focus-visible) .player-controls { opacity: 1; pointer-events: auto; }
 
 button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
     outline: 2px solid var(--cyan);
@@ -1356,27 +1512,43 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
     .app-container { height: auto; min-height: 100vh; min-height: 100dvh; }
     .main-content { min-height: auto; }
     .player-section { overflow: visible; }
-    .reaction-section { flex-direction: row; align-items: center; }
+    .reaction-section { flex-direction: column; align-items: stretch; gap: 8px; width: 100%; }
+    .emoji-bar { flex-wrap: nowrap; width: 100%; }
 }
 
 @media (max-width: 600px) {
-    .app-header { min-height: 56px; }
+    .app-header { min-height: 52px; padding: 0 10px; gap: 8px; }
     .header-right { gap: 8px; }
-    .perf-toggle-btn { padding: 7px 9px; }
+    .perf-toggle-btn { padding: 6px 8px; }
     .perf-toggle-btn span { display: none; }
     .viewer-count { display: none; }
-    .stream-title { font-size: 13px; }
-    .stream-codec { max-width: 42vw; font-size: 9px; }
-    .reaction-section { gap: 10px; padding: 10px 12px; }
-    .reactions-title { flex-wrap: wrap; gap: 5px 7px; }
-    .reactions-title small { flex-basis: 100%; margin-left: 21px; }
-    .emoji-bar { gap: 5px; }
-    .emoji-btn { min-width: 36px; min-height: 36px; padding: 5px 8px; }
+    .stream-title { font-size: 13px; line-height: 1.2; }
+    .stream-codec { max-width: 42vw; font-size: 9.5px; line-height: 1.2; }
+    .reaction-section { gap: 6px; padding: 8px 10px; flex-wrap: nowrap; width: 100%; flex-direction: column; }
+    .reactions-title { flex-wrap: nowrap; gap: 5px 7px; font-size: 11px; }
+    .reactions-title small { font-size: 9px; margin-left: 0; }
+    .emoji-bar { gap: 4px; flex-wrap: nowrap; width: 100%; }
+    .emoji-btn { flex: 1 1 0; min-width: 0; min-height: 32px; padding: 4px 2px; gap: 3px; justify-content: center; }
+    .emoji-icon { font-size: 13px; }
+    .emoji-count { font-size: 8.5px; min-width: 14px; padding: 1px 3px; }
     .controls-left, .controls-right { gap: 3px; }
     .control-btn { width: 32px; height: 34px; }
     .volume-slider { width: 54px; }
     .volume-badge { display: none; }
     html, body { overflow-x: hidden; }
+
+    /* Compact offline overlay for mobile video */
+    .player-offline-overlay { padding: 4px; }
+    .offline-content { padding: 6px 10px; max-width: 280px; }
+    .signal-icon { font-size: 22px; margin-bottom: 4px; }
+    .offline-content h2 { font-size: 13px; letter-spacing: 0.6px; margin-bottom: 2px; }
+    .offline-content p { font-size: 10px; line-height: 1.35; margin-bottom: 6px; }
+    .radar-ring { width: 55px; height: 55px; }
+    .offline-pulse-bar span { width: 2.5px; height: 10px; }
+
+    /* Compact unmute button for mobile */
+    .unmute-btn { padding: 8px 18px; font-size: 12px; gap: 7px; }
+    .unmute-btn i { font-size: 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1386,4 +1558,49 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
     }
+}
+
+/* ── Mobile Layout Hardening ──────────────────────────────────────────────── */
+/* Phones overflowed the header and the control bar (right-hand buttons were
+   clipped by overflow:hidden instead of staying reachable). These rules keep
+   every control inside the viewport on narrow screens. */
+@media (max-width: 600px) {
+    .app-header { gap: 10px; }
+    .header-left { flex: 1 1 auto; min-width: 0; }
+    .stream-title-group { min-width: 0; }
+    .stream-title {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .header-right { flex: 0 0 auto; }
+
+    .reaction-section { flex-wrap: nowrap; }
+    .telemetry-hud { width: min(310px, calc(100% - 24px)); }
+
+    .player-controls { padding: 18px 8px 10px; }
+    .controls-left, .controls-right { gap: 3px; }
+    .control-btn { width: 30px; height: 30px; font-size: 13px; }
+    .volume-slider { width: 46px; }
+    .live-label {
+        font-size: 9px;
+        letter-spacing: 1px;
+        padding: 3px 8px;
+        gap: 4px;
+    }
+}
+
+/* Very narrow phones (<400px): compress further so play/pause, volume, LIVE,
+   latency, PiP, theatre, stats and fullscreen all fit on a single row. */
+@media (max-width: 400px) {
+    .player-controls { padding: 16px 6px 10px; }
+    .controls-left, .controls-right { gap: 2px; }
+    .control-btn { width: 28px; height: 30px; font-size: 12px; }
+    .volume-slider { width: 40px; }
+}
+
+/* Legacy 320px-wide devices: the mute button (plus device volume keys)
+   replaces the slider to guarantee the row fits. */
+@media (max-width: 340px) {
+    .volume-slider { display: none; }
 }

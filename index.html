@@ -14,7 +14,7 @@
     <!-- FontAwesome Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <!-- Custom CSS -->
-<link rel="stylesheet" href="/streaming/style.css?v=2.8.0">
+<link rel="stylesheet" href="/streaming/style.css?v=2.21.0">
 </head>
 <body>
     <!-- Ambient Background -->
@@ -34,7 +34,7 @@
                     <span class="stream-codec" id="stream-summary">Waiting for stream</span>
                 </div>
             </div>
-
+            
             <div class="header-right">
                 <!-- GPU Performance Mode Toggle -->
                 <button class="perf-toggle-btn" id="perf-toggle-btn" title="Reduce decorative visual effects" aria-pressed="false">
@@ -48,10 +48,11 @@
                     <span class="status-text" id="status-text">OFFLINE</span>
                 </div>
 
-                <!-- Viewer count is not exposed by the current stream service. -->
-                <div class="viewer-count" title="Viewer count is unavailable">
+                <!-- Live viewer count, broadcast by the server over SSE on
+                     every connected-page join/leave (includes this page). -->
+                <div class="viewer-count" title="Connected viewers (including you)">
                     <i class="fa-solid fa-eye"></i>
-                    <span id="viewer-num" aria-label="Viewer count unavailable">—</span>
+                    <span id="viewer-num" aria-label="Connecting viewer count">—</span>
                     <span class="viewer-label">viewers</span>
                 </div>
             </div>
@@ -64,7 +65,7 @@
                 <!-- Video Container -->
                 <div class="video-container" id="video-container">
                     <video id="stream-player" autoplay playsinline muted aria-label="Live screen share"></video>
-
+                    
                     <!-- Gesture Action Indicator (Ripple Flash) -->
                     <div class="action-feedback" id="action-feedback" aria-hidden="true">
                         <i class="fa-solid fa-play"></i>
@@ -78,9 +79,9 @@
 
                     <!-- Floating Unmute Overlay -->
                     <div class="unmute-overlay" id="unmute-overlay">
-                        <button class="unmute-btn" id="unmute-overlay-btn">
+                        <button class="unmute-btn" id="unmute-overlay-btn" aria-label="Unmute stream audio">
                             <i class="fa-solid fa-volume-xmark"></i>
-                            <span>Click to Unmute</span>
+                            <span>Click to unmute</span>
                         </button>
                     </div>
 
@@ -165,6 +166,10 @@
                                 <span class="hud-label">Buffer Target</span>
                                 <span class="hud-value" id="hud-buffer">180 ms</span>
                             </div>
+                            <div class="hud-item">
+                                <span class="hud-label">Route</span>
+                                <span class="hud-value" id="hud-route">--</span>
+                            </div>
                             <div class="hud-item hud-item-wide">
                                 <span class="hud-label">Video State</span>
                                 <span class="hud-value" id="hud-video-state">--</span>
@@ -194,9 +199,9 @@
                                 <span class="live-label" id="live-label" hidden><span class="live-dot"></span>LIVE</span>
                             </div>
                             <div class="controls-right">
-                                <!-- Adaptive Latency Mode Switcher -->
-                                <button class="control-btn" id="latency-mode-btn" title="Latency buffer: Anti-Stutter (350 ms)" aria-label="Change latency buffer">
-                                    <i class="fa-solid fa-shield-halved"></i>
+                                <!-- Adaptive Latency Mode Switcher (JS syncs icon/title to the loaded mode) -->
+                                <button class="control-btn" id="latency-mode-btn" title="Latency Buffer: Balanced (180ms)" aria-label="Change latency buffer">
+                                    <i class="fa-solid fa-gauge-high"></i>
                                 </button>
 
                                 <!-- Picture in Picture -->
@@ -225,7 +230,7 @@
 
                 <!-- Reaction Emitter Bar -->
                 <div class="reaction-section">
-                    <div class="reactions-title"><i class="fa-solid fa-face-laugh-beam"></i><span>Quick reactions</span><small>Local to this screen</small></div>
+                    <div class="reactions-title"><i class="fa-solid fa-face-laugh-beam"></i><span>Quick reactions</span><small>Live reactions</small></div>
                     <div class="emoji-bar">
                         <button class="emoji-btn" data-emoji="heart" title="Send a heart reaction" aria-label="Send a heart reaction"><span class="emoji-icon">❤️</span><span class="emoji-count" id="count-heart">0</span></button>
                         <button class="emoji-btn" data-emoji="fire" title="Send a fire reaction" aria-label="Send a fire reaction"><span class="emoji-icon">🔥</span><span class="emoji-count" id="count-fire">0</span></button>
@@ -239,25 +244,28 @@
             <!-- Right Panel: Chat and Stream Info -->
             <section class="sidebar-section">
                 <div class="sidebar-tabs" role="tablist" aria-label="Stream panels">
-                    <button class="tab-btn active" id="tab-chat" role="tab" aria-selected="true" aria-controls="content-chat"><i class="fa-solid fa-list"></i> Activity</button>
+                    <button class="tab-btn active" id="tab-chat" role="tab" aria-selected="true" aria-controls="content-chat"><i class="fa-solid fa-comments"></i> Live Chat</button>
                     <button class="tab-btn" id="tab-info" role="tab" aria-selected="false" aria-controls="content-info" tabindex="-1"><i class="fa-solid fa-circle-info"></i> Stream info</button>
                     <div class="tab-indicator"></div>
                 </div>
-
+                
                 <!-- Chat Container -->
                 <div class="tab-content chat-content active" id="content-chat" role="tabpanel" aria-labelledby="tab-chat" aria-hidden="false">
                     <div class="chat-header-bar">
-                        <span class="chat-header-title"><i class="fa-solid fa-wave-square"></i> Session activity</span>
-                        <button class="chat-sound-btn" id="sound-toggle-btn" title="Toggle interface sounds" aria-label="Toggle interface sounds" aria-pressed="true">
-                            <i class="fa-solid fa-volume-high"></i>
-                        </button>
+                        <span class="chat-header-title" id="chat-header-title"><i class="fa-solid fa-comments"></i> Live Chat</span>
+                        <div class="chat-header-actions">
+                            <button class="chat-nick-btn" id="chat-nick-btn" title="Change nickname" aria-label="Change nickname"><i class="fa-solid fa-user"></i> <span id="chat-nick-display">Viewer</span></button>
+                            <button class="chat-sound-btn" id="sound-toggle-btn" title="Toggle interface sounds" aria-label="Toggle interface sounds" aria-pressed="true">
+                                <i class="fa-solid fa-volume-high"></i>
+                            </button>
+                        </div>
                     </div>
                     <div class="chat-messages" id="chat-messages" role="log" aria-live="polite" aria-relevant="additions">
-                        <div class="activity-empty"><i class="fa-solid fa-comment-slash"></i><p>Shared chat isn’t connected yet.</p><span>Use this space for notes visible only in this browser.</span></div>
+                        <div class="activity-empty" id="activity-empty"><i class="fa-solid fa-comments"></i><p>Welcome to Live Chat!</p><span>Send a message to join the conversation.</span></div>
                     </div>
                     <form class="chat-input-area" id="chat-form">
-                        <input type="text" class="chat-input" id="chat-input" placeholder="Add a private note…" aria-label="Add a note visible only in this browser" autocomplete="off" maxlength="150">
-                        <button type="submit" class="chat-send-btn" title="Add note" aria-label="Add note">
+                        <input type="text" class="chat-input" id="chat-input" placeholder="Send a message or /nick..." aria-label="Send a chat message" autocomplete="off" maxlength="200">
+                        <button type="submit" class="chat-send-btn" title="Send message" aria-label="Send message">
                             <i class="fa-solid fa-paper-plane"></i>
                         </button>
                     </form>
@@ -320,19 +328,20 @@
                                 <button class="ingest-tab active" id="ingest-tab-whip">RTMP (this laptop)</button>
                                 <button class="ingest-tab" id="ingest-tab-srt">SRT / WHIP options</button>
                             </div>
-
+                            
                             <!-- OBS runs on the same laptop as MediaMTX. -->
                             <ul class="obs-instructions active" id="instructions-whip">
                                 <li><span class="obs-key">Service</span><span class="obs-val">Custom...</span></li>
                                 <li><span class="obs-key">Server</span><code class="code-box copyable-text" id="whip-server-url">rtmp://127.0.0.1:1935/live</code></li>
                                 <li><span class="obs-key">Stream Key</span><span class="obs-val">Leave empty</span></li>
-                                <li><span class="obs-key">Audio</span><span class="obs-val obs-val-important">RTMP audio is AAC, which MediaMTX cannot convert for WebRTC — viewers hear nothing. Use the WHIP option in the next tab when you need sound.</span></li>
-                                <li><span class="obs-key">Encoder</span><span class="obs-val obs-val-important">Start with H.264; test other codecs on each browser</span></li>
+                                <li><span class="obs-key">Audio</span><span class="obs-val">RTMP audio is AAC, which the WebRTC path cannot read directly — the host bridge automatically converts it to Opus on a full-quality rendition, so viewers hear sound. WHIP (next tab) delivers Opus natively.</span></li>
+                                <li><span class="obs-key">Encoder</span><span class="obs-val obs-val-important">NVIDIA NVENC AV1 (best for low bandwidth) or NVENC H.264 — both are served to every browser automatically</span></li>
                                 <li><span class="obs-key">Rate Control</span><span class="obs-val">CBR</span></li>
                                 <li><span class="obs-key">Bitrate</span><span class="obs-val">Keep about 25% of stable hotspot upload free</span></li>
-                                <li><span class="obs-key">Keyframe Interval</span><span class="obs-val obs-val-important">2 seconds</span></li>
-                                <li><span class="obs-key">Max B-frames</span><span class="obs-val">Try 0 if viewers see decoder issues</span></li>
+                                <li><span class="obs-key">Keyframe Interval</span><span class="obs-val obs-val-important">1 second — 2s makes keyframes huge and loss recovery slow, which viewers feel as stutter</span></li>
+                                <li><span class="obs-key">Max B-frames</span><span class="obs-val obs-val-important">0 — required: WebRTC cannot play H.264 with B-frames, viewers get disconnected instantly</span></li>
                                 <li><span class="obs-key">Look-ahead</span><span class="obs-val">Disable to prioritize low latency</span></li>
+                                <li><span class="obs-key">Auto renditions</span><span class="obs-val">The host bridges your stream to the other codec on the GPU (AV1 source → <code>live-h264</code>, H.264 source → <code>live-av1</code>), so every browser plays regardless of codec support.</span></li>
                             </ul>
 
                             <!-- Optional alternate ingest protocols, also local to this laptop. -->
@@ -340,7 +349,7 @@
                                 <li><span class="obs-key">SRT Ingest</span><code class="code-box copyable-text" id="srt-server-url">srt://127.0.0.1:8890?streamid=publish:live</code></li>
                                 <li><span class="obs-key">WHIP Ingest</span><code class="code-box copyable-text">http://127.0.0.1:8889/live/whip</code></li>
                                 <li><span class="obs-key">Audio (recommended)</span><span class="obs-val obs-val-important">WHIP is the only OBS path that delivers sound: it publishes Opus, while RTMP/SRT carry AAC which WebRTC players cannot receive. In OBS choose Service: WHIP, set Server to the URL above, and leave Bearer Token empty.</span></li>
-                                <li><span class="obs-key">Encoder Info</span><span class="obs-val">Use CBR and a 2-second keyframe interval; test playback before a long session.</span></li>
+                                <li><span class="obs-key">Encoder Info</span><span class="obs-val">NVENC AV1 or H.264 with CBR and a 1-second keyframe interval; test playback before a long session.</span></li>
                             </ul>
                         </div>
 
@@ -360,7 +369,7 @@
                             <p class="info-description">For steadier playback:</p>
                             <ul class="obs-instructions active">
                                 <li><span class="obs-key">Hardware GPU Decode</span><span class="obs-val">Ensure Hardware Acceleration is turned ON in your browser settings.</span></li>
-                                <li><span class="obs-key">Decoder compatibility</span><span class="obs-val">If playback fails, try H.264 and set B-frames to 0.</span></li>
+                                <li><span class="obs-key">Decoder compatibility</span><span class="obs-val">If playback fails, set Max B-frames to 0 first (WebRTC cannot decode H.264 with B-frames), then try H.264.</span></li>
                                 <li><span class="obs-key">Frame pacing</span><span class="obs-val">Match the capture and display frame rates where practical.</span></li>
                                 <li><span class="obs-key">OBS Pacing Lock</span><span class="obs-val">Check <b>"Limit capture framerate"</b> in Game Capture source settings.</span></li>
                             </ul>
@@ -372,6 +381,6 @@
     </div>
 
     <!-- Custom JavaScript -->
-<script src="/streaming/app.js?v=2.8.0"></script>
+<script src="/streaming/app.js?v=2.21.0"></script>
 </body>
 </html>

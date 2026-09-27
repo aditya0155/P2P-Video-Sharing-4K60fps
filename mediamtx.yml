@@ -11,11 +11,15 @@ logDestinations: [stdout]
 api: yes
 apiAddress: 127.0.0.1:8888
 
-# Outgoing packet queue per reader. The MediaMTX default is 512; 1024 is the
-# value recommended in the official "decrease packet loss" guide, while still
-# keeping worst-case queueing delay on a congested viewer link about half of a
-# 2048-packet queue (queue depth translates directly into added live latency).
-writeQueueSize: 1024
+# Outgoing packet queue per reader. The MediaMTX default is 512; 2048 doubles
+# the officially recommended 1024 and is tuned for the receiver: a queue only
+# holds packets when a viewer's link is briefly congested, so on a healthy link
+# it is empty and adds nothing, while on a hotspot hiccup the backlog survives
+# instead of overflowing (an overflowed queue is dropped or disconnects the
+# reader — lost packets break decode until the next keyframe, which is exactly
+# the "frame drops" this setup fights). The player's buffer accommodation
+# absorbs the temporary added latency; 2048 packets ≈ 2.4s at 6 Mbps.
+writeQueueSize: 2048
 
 # Enlarge per-socket UDP receive buffers so publisher bursts and viewer RTCP
 # feedback (NACK / transport-cc) are not dropped by the OS when the WebRTC or
@@ -31,7 +35,10 @@ writeTimeout: 10s
 # Ingest Protocols (OBS Studio)
 ###############################################
 
-rtsp: no
+# RTSP exists only so codec_bridge.js can read the source back (RTMP cannot
+# serve AV1; RTSP can). Bound to loopback: nothing outside this laptop uses it.
+rtsp: yes
+rtspAddress: 127.0.0.1:8554
 hls: no
 moq: no
 
@@ -76,10 +83,23 @@ webrtcICEServers2:
 # Stream Paths
 ###############################################
 paths:
+  # Primary path: whatever OBS publishes (H.264 or AV1).
   live:
     # Instant publisher reconnect when OBS starts/stops
     overridePublisher: yes
+    # GPU companion rendition: codec_bridge.js watches this path and publishes
+    # the *other* codec (AV1 source -> live-h264 fallback, H264 source ->
+    # live-av1 low-bitrate rendition) with NVENC on the RTX 4070.
+    # runOnUnavailable kills any leftover ffmpeg (see PID guard in the script).
+    runOnAvailable: node "codec_bridge.js"
+    runOnAvailableRestart: false
+    runOnUnavailable: node "codec_bridge.js" --cleanup
     publishUser:
     publishPass:
     readUser:
     readPass:
+  # Auto-created rendition paths (published by codec_bridge.js only).
+  live-av1:
+    overridePublisher: yes
+  live-h264:
+    overridePublisher: yes

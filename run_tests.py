@@ -25,6 +25,7 @@ APP_PATH = ROOT / "app.js"
 SERVER_PATH = ROOT / "server.js"
 CONFIG_PATH = ROOT / "mediamtx.yml"
 JS_CHECKS_PATH = ROOT / "js_checks.js"
+BRIDGE_PATH = ROOT / "codec_bridge.js"
 LAUNCHER_PATH = ROOT / "start_host.ps1"
 MEDIAMTX_PATH = ROOT / "mediamtx_win" / "mediamtx.exe"
 
@@ -220,7 +221,7 @@ class LaptopHostChecks(unittest.TestCase):
         cls.config = read_text(CONFIG_PATH)
 
     def test_required_local_files_exist(self):
-        for path in (HTML_PATH, APP_PATH, SERVER_PATH, CONFIG_PATH, JS_CHECKS_PATH, LAUNCHER_PATH, MEDIAMTX_PATH):
+        for path in (HTML_PATH, APP_PATH, SERVER_PATH, CONFIG_PATH, JS_CHECKS_PATH, BRIDGE_PATH, LAUNCHER_PATH, MEDIAMTX_PATH):
             with self.subTest(path=path.name):
                 self.assertTrue(path.is_file(), "Missing required host file")
 
@@ -234,7 +235,21 @@ class LaptopHostChecks(unittest.TestCase):
 
     def test_page_assets_use_one_cache_version(self):
         versions = re.findall(r"/(?:streaming/)?(?:style\.css|app\.js)\?v=([^\"']+)", self.html)
-        self.assertEqual(versions, ["2.8.0", "2.8.0"])
+        self.assertEqual(len(versions), 2, "both style.css and app.js must be cache-versioned")
+        self.assertEqual(len(set(versions)), 1, "both assets must share one cache version")
+        self.assertRegex(versions[0], r"^\d+\.\d+\.\d+$", "cache version must be semver-like")
+
+    def test_page_text_is_clean_utf8_without_mojibake(self):
+        # index.html once shipped Windows-1252 double-encoded text (scrambled
+        # emoji and apostrophes) that only mobile viewers noticed, because
+        # desktop browsers were serving stale cached bytes. Keep it out for good.
+        self.assertNotRegex(self.html, r"[\x80-\x9f]",
+                            "index.html contains C1 controls (double-encoded bytes)")
+        for marker in ("\u00e2\u20ac", "\u00f0\u0178", "\u00c3\u00a2", "\u00ef\u00b8"):
+            self.assertNotIn(marker, self.html,
+                             "index.html contains double-encoded (mojibake) text")
+        self.assertNotIn("\ufffd", self.html,
+                         "index.html contains replacement characters")
 
     def test_obs_and_player_use_the_laptop_stream_path(self):
         self.assertIn("rtmp://127.0.0.1:1935/live", self.html)
@@ -263,7 +278,7 @@ class LaptopHostChecks(unittest.TestCase):
     def test_node_files_parse(self):
         node = shutil.which("node")
         self.assertIsNotNone(node, "Node.js is required to host the site")
-        for path in (SERVER_PATH, APP_PATH, JS_CHECKS_PATH):
+        for path in (SERVER_PATH, APP_PATH, JS_CHECKS_PATH, BRIDGE_PATH):
             result = subprocess.run(
                 [node, "--check", str(path)],
                 cwd=str(ROOT),
@@ -284,6 +299,32 @@ class LaptopHostChecks(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("configuration file is valid", result.stdout.lower())
+
+    def test_codec_bridge_is_wired_into_the_mediamtx_config(self):
+        # The companion-rendition bridge must be fully reachable from the
+        # config: loopback RTSP (the only protocol that can serve AV1 back
+        # out of MediaMTX), both rendition paths, and hooks that start and
+        # stop codec_bridge.js with the source stream.
+        self.assertIn("rtsp: yes", self.config)
+        rtsp = re.search(r"^rtspAddress:\s*(\S+)$", self.config, re.MULTILINE)
+        self.assertIsNotNone(rtsp, "missing rtspAddress in mediamtx.yml")
+        self.assertTrue(rtsp.group(1).startswith("127.0.0.1:"),
+                        "RTSP must bind loopback only, got {}".format(rtsp.group(1)))
+        self.assertIn('runOnAvailable: node "codec_bridge.js"', self.config)
+        self.assertIn('runOnUnavailable: node "codec_bridge.js" --cleanup', self.config)
+        self.assertIn("  live-av1:", self.config)
+        self.assertIn("  live-h264:", self.config)
+
+        # The bridge's default ports must agree with this config, otherwise
+        # the hook silently transcodes into a dead endpoint.
+        bridge = read_text(BRIDGE_PATH)
+        rtmp = re.search(r"^rtmpAddress:\s*127\.0\.0\.1:(\d+)", self.config, re.MULTILINE)
+        api = re.search(r"^apiAddress:\s*(\S+)$", self.config, re.MULTILINE)
+        self.assertIsNotNone(rtmp, "missing rtmpAddress in mediamtx.yml")
+        self.assertIsNotNone(api, "missing apiAddress in mediamtx.yml")
+        self.assertIn("BRIDGE_RTMP_PORT || '{}'".format(rtmp.group(1)), bridge)
+        self.assertIn("BRIDGE_API_BASE || 'http://{}'".format(api.group(1)), bridge)
+        self.assertIn("RTSP_PORT || '{}'".format(rtsp.group(1).rsplit(":", 1)[1]), bridge)
 
     def test_local_site_routes_and_404_behavior(self):
         node = shutil.which("node")
@@ -507,6 +548,36 @@ class JsLogicChecks(unittest.TestCase):
     def test_stream_endpoints_are_consistent_across_files(self):
         run_js_check(self, "stream-endpoints-are-consistent-everywhere")
 
+    def test_playout_delay_drift_uses_windowed_deltas(self):
+        run_js_check(self, "playout-delay-is-windowed")
+
+    def test_poll_warns_about_av1_only_broadcast(self):
+        run_js_check(self, "poll-warns-about-av1-only-broadcast")
+
+    def test_poll_resets_rendition_wait_state(self):
+        run_js_check(self, "poll-resets-rendition-wait-state")
+
+    def test_buffer_supervisor_sleeps_while_hidden(self):
+        run_js_check(self, "buffer-supervisor-sleeps-while-hidden")
+
+    def test_jitter_buffer_floor_tracks_measured_jitter(self):
+        run_js_check(self, "jitter-buffer-floor")
+
+    def test_abr_switching_state_machine(self):
+        run_js_check(self, "abr-switching-state-machine")
+
+    def test_stream_path_selection_by_browser_codec_support(self):
+        run_js_check(self, "choose-stream-path-matrix")
+
+    def test_poll_waits_for_a_decodable_rendition(self):
+        run_js_check(self, "poll-waits-for-compatible-rendition")
+
+    def test_poll_prefers_the_av1_rendition_when_available(self):
+        run_js_check(self, "poll-picks-rendition-path")
+
+    def test_codec_bridge_direction_and_command(self):
+        run_js_check(self, "codec-bridge-direction-matrix")
+
     def test_unmute_overlay_follows_the_mute_state(self):
         run_js_check(self, "unmute-overlay-follows-mute-state")
 
@@ -714,6 +785,19 @@ class TurnCredentialProxyChecks(_SiteUnderTest):
         http_request(self.port, "GET", "/stream-api/turn")
         self.assertEqual(len(self.cf.requests), 1, "failed mints must back off instead of hammering")
 
+    def test_mint_renews_at_half_life_and_viewer_cache_stays_shorter(self):
+        # Cloudflare disconnects TURN allocations once their credentials expire
+        # (FAQ), so the server must never serve a mint with less than TTL/2 of
+        # validity left, and the viewer's ICE cache must stay shorter than that
+        # floor — the old TTL-300s schedule + 30-minute viewer cache could
+        # hand a reconnecting viewer expired credentials and kill its relay.
+        server = read_text(SERVER_PATH)
+        app = read_text(APP_PATH)
+        self.assertIn("(CF_TURN_TTL_SECONDS / 2) * 1000", server,
+                      "server must renew mints on a TTL/2 half-life schedule")
+        self.assertRegex(app, r"cachedIceServersAt (?:<=>|> |<=) 10 \* 60 \* 1000",
+                         "viewer ICE cache (10 min) must stay below the mint's >=30 min validity floor")
+
 
 class MediaMtxUnavailableChecks(_SiteUnderTest):
     """MediaMTX is down before OBS starts — the page must still behave."""
@@ -851,6 +935,7 @@ class CrossFileConsistencyChecks(unittest.TestCase):
             "rtmp": address("rtmp"),
             "webrtc": address("webrtc"),
             "srt": address("srt"),
+            "rtsp": address("rtsp"),
         }
         for label, value in addresses.items():
             with self.subTest(binding=label):
@@ -1023,7 +1108,7 @@ class ReceiverLagFixChecks(unittest.TestCase):
         # The player asks the local server for ICE config and hands exactly
         # that to RTCPeerConnection; it never hardcodes servers of its own.
         self.assertIn("'/stream-api/turn'", app, "player must fetch ICE config from the local endpoint")
-        self.assertIn("iceServers: cachedIceServers", app, "PC must use the fetched ICE config")
+        self.assertIn("cachedIceServers", app, "PC must use the fetched ICE config")
         self.assertIn("allowedIceServers", app, "player must filter ICE entries through the allow-list")
         self.assertNotRegex(
             app,
@@ -1072,7 +1157,8 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertIn("superviseAdaptiveBuffer();", app, "the stats loop must call the supervisor")
         self.assertIn("jitterBufferDelay", app, "drift detection needs the playout-delay stats")
         self.assertIn("function currentBufferTargetMs()", app, "effective target helper missing")
-        self.assertIn("catchUpUntil", app, "live-edge catch-up state missing")
+        self.assertIn("accommodationTargetMs", app, "accommodation state missing")
+        self.assertIn("bufferAccommodationMs", app, "buffer accommodation missing")
         self.assertIn("adaptiveRaiseUntil", app, "stress-raise state missing")
 
     def test_frame_drop_auto_perf_mode_is_present(self):
@@ -1080,6 +1166,11 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertIn("function maybeAutoPerfMode()", app)
         self.assertIn("maybeAutoPerfMode();", app, "frame-drop path must invoke the auto perf mode")
         self.assertIn("rydius_perf_mode", app, "auto perf mode must respect the manual preference key")
+        # The rolling window catches GOP-periodic drop bursts the old
+        # strictly-consecutive counter missed, and the first tick after a
+        # (re)start only re-baselines instead of counting the hidden span.
+        self.assertIn("dropWindow", app, "rolling drop window missing")
+        self.assertIn("dropTickPending", app, "first-tick re-baseline guard missing")
 
     def test_hud_exposes_jitter_and_buffer_target(self):
         html = read_text(HTML_PATH)
@@ -1091,12 +1182,469 @@ class ReceiverLagFixChecks(unittest.TestCase):
 
     def test_mediamtx_queue_and_udp_buffers_are_tuned_for_viewers(self):
         config = read_text(CONFIG_PATH)
-        self.assertRegex(config, r"(?m)^writeQueueSize:\s*1024\s*$",
-                         "1024 is the documented packet-loss recommendation and bounds queueing delay")
+        # 2048 = double MediaMTX's documented packet-loss recommendation: an
+        # empty queue costs nothing on a healthy link, while on a hotspot
+        # hiccup the backlog survives instead of overflowing (an overflow
+        # drops packets or the reader — lost packets break decode until the
+        # next keyframe, which is exactly the receiver "frame drops" fought
+        # here). The player's buffer accommodation absorbs the added latency.
+        self.assertRegex(config, r"(?m)^writeQueueSize:\s*2048\s*$",
+                         "2048 packets ride out hotspot hiccups without overflowing")
         self.assertRegex(config, r"(?m)^udpReadBufferSize:\s*\d+\s*$",
                          "udpReadBufferSize must be set explicitly for bursty Wi-Fi viewers")
         self.assertNotRegex(config, r"(?m)^udpReadBufferSize:\s*0\s*$",
                             "OS-default UDP buffers drop bursts on Wi-Fi viewers")
+
+    def test_buffer_accommodation_is_drop_gated(self):
+        # The measured jitter-buffer delay always tracks the jitterBufferTarget
+        # hint Chrome was given, so a controller that raises the target to meet
+        # the measurement chases its own tail: every session inflates to the
+        # cap within half a minute, throwing away the user's latency choice
+        # and re-purging the buffer on every mode switch. Raising must require
+        # hard evidence (frames actually discarded while the buffer outgrew
+        # the base target) and calm must drain it back.
+        run_js_check(self, "buffer-accommodation-gate")
+        app = read_text(APP_PATH)
+        self.assertIn("droppedDelta > 0", app,
+                      "the stats loop must gate the accommodation raise on actual drops")
+        self.assertIn("baseBufferTargetMs()", app,
+                      "the raise must be measured against the pre-accommodation target")
+        self.assertIn("accommodationCalmTicks", app,
+                      "the decay must require sustained drop-free ticks")
+
+    def test_playout_delay_drift_measurement_is_windowed(self):
+        # Chrome exposes jitterBufferDelay/jitterBufferEmittedCount as
+        # cumulative session totals; the cumulative average they produce hides
+        # fresh drift within seconds of steady playback. The supervisor must
+        # consume per-tick deltas instead.
+        app = read_text(APP_PATH)
+        self.assertIn("function windowedPlayoutDelayMs(", app,
+                      "windowed delta helper missing")
+        self.assertIn("lastJitterDelayTotal", app, "delay baseline state missing")
+        self.assertIn("lastJitterEmittedTotal", app, "emitted-count baseline state missing")
+        self.assertNotIn("videoStats.jitterBufferDelay / videoStats.jitterBufferEmittedCount", app,
+                         "the cumulative-average form must stay gone")
+
+    def test_hud_shows_measured_playout_delay(self):
+        app = read_text(APP_PATH)
+        self.assertIn("updateBufferHud", app)
+        self.assertRegex(app, r"live \$\{Math\.round\(avgPlayoutDelayMs\)\}",
+                         "HUD buffer item must print the measured live delay when it diverges")
+
+    def test_latency_mode_defaults_to_balanced_and_persists(self):
+        # 'smooth' (350ms) as the default left every fresh viewer 170ms behind
+        # the live edge even on a clean network; 'balanced' is the new floor
+        # and a manual choice must survive reloads.
+        app = read_text(APP_PATH)
+        html = read_text(HTML_PATH)
+        self.assertIn("let currentLatencyMode = 'balanced';", app,
+                      "balanced (180ms) must be the default playout target")
+        self.assertIn("rydius_latency_mode", app,
+                      "the latency choice must persist across visits")
+        self.assertIn('title="Latency Buffer: Balanced (180ms)"', html,
+                      "the latency button must boot in the default mode's state")
+
+    def test_stats_loop_resume_keeps_measurement_baselines(self):
+        # A returning background tab used to restart telemetry by zeroing the
+        # byte/frame baselines while the cumulative counters kept growing,
+        # printing a garbage multi-Gbps bitrate spike. Resume must re-arm the
+        # interval without touching baselines.
+        app = read_text(APP_PATH)
+        self.assertIn("function beginStatsLoop()", app, "resume-safe stats starter missing")
+        self.assertGreaterEqual(app.count("beginStatsLoop();"), 2,
+                                "both a fresh session and tab-resume must go through beginStatsLoop")
+        self.assertNotIn("startTelemetry();\n                startAudioMeter", app,
+                         "visibilitychange must not zero baselines on resume")
+
+    def test_codec_bridge_runs_a_low_latency_pipeline(self):
+        # Every added stage removes a measured source of rendition lag: UDP
+        # RTSP loss, encoder lookahead, sparse keyframes and CPU decode
+        # contention with OBS capture. nobuffer/low_delay input flags were
+        # live-tested and made RTSP joins flaky or broken — they must stay out.
+        bridge = read_text(BRIDGE_PATH)
+        for flag in ("'-rtsp_transport', 'tcp'", "'-tune', 'ull'", "'-forced-idr', '1'",
+                     "'-max_interleave_delta', '0'",
+                     # Burst cap: bare -b:v measured 2.4x-target 100ms peaks;
+                     # -maxrate/-bufsize must stay glued to every encoder plan.
+                     "'-maxrate'", "'-bufsize'"):
+            self.assertIn(flag, bridge, "low-latency ffmpeg flag missing: {}".format(flag))
+        # The GOP must track the source frame rate (probe) with an env override.
+        self.assertIn("probeGopFrames", bridge, "frame-rate GOP probe missing")
+        self.assertIn("BRIDGE_GOP", bridge, "GOP override environment variable missing")
+        self.assertNotIn("'-fflags', 'nobuffer'", bridge,
+                         "nobuffer made RTSP joins fail or break DTS in live testing")
+        self.assertNotIn("'-flags', 'low_delay'", bridge,
+                         "low_delay broke AV1 decode ordering in live testing")
+        self.assertIn("h264_cuvid", bridge, "NVDEC H264 decode support missing")
+        self.assertIn("av1_cuvid", bridge, "NVDEC AV1 decode support missing")
+        self.assertIn("function pickDecoderArgs(", bridge, "decoder selection helper missing")
+        self.assertIn("BRIDGE_GPU_DECODE", bridge, "GPU decode must stay opt-out configurable")
+        # A decoder that crash-looped once must be remembered, so later
+        # broadcasts skip the crash cycles and start renditions immediately.
+        self.assertIn("gpuDecodeBlocked", bridge, "GPU-decode failure memory missing")
+        self.assertIn("rememberGpuDecodeFailure", bridge, "GPU-decode failure recording missing")
+        self.assertIn("clearGpuDecodeFailure", bridge, "GPU-decode recovery clearing missing")
+        # Fast failures must retry quickly (cold start is viewer-visible).
+        self.assertIn("await sleep(400);", bridge, "fast-failure retry must not wait the full 2s")
+        # A transcoder that publishes audio but never video (the verified OBS
+        # WHIP AV1 hang) must be detected and restarted, not left running.
+        self.assertIn("renditionHasVideo", bridge, "rendition video watchdog missing")
+        self.assertIn("RENDITION_START_TIMEOUT_MS", bridge, "watchdog timeout missing")
+        self.assertIn("restarting the transcoder", bridge, "watchdog restart log missing")
+        # The bundled ffmpeg 8.1 carries the AV1 RTP fragmented-keyframe fix
+        # (d12791ef) that lets OBS WHIP AV1 sources bridge; the bridge must
+        # prefer it automatically while keeping the env/PATH overrides.
+        self.assertIn("function resolveFfmpegBinary(", bridge, "bundled-ffmpeg resolver missing")
+        self.assertIn("ffmpeg_win", bridge, "bundled ffmpeg path missing")
+        self.assertIn("process.env.BRIDGE_FFMPEG", bridge, "BRIDGE_FFMPEG override missing")
+        # The tunable env defaults are load-bearing for the mediamtx wiring test.
+        self.assertIn("process.env.BRIDGE_RTMP_PORT || '1935'", bridge)
+        self.assertIn("process.env.RTSP_PORT || '8554'", bridge)
+        self.assertIn("process.env.BRIDGE_API_BASE || 'http://127.0.0.1:8888'", bridge)
+
+    def test_player_selects_path_by_decode_quality_and_warns_av1_only(self):
+        # RTCRtpReceiver.getCapabilities lists software decoders too: a viewer
+        # without AV1 hardware "supports" AV1 yet drops frames at high
+        # resolution. The Media Capabilities probe decides whether the
+        # low-bandwidth AV1 rendition is actually smooth on this device.
+        app = read_text(APP_PATH)
+        self.assertIn("mediaCapabilities", app, "Media Capabilities probe missing")
+        self.assertIn("decodingInfo", app, "decodingInfo call missing")
+        self.assertIn("async function probeAv1DecodeSmooth()", app)
+        self.assertIn("function chooseStreamPath(items, av1Capable, av1Smooth = true, preference = 'auto')",
+                      app, "path selection must take the decode-quality and ABR arguments")
+        # A legacy browser on an AV1-only broadcast must be told WHY nothing
+        # plays instead of waiting on "connecting" forever.
+        self.assertIn("renditionWaitPolls", app, "rendition wait counter missing")
+        self.assertIn("broadcast H.264 via WHIP", app, "AV1-only viewer notice missing")
+
+    def test_hidden_tab_return_recovers_playout_delay(self):
+        run_js_check(self, "catch-up-arms-on-visibility-return")
+
+    def test_receiver_anti_drop_hardening_is_present(self):
+        # Latency is explicitly traded for smoothness in this project: the
+        # playout floor grows with measured jitter (late frames left
+        # under-buffered are what a viewer sees as "frame drops"), drift
+        # limits are per-mode, ABR switches stressed viewers onto the
+        # low-bitrate rendition, and the HUD distinguishes decoded frames
+        # from actually rendered frames.
+        app = read_text(APP_PATH)
+        self.assertIn("function jitterBufferFloorMs(", app, "jitter-proportional floor missing")
+        self.assertIn("jitterFloorEmaMs = jitterBufferFloorMs(",
+                      app, "floor must be updated from the stats loop")
+        self.assertIn("target = Math.max(target, jitterFloorEmaMs);",
+                      app, "floor must feed the playout target")
+        self.assertIn("driftLimitMs", app, "per-mode drift limits missing")
+        self.assertIn("function switchRendition(", app, "ABR switch helper missing")
+        self.assertIn("startRenditionPathsPoll();",
+                      app, "the connected-state ladder poll must be armed on connect")
+        self.assertIn("lighter rendition", app, "ABR downgrade viewer message missing")
+        self.assertIn("metadata.presentedFrames", app, "presented-frames counter missing")
+        self.assertIn("fps rendered", app, "HUD render-rate readout missing")
+
+
+class ChatFeatureChecks(_SiteUnderTest):
+    def test_chat_broadcast_between_multiple_clients(self):
+        self.start_site()
+        # Connect client B to SSE stream
+        conn_b = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn_b.request("GET", "/stream-api/chat/events")
+        res_b = conn_b.getresponse()
+        self.assertEqual(res_b.status, 200)
+        self.assertIn("text/event-stream", res_b.headers.get("Content-Type", ""))
+
+        # Read the init event from B
+        init_event = b""
+        while b"\n\n" not in init_event:
+            chunk = res_b.fp.readline()
+            if not chunk:
+                break
+            init_event += chunk
+        self.assertIn(b"event: init", init_event)
+
+        # Client A sends a message via POST
+        status, _, body = http_request(
+            self.port,
+            "POST",
+            "/stream-api/chat/messages",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"text": "Hello stream viewers!", "author": "Alice", "clientId": "client-a"}),
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data.get("ok"))
+        self.assertEqual(data["message"]["text"], "Hello stream viewers!")
+        self.assertEqual(data["message"]["author"], "Alice")
+
+        # Client B must receive the broadcast message event!
+        b_msg_event = b""
+        for _ in range(10):
+            line = res_b.fp.readline()
+            b_msg_event += line
+            if b"\n\n" in b_msg_event:
+                if b"event: message" in b_msg_event:
+                    break
+                b_msg_event = b""
+        self.assertIn(b"event: message", b_msg_event)
+        self.assertIn(b"Hello stream viewers!", b_msg_event)
+        conn_b.close()
+
+    def test_chat_history_and_validation(self):
+        self.start_site()
+        # Empty message should be rejected
+        status, _, _ = http_request(
+            self.port,
+            "POST",
+            "/stream-api/chat/messages",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"text": "   "}),
+        )
+        self.assertEqual(status, 400)
+
+        # Too long message should be rejected
+        status, _, _ = http_request(
+            self.port,
+            "POST",
+            "/stream-api/chat/messages",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"text": "x" * 201}),
+        )
+        self.assertEqual(status, 400)
+
+        # Post a valid message
+        status, _, _ = http_request(
+            self.port,
+            "POST",
+            "/stream-api/chat/messages",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"text": "Persistent chat note", "author": "Charlie"}),
+        )
+        self.assertEqual(status, 200)
+
+        # Check GET /stream-api/chat/messages returns the message in history
+        status, _, body = http_request(self.port, "GET", "/stream-api/chat/messages")
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data.get("ok"))
+        texts = [m["text"] for m in data.get("messages", [])]
+        self.assertIn("Persistent chat note", texts)
+
+    def test_host_badge_security(self):
+        self.start_site()
+        # Direct loopback without proxy headers can assume HOST badge
+        status, _, body = http_request(
+            self.port,
+            "POST",
+            "/stream-api/chat/messages",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"text": "Host greeting", "author": "Host", "badge": "HOST"}),
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(data["message"]["badge"], "HOST")
+
+        # Remote viewer passing Cf-Connecting-Ip header attempting to spoof HOST badge is forced to USER
+        status, _, body = http_request(
+            self.port,
+            "POST",
+            "/stream-api/chat/messages",
+            headers={
+                "Content-Type": "application/json",
+                "Cf-Connecting-Ip": "203.0.113.195",
+            },
+            body=json.dumps({"text": "Imposter host", "author": "Host", "badge": "HOST"}),
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(data["message"]["badge"], "USER")
+
+    def test_reactions_endpoint_and_broadcast(self):
+        self.start_site()
+        # Invalid emoji rejected
+        status, _, _ = http_request(
+            self.port,
+            "POST",
+            "/stream-api/chat/reactions",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"emoji": "alien"}),
+        )
+        self.assertEqual(status, 400)
+
+        # Valid emoji accepted
+        status, _, body = http_request(
+            self.port,
+            "POST",
+            "/stream-api/chat/reactions",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"emoji": "fire"}),
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data.get("ok"))
+        self.assertGreaterEqual(data.get("count", 0), 1)
+
+
+
+class StreamingHardeningChecks(unittest.TestCase):
+    """Hardening pass: audio-rescue renditions, codec-change re-planning,
+    viewer count, route HUD, single-path volume, network-change recovery and
+    the server-side SSE/proxy stability work."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = read_text(APP_PATH)
+        cls.html = read_text(HTML_PATH)
+        cls.server = read_text(SERVER_PATH)
+        cls.bridge = read_text(BRIDGE_PATH)
+
+    def test_bridge_publishes_an_audio_rescue_rendition(self):
+        # An RTMP/SRT source carries AAC, which MediaMTX never serves to
+        # WebRTC readers: the native path plays VIDEO-ONLY. The bridge must
+        # emit a second output with Opus audio so every viewer gets sound.
+        self.assertIn("extraOutputs", self.bridge, "audio-rescue output plan missing")
+        self.assertIn("function planTargets(", self.bridge, "multi-target helper missing")
+        self.assertIn("'-c:v', 'copy'", self.bridge,
+                      "the H264 audio-rescue output must copy video (zero GPU cost)")
+        self.assertIn("hasAudio && !hasOpusAudio", self.bridge)
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise the bridge plan")
+        script = (
+            "const b=require('./codec_bridge.js');"
+            "const p=b.decideBridge(['MPEG-4 Audio','H264']);"
+            "if(!p.extraOutputs||p.extraOutputs.length!==1) throw new Error('missing rescue output');"
+            "if(p.extraOutputs[0].target!=='live-h264') throw new Error('wrong rescue target');"
+            "if(p.extraOutputs[0].videoArgs.join(' ')!=='-c:v copy') throw new Error('rescue must copy video');"
+            "const args=b.buildFfmpegArgs(p);"
+            "const line=args.join(' ');"
+            "if(!line.includes('rtmp://127.0.0.1:1935/live-av1')) throw new Error('primary output missing');"
+            "if(!line.includes('rtmp://127.0.0.1:1935/live-h264')) throw new Error('rescue output missing');"
+            "if((line.match(/-map 0:v:0/g)||[]).length!==2) throw new Error('each output needs its own maps');"
+            "const q=b.decideBridge(['H264','Opus']);"
+            "if(q.extraOutputs) throw new Error('Opus sources must not get a rescue output');"
+            "if(b.planTargets(p).join(',')!=='live-av1,live-h264') throw new Error('planTargets wrong');"
+            "const r=b.decideBridge(['MPEG-4 Audio','AV1']);"
+            "if(!r.extraOutputs||r.extraOutputs[0].target!=='live-av1') throw new Error('AV1-source rescue missing');"
+        )
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT), capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_bridge_replans_when_the_source_codec_changes(self):
+        # OBS auto-reconnect swaps the publisher without taking the path
+        # offline (so the runOnAvailable hook is NOT re-run); a mid-broadcast
+        # encoder switch must re-plan the renditions instead of crash-looping
+        # on a plan built for the previous codec.
+        self.assertIn("source codec changed", self.bridge, "codec-change re-plan missing")
+        self.assertIn("function resolveDecodeArgs(", self.bridge,
+                      "decode args must be re-derived for the new codec")
+
+    def test_player_routes_viewers_to_the_audio_rescue_rendition(self):
+        self.assertIn("hasOpusAudio", self.app, "audio-aware path choice missing")
+        self.assertIn("ready('live-h264')", self.app, "audio-rescue rendition check missing")
+        self.assertIn("preferNonTranscode", self.app, "ABR upgrade preference missing")
+
+    def test_player_abr_covers_the_audio_rescue_path(self):
+        self.assertIn("onFullBitratePath", self.app,
+                      "ABR must be able to step down from the audio-rescue path too")
+
+    def test_server_sse_hardening_is_present(self):
+        # id: lines let a native EventSource reconnect replay exactly the
+        # missed messages through the server's Last-Event-ID support.
+        self.assertIn("id: ${eventId}", self.server, "SSE event ids missing")
+        self.assertIn("broadcastChatEvent('message', message, message.id)", self.server)
+        # A subscriber that stops reading is destroyed instead of buffering
+        # unbounded memory server-side.
+        self.assertIn("_slowWrites", self.server, "SSE backpressure guard missing")
+        # The per-IP rate-limit map is swept of expired entries.
+        self.assertIn("chatRateLimits.delete(ip)", self.server, "rate-limit sweep missing")
+        # The proxy reuses pooled keep-alive connections to MediaMTX.
+        self.assertIn("new http.Agent({ keepAlive: true", self.server, "keep-alive agent missing")
+        self.assertIn("agent: MEDIAMTX_AGENT", self.server)
+
+    def test_server_reports_an_occupied_port_clearly(self):
+        self.assertIn("EADDRINUSE", self.server, "occupied-port handler missing")
+
+    def test_player_volume_is_controlled_exactly_once(self):
+        # The WebAudio graph taps the element AFTER its volume property, so
+        # driving both controls attenuates twice (slider 50% played at 25%).
+        self.assertIn("lastVolumeMultiplier", self.app, "single-path volume state missing")
+        self.assertGreaterEqual(self.app.count("player.volume = 1.0;"), 2,
+                                "element volume must be released when the GainNode carries the multiplier")
+
+    def test_network_change_reestablishes_the_session(self):
+        self.assertIn("navigator.connection", self.app, "network-change listener missing")
+        self.assertIn("lastNetworkType", self.app, "interface-type change detection missing")
+
+    def test_hud_shows_the_selected_ice_route(self):
+        self.assertIn('id="hud-route"', self.html, "route HUD item missing")
+        self.assertIn("getElementById('hud-route')", self.app)
+        self.assertIn("relay (TURN)", self.app, "relay route label missing")
+
+    def test_diagnostic_report_includes_route_and_recovery(self):
+        self.assertIn("iceRoute: lastRouteText", self.app)
+        self.assertIn("recovery: lastRecoveryCounts", self.app)
+        self.assertIn("pliCount", self.app, "PLI recovery counters missing")
+
+    def test_chat_dedupe_memory_is_capped(self):
+        self.assertIn("seenMessageIds.size > 500", self.app,
+                      "marathon sessions must not grow the dedupe set without bound")
+
+    def test_ice_prefetch_and_candidate_pool(self):
+        self.assertIn("prefetchIceServers();", self.app, "startup ICE prefetch missing")
+        self.assertIn("iceCandidatePoolSize: 2", self.app, "candidate pool missing")
+
+
+class ViewerCountRuntimeChecks(_SiteUnderTest):
+    def test_viewer_count_broadcasts_on_join_and_leave(self):
+        self.start_site()
+
+        def read_frame(response, want):
+            """Read SSE frames until one contains the wanted bytes."""
+            buffer = b""
+            for _ in range(20):
+                line = response.fp.readline()
+                if not line:
+                    break
+                buffer += line
+                if b"\n\n" in buffer:
+                    if want in buffer:
+                        return buffer
+                    buffer = b""
+            return buffer
+
+        conn_a = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn_a.request("GET", "/stream-api/chat/events")
+        res_a = conn_a.getresponse()
+        self.assertEqual(res_a.status, 200)
+        init_a = b""
+        while b"\n\n" not in init_a:
+            chunk = res_a.fp.readline()
+            if not chunk:
+                break
+            init_a += chunk
+        self.assertIn(b"event: init", init_a)
+        self.assertIn(b'"subscriberCount":1', init_a)
+
+        # Second page subscribes: the first page must learn the new count.
+        conn_b = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn_b.request("GET", "/stream-api/chat/events")
+        res_b = conn_b.getresponse()
+        init_b = b""
+        while b"\n\n" not in init_b:
+            chunk = res_b.fp.readline()
+            if not chunk:
+                break
+            init_b += chunk
+        self.assertIn(b"event: init", init_b)
+        self.assertIn(b'"subscriberCount":2', init_b, "init must include the joining page itself")
+        # A's own join already broadcast count:1 - skip it and find B's join.
+        join_event = read_frame(res_a, b'"count":2')
+        self.assertIn(b'"count":2', join_event, "join must broadcast the new count to existing viewers")
+
+        # Leave: the remaining viewer is told the count dropped.
+        conn_b.close()
+        leave_event = read_frame(res_a, b'"count":1')
+        self.assertIn(b'"count":1', leave_event, "leave must broadcast the dropped count")
+        conn_a.close()
 
 
 if __name__ == "__main__":

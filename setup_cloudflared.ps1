@@ -25,15 +25,7 @@ $cfDir = Join-Path $env:USERPROFILE '.cloudflared'
 $certPath = Join-Path $cfDir 'cert.pem'
 
 if (-not (Test-Path -LiteralPath $cloudflared -PathType Leaf)) {
-    $cloudflaredDir = Split-Path -Parent $cloudflared
-    New-Item -ItemType Directory -Path $cloudflaredDir -Force | Out-Null
-    $downloadUrl = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe'
-    Write-Host 'Downloading the official Cloudflare Tunnel client for Windows...' -ForegroundColor Cyan
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $cloudflared -UseBasicParsing
-    if (-not (Test-Path -LiteralPath $cloudflared -PathType Leaf) -or (Get-Item -LiteralPath $cloudflared).Length -lt 1MB) {
-        throw "cloudflared.exe download did not produce a valid file: $cloudflared"
-    }
-    Write-Host "Downloaded cloudflared.exe to $cloudflared" -ForegroundColor Green
+    throw "cloudflared.exe is missing: $cloudflared (expected in cloudflared_win\)"
 }
 
 # 1. One-time browser authorization ---------------------------------------

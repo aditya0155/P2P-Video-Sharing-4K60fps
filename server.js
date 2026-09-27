@@ -64,6 +64,14 @@ const MIME_TYPES = {
     '.js': 'application/javascript; charset=utf-8'
 };
 
+// Pool TCP connections to MediaMTX instead of opening a fresh loopback
+// connection per request. Every viewer generates a steady request flow
+// (status probe every 5s, ICE config, WHEP handshakes) — reusing warm
+// sockets removes the connect/teardown jitter from each of those round
+// trips and keeps signaling latency flat as the room grows. maxSockets is
+// left generous so a burst of simultaneous WHEP handshakes never queues.
+const MEDIAMTX_AGENT = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 64 });
+
 const STATIC_FILES = new Map([
     ['/', 'index.html'],
     ['/index.html', 'index.html'],
@@ -96,7 +104,8 @@ function proxyToMediaMTX(req, res, requestUrl) {
         port: targetPort,
         path: `${targetPath}${requestUrl.search}`,
         method: req.method,
-        headers
+        headers,
+        agent: MEDIAMTX_AGENT
     }, (proxyRes) => {
         const responseHeaders = { ...proxyRes.headers };
         // Never let browsers cache proxied signaling/API responses — a stale path-state
@@ -160,7 +169,7 @@ function proxyToMediaMTX(req, res, requestUrl) {
 }
 
 // --- Cloudflare TURN credential minting ------------------------------------
-// One mint is shared by every viewer until shortly before its TTL expires, so
+// One mint is shared by every viewer until half its TTL has elapsed, so
 // a full room costs a single Cloudflare API call per hour, not one per viewer.
 let turnMintCache = { iceServers: null, renewAt: 0, retryAt: 0 };
 
@@ -214,7 +223,15 @@ async function mintTurnIceServers() {
         }
         const payload = await response.json();
         turnMintCache.iceServers = turnOnlyIceServers(payload && payload.iceServers);
-        turnMintCache.renewAt = now + Math.max(60000, (CF_TURN_TTL_SECONDS - 300) * 1000);
+        // Renew at half-life instead of TTL-300s: under the old schedule a
+        // mint served at the tail of its window carried only ~5 minutes of
+        // validity, while viewers cache this answer for 10 minutes (app.js) —
+        // so a reconnect could present Cloudflare with EXPIRED credentials,
+        // which kills the TURN allocation (Cloudflare FAQ: allocations are
+        // disconnected once their credentials expire). At TTL/2 every served
+        // mint keeps at least TTL/2 of validity (default 30 min vs the 10 min
+        // viewer cache), making an expired-credential reconnect impossible.
+        turnMintCache.renewAt = now + Math.max(60000, (CF_TURN_TTL_SECONDS / 2) * 1000);
         console.log(`[TURN] Minted relay credentials (${turnMintCache.iceServers.length} TURN entries).`);
     } catch (error) {
         // Any failure just means "host candidates only" for the next 30s; a
@@ -248,6 +265,344 @@ function handleTurnCredentials(req, res) {
     });
 }
 
+// --- Realtime Chat System --------------------------------------------------
+const MAX_CHAT_HISTORY = 100;
+const MAX_MESSAGE_LENGTH = 200;
+const MAX_AUTHOR_LENGTH = 30;
+const chatHistory = [];
+const chatSubscribers = new Set();
+const reactionCounts = { heart: 0, fire: 0, clap: 0, laugh: 0, thumbs: 0 };
+const chatRateLimits = new Map();
+let lastChatMessageId = 0;
+
+function isDirectLocal(req) {
+    const ip = req.socket && req.socket.remoteAddress;
+    const isLoopbackIp = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+    const hasProxyHeaders = Boolean(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']);
+    return isLoopbackIp && !hasProxyHeaders;
+}
+
+function broadcastChatEvent(eventType, data, eventId) {
+    // The SSE id: line is what EventSource replays through Last-Event-ID on a
+    // native auto-reconnect — the server already honors that header, so a
+    // viewer that blips offline mid-broadcast receives exactly the messages
+    // it missed instead of a generic history slice. Non-message events carry
+    // no id (EventSource ignores them for replay bookkeeping).
+    const payload = (eventId !== undefined ? `id: ${eventId}\n` : '')
+        + `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const sub of chatSubscribers) {
+        if (!sub.destroyed && !sub.writableEnded) {
+            try {
+                const buffered = sub.write(payload);
+                // Backpressure guard: a viewer that stops reading (dead tab,
+                // broken tunnel) would otherwise buffer unbounded memory on
+                // this process. HTTPServerResponse buffers internally, so
+                // write()===false is the only signal; one slow event is
+                // normal (socket momentarily busy), a long run of them means
+                // the consumer is gone. The 'error'/'close' handlers clean up.
+                if (!buffered) {
+                    sub._slowWrites = (sub._slowWrites || 0) + 1;
+                    if (sub._slowWrites > 64) {
+                        console.warn('[Chat] Destroying a stalled SSE subscriber after repeated backpressure.');
+                        sub.destroy();
+                        continue;
+                    }
+                } else {
+                    sub._slowWrites = 0;
+                }
+            } catch (err) {
+                console.warn('[Chat] Failed to write event to subscriber:', err.message);
+            }
+        }
+    }
+}
+
+// Connected-viewer count, derived from live SSE subscriptions (every page
+// open holds one for its whole lifetime). Broadcast on every change so the
+// header viewer counter updates in real time — until now the server only
+// sent the count once in the init event and the UI kept a permanent "—".
+function broadcastViewerCount() {
+    broadcastChatEvent('viewers', { count: chatSubscribers.size });
+}
+
+// Sweep stale rate-limit entries: the map is keyed per client IP and each
+// entry only matters for a 2s window, so without this it would grow with
+// every distinct visitor for the lifetime of the process.
+setInterval(() => {
+    const cutoff = Date.now() - 2000;
+    for (const [ip, stamps] of chatRateLimits) {
+        const kept = stamps.filter((ts) => ts > cutoff);
+        if (kept.length === 0) {
+            chatRateLimits.delete(ip);
+        } else if (kept.length !== stamps.length) {
+            chatRateLimits.set(ip, kept);
+        }
+    }
+}, 60000).unref();
+
+function readJsonBody(req, maxBytes = 16384) {
+    return new Promise((resolve, reject) => {
+        let size = 0;
+        const chunks = [];
+        req.on('data', (chunk) => {
+            size += chunk.length;
+            if (size > maxBytes) {
+                req.destroy(new Error('Payload too large'));
+                reject(new Error('Payload too large'));
+                return;
+            }
+            chunks.push(chunk);
+        });
+        req.on('end', () => {
+            try {
+                const bodyStr = Buffer.concat(chunks).toString('utf8');
+                if (!bodyStr.trim()) {
+                    resolve({});
+                    return;
+                }
+                resolve(JSON.parse(bodyStr));
+            } catch (err) {
+                reject(new Error('Invalid JSON'));
+            }
+        });
+        req.on('error', reject);
+    });
+}
+
+function handleChat(req, res, requestUrl) {
+    const subpath = requestUrl.pathname.slice('/stream-api/chat'.length);
+
+    if (subpath === '/events' || subpath === '/events/') {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+            res.writeHead(405, setCorsHeaders({
+                'Allow': 'GET, HEAD',
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL
+            }));
+            res.end('405 Method Not Allowed');
+            return;
+        }
+
+        res.writeHead(200, setCorsHeaders({
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'
+        }));
+
+        if (req.method === 'HEAD') {
+            res.end();
+            return;
+        }
+
+        const isHost = isDirectLocal(req);
+        const lastEventId = Number.parseInt(req.headers['last-event-id'] || requestUrl.searchParams.get('lastId') || '0', 10);
+        let initialHistory;
+        if (lastEventId > 0) {
+            initialHistory = chatHistory.filter((m) => m.id > lastEventId);
+        } else {
+            initialHistory = chatHistory.slice(-50);
+        }
+
+        res.write(`event: init\ndata: ${JSON.stringify({
+            isHost,
+            history: initialHistory,
+            reactionCounts,
+            subscriberCount: chatSubscribers.size + 1
+        })}\n\n`);
+
+        chatSubscribers.add(res);
+        broadcastViewerCount();
+
+        const keepAliveTimer = setInterval(() => {
+            if (res.destroyed || res.writableEnded) {
+                clearInterval(keepAliveTimer);
+                chatSubscribers.delete(res);
+                return;
+            }
+            res.write(':keepalive\n\n');
+        }, 15000);
+
+        req.on('close', () => {
+            clearInterval(keepAliveTimer);
+            if (chatSubscribers.delete(res)) {
+                broadcastViewerCount();
+            }
+        });
+        return;
+    }
+
+    if (subpath === '/messages' || subpath === '/messages/') {
+        if (req.method === 'GET' || req.method === 'HEAD') {
+            const sinceId = Number.parseInt(requestUrl.searchParams.get('since') || '0', 10);
+            const messages = sinceId > 0 ? chatHistory.filter((m) => m.id > sinceId) : chatHistory;
+            const body = JSON.stringify({ ok: true, messages });
+            res.writeHead(200, setCorsHeaders({
+                'Content-Type': 'application/json; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL,
+                'Content-Length': Buffer.byteLength(body)
+            }));
+            if (req.method === 'HEAD') {
+                res.end();
+                return;
+            }
+            res.end(body);
+            return;
+        }
+
+        if (req.method === 'POST') {
+            const clientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || 'unknown';
+            const now = Date.now();
+            const rateInfo = chatRateLimits.get(clientIp) || [];
+            const recent = rateInfo.filter((ts) => now - ts < 2000);
+            if (recent.length >= 5) {
+                res.writeHead(429, setCorsHeaders({
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL
+                }));
+                res.end(JSON.stringify({ error: 'You are sending messages too quickly. Please wait a moment.' }));
+                return;
+            }
+            recent.push(now);
+            chatRateLimits.set(clientIp, recent);
+
+            readJsonBody(req).then((data) => {
+                const rawText = typeof data.text === 'string' ? data.text.trim() : '';
+                if (!rawText) {
+                    res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                    res.end(JSON.stringify({ error: 'Message text cannot be empty' }));
+                    return;
+                }
+                if (rawText.length > MAX_MESSAGE_LENGTH) {
+                    res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                    res.end(JSON.stringify({ error: `Message exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` }));
+                    return;
+                }
+
+                let author = typeof data.author === 'string' ? data.author.trim() : 'Viewer';
+                if (!author) author = 'Viewer';
+                if (author.length > MAX_AUTHOR_LENGTH) author = author.slice(0, MAX_AUTHOR_LENGTH);
+
+                const isHost = isDirectLocal(req);
+                let badge = 'USER';
+                if (isHost && (data.badge === 'HOST' || author.toLowerCase() === 'host')) {
+                    badge = 'HOST';
+                } else if (data.badge === 'VIP') {
+                    badge = 'VIP';
+                }
+
+                const message = {
+                    id: ++lastChatMessageId,
+                    author,
+                    badge,
+                    text: rawText,
+                    time: new Date().toISOString(),
+                    clientId: typeof data.clientId === 'string' ? data.clientId : null,
+                    clientMsgId: typeof data.clientMsgId === 'string' ? data.clientMsgId : null
+                };
+
+                chatHistory.push(message);
+                if (chatHistory.length > MAX_CHAT_HISTORY) {
+                    chatHistory.shift();
+                }
+
+                // The id makes EventSource replay this exact message through
+                // Last-Event-ID after a native reconnect (see broadcastChatEvent).
+                broadcastChatEvent('message', message, message.id);
+
+                const body = JSON.stringify({ ok: true, message });
+                res.writeHead(200, setCorsHeaders({
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL,
+                    'Content-Length': Buffer.byteLength(body)
+                }));
+                res.end(body);
+            }).catch((err) => {
+                res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                res.end(JSON.stringify({ error: err.message || 'Invalid request body' }));
+            });
+            return;
+        }
+
+        res.writeHead(405, setCorsHeaders({
+            'Allow': 'GET, POST, HEAD',
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL
+        }));
+        res.end('405 Method Not Allowed');
+        return;
+    }
+
+    if (subpath === '/reactions' || subpath === '/reactions/') {
+        if (req.method === 'POST') {
+            readJsonBody(req).then((data) => {
+                const emoji = typeof data.emoji === 'string' ? data.emoji.trim() : '';
+                const validEmojis = ['heart', 'fire', 'clap', 'laugh', 'thumbs'];
+                if (!validEmojis.includes(emoji)) {
+                    res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                    res.end(JSON.stringify({ error: 'Invalid emoji reaction' }));
+                    return;
+                }
+
+                reactionCounts[emoji] = (reactionCounts[emoji] || 0) + 1;
+                broadcastChatEvent('reaction', {
+                    emoji,
+                    clientId: typeof data.clientId === 'string' ? data.clientId : null,
+                    totalCount: reactionCounts[emoji]
+                });
+
+                const body = JSON.stringify({ ok: true, count: reactionCounts[emoji] });
+                res.writeHead(200, setCorsHeaders({
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL,
+                    'Content-Length': Buffer.byteLength(body)
+                }));
+                res.end(body);
+            }).catch((err) => {
+                res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                res.end(JSON.stringify({ error: err.message || 'Invalid request body' }));
+            });
+            return;
+        }
+
+        res.writeHead(405, setCorsHeaders({
+            'Allow': 'POST',
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL
+        }));
+        res.end('405 Method Not Allowed');
+        return;
+    }
+
+    if (subpath === '/identity' || subpath === '/identity/') {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+            res.writeHead(405, setCorsHeaders({
+                'Allow': 'GET, HEAD',
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL
+            }));
+            res.end('405 Method Not Allowed');
+            return;
+        }
+        const isHost = isDirectLocal(req);
+        const body = JSON.stringify({ isHost });
+        res.writeHead(200, setCorsHeaders({
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL,
+            'Content-Length': Buffer.byteLength(body)
+        }));
+        if (req.method === 'HEAD') {
+            res.end();
+            return;
+        }
+        res.end(body);
+        return;
+    }
+
+    res.writeHead(404, setCorsHeaders({ 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+    res.end('404 Not Found');
+}
+
 const server = http.createServer((req, res) => {
     let requestUrl;
     try {
@@ -277,6 +632,10 @@ const server = http.createServer((req, res) => {
                 return;
             }
             handleTurnCredentials(req, res);
+            return;
+        }
+        if (requestUrl.pathname === '/stream-api/chat' || requestUrl.pathname.startsWith('/stream-api/chat/')) {
+            handleChat(req, res, requestUrl);
             return;
         }
         proxyToMediaMTX(req, res, requestUrl);
@@ -312,6 +671,7 @@ const server = http.createServer((req, res) => {
         if (req.headers['if-none-match'] === etag) {
             res.writeHead(304, {
                 'Cache-Control': STATIC_CACHE_CONTROL,
+                'CDN-Cache-Control': 'no-store',
                 'ETag': etag,
                 'X-Content-Type-Options': 'nosniff'
             });
@@ -323,6 +683,7 @@ const server = http.createServer((req, res) => {
             'Content-Type': MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
             'Content-Length': stats.size,
             'Cache-Control': STATIC_CACHE_CONTROL,
+            'CDN-Cache-Control': 'no-store',
             'ETag': etag,
             'X-Content-Type-Options': 'nosniff'
         });
@@ -332,6 +693,17 @@ const server = http.createServer((req, res) => {
         }
         fs.createReadStream(filePath).pipe(res);
     });
+});
+
+// A second launcher (or any other process grabbing the port) must fail with
+// a readable reason, not a raw EADDRINUSE stack trace in the launcher window.
+server.on('error', (error) => {
+    if (error && error.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use. Stop the other site server or set PORT to a free port before starting.`);
+        process.exit(1);
+    }
+    console.error('Rydius Stream host server error:', error);
+    process.exit(1);
 });
 
 server.listen(PORT, '127.0.0.1', () => {
@@ -344,6 +716,6 @@ server.listen(PORT, '127.0.0.1', () => {
     } else {
         console.log('TURN relay: not configured — remote viewers use free Cloudflare STUN punch-through. Set CF_TURN_KEY_ID/CF_TURN_KEY_TOKEN to add a relay fallback.');
     }
-    console.log('Public viewers: open https://stream.rydius.in after the Cloudflare Tunnel has been configured. Tailscale Serve is the private fallback.');
+    console.log('Remote viewers: share https://stream.rydius.in once setup_cloudflared.ps1 has been run (the Tailscale URL also still works).');
     console.log('Keep this window open while streaming.');
 });

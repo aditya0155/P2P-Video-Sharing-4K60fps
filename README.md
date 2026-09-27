@@ -1,76 +1,71 @@
-# Rydius Stream
+# Rydius Stream: laptop host
 
-Rydius Stream is hosted on a Windows laptop. OBS publishes to MediaMTX locally, and the browser receives video over WebRTC. **Cloudflare Tunnel is the primary public access path**: it publishes the page and WebRTC signaling at `https://stream.rydius.in` without router port forwarding or a separate web host. WebRTC carries media directly when the viewer's network allows it; optional Cloudflare TURN credentials provide a relay fallback.
+This setup runs OBS and MediaMTX on the same Windows laptop. The page and WebRTC signaling are served locally and published at **https://stream.rydius.in** through a Cloudflare Tunnel, so viewers just open a link — no Tailscale install, no account. Video for viewers that cannot reach the laptop directly relays through Cloudflare TURN. OBS video enters through loopback, so it does not use the hotspot upload until viewers connect. Tailscale Serve remains as a verified fallback.
 
-Tailscale Serve is an optional private fallback. Viewers using it must join the host's tailnet and keep Tailscale connected.
+## One-time setup
 
-## Requirements
+1. Run `setup_cloudflared.ps1` once in this folder. It authorizes `cloudflared` for the `rydius.in` zone (one browser step), creates the named tunnel `rydius-stream`, writes `cloudflared_config.yml`, points `stream.rydius.in` at the tunnel, and offers an **optional** Cloudflare TURN key (Dashboard → Realtime → TURN → *Create TURN key*; docs: https://developers.cloudflare.com/realtime/turn/generate-credentials/). TURN is metered (free 1,000 GB/month) and the dashboard may require a payment method — **skip it if you have no card**: remote viewing still works through the free STUN punch-through path, and the key can be added later by rerunning the script. If you add one, it + the API token land in `secrets.local.env`, which stays on this laptop — browsers only ever receive short-lived credentials minted by `server.js`.
+2. Tailscale fallback (optional): install Tailscale on this laptop and each viewer device and sign in to the same tailnet. The first `tailscale serve --bg 3000` run may print a consent link that the tailnet admin must approve; confirm the private HTTPS hostname with `tailscale serve status`, then give viewers that URL with `/streaming/` appended.
 
-- Windows 10 or 11 and Node.js 18.17 or newer.
-- OBS Studio on the host laptop.
-- A Cloudflare account with `rydius.in` managed in Cloudflare DNS for the public link.
-- Tailscale on the host and viewer devices only if using the private fallback.
-- The Windows amd64 MediaMTX executable and upstream license are included in `mediamtx_win/`.
+`cloudflared_config.yml` and `secrets.local.env` are machine-local — do not share them. Rerunning `setup_cloudflared.ps1` is safe; it reuses the existing tunnel and DNS record.
 
-## One-time Cloudflare setup
+## Start a stream
 
-Run `setup_cloudflared.ps1` from PowerShell:
+1. Double-click `start_host.bat` and leave its window open. It validates the MediaMTX config, starts MediaMTX, starts the Cloudflare tunnel (when configured), then starts the website and WebRTC signaling proxy.
+2. In OBS, open **Settings → Stream**, select **Custom...**, set the server to `rtmp://127.0.0.1:1935/live`, and leave **Stream Key** empty.
+3. Start OBS streaming. On the laptop, check `http://127.0.0.1:3000/streaming/`; remote viewers open `https://stream.rydius.in`. A tailnet viewer can also use the Tailscale URL.
+4. Stop the host by pressing Ctrl+C in the launcher window. The launcher then stops the MediaMTX process it started.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup_cloudflared.ps1
-```
+Start with CBR and a 1-second keyframe interval (2s doubles each keyframe burst and doubles how long packet-loss recovery waits for the next IDR — both read as viewer stutter). Choose a bitrate below the hotspot's sustained upload rate and leave roughly 25% headroom. A hotspot may vary over time, so 4K/60 quality and latency depend on the measured upload and the viewer's connection.
 
-The script downloads `cloudflared.exe` into the ignored `cloudflared_win/` folder if needed, authorizes it for the Cloudflare zone, creates or reuses the `rydius-stream` tunnel, and routes `stream.rydius.in` to the local site. Cloudflare Tunnel makes an outbound connection, so the laptop can be behind a mobile hotspot or CGNAT.
+## Codecs: H.264 + AV1 on the GPU (automatic renditions)
 
-The script also offers optional Cloudflare TURN setup. Skip it initially: free Cloudflare STUN is configured automatically and is enough for many viewer networks. TURN is metered and may require billing details; only configure it if viewers cannot connect directly. The API credentials are stored in the ignored local `secrets.local.env` file, and the server mints short-lived relay credentials for viewers.
+Every broadcast is served in **both codecs at once**, so no viewer is ever blocked by codec support and AV1-capable viewers use the least bandwidth:
 
-Generated `cloudflared_config.yml`, `secrets.local.env`, and `cloudflared_win/` are machine-local and must not be committed. `cloudflared` does not auto-update on Windows; update its local executable manually when desired.
+- OBS publishes **either** NVENC H.264 **or** NVENC AV1 (both are hardware encoders on the RTX 4070). **For a mixed audience, broadcast H.264 via WHIP** — see the known limitation below. Use NVENC AV1 only when every viewer's browser decodes AV1.
+- `codec_bridge.js` runs as a MediaMTX `runOnAvailable` hook on `live`. It reads the source over loopback RTSP (TCP transport — UDP loopback bursts can reorder packets) and publishes the complementary rendition with NVENC:
+  - AV1 source → `live-h264` (`h264_nvenc`, default 6000k) so legacy browsers keep playing;
+  - H.264 source → `live-av1` (`av1_nvenc`, default 3000k) so AV1 browsers save ~50% bandwidth per viewer.
+- **Known limitation — fixed by the bundled ffmpeg:** an OBS **WHIP AV1** source cannot be bridged by **ffmpeg 8.0** (the system PATH version here). Its AV1 RTP depacketizer filters packets until it recognizes a keyframe via the aggregation header's N bit, and fragmented keyframes whose OBU size field is kept (libwebrtc does this) never reassemble — the reader loops forever on "AV1 RTP packet before keyframe / Unexpected fragment continuation" (CPU and NVDEC decode hang identically; the stall is upstream of decode). Fixed upstream by ffmpeg commit `d12791ef`, shipped in **8.1+**. The project therefore bundles **ffmpeg 8.1.3** in `ffmpeg_win/` and the bridge prefers it automatically (an explicit `BRIDGE_FFMPEG` still wins; the system PATH is the fallback) — verified: the bundled build bridges WHIP AV1 sources to a healthy `live-h264` in ~2.4s. As a safety net, a rendition that carries no video within 20s gets its transcoder killed and retried, and after repeated failures the bridge gives up with a clear console message. AV1-capable viewers are always unaffected (they play the native path); the player tells legacy viewers explicitly when a broadcast is AV1-only.
+- The rendition pipeline is tuned for the receiver: NVENC runs `tune=ull` (ultra low latency: no lookahead) with frame-rate-probed ~1-second forced-IDR keyframes (the GOP matches the source's real fps; `BRIDGE_GOP` overrides the probe, so a 30 fps source gets 30-frame groups instead of silent 2-second ones) and `-maxrate`/`-bufsize` caps that stop keyframe bursts from overflowing MediaMTX's per-reader queue, so joining viewers and packet-loss recovery lock on within a second, the FLV muxer writes packets as they arrive (`-max_interleave_delta 0`, so a slow first keyframe can no longer stall the publish into MediaMTX's 10s publisher timeout), and video decodes on NVDEC (`h264_cuvid`/`av1_cuvid`) when available so the CPU stays free for OBS capture. A decoder that crash-loops twice is recorded in a temp state file for 24h — later broadcasts start directly on CPU decode — and a healthy 30s+ GPU run clears the record.
+- The player picks the path per browser on every status poll: AV1 sources go native to AV1 browsers whose Media Capabilities probe says AV1 decodes smoothly (software decoders wait for `live-h264` like a legacy browser) and through `live-h264` for the rest; H.264 sources ride `live-av1` only when `navigator.mediaCapabilities.decodingInfo(type:"webrtc")` says AV1 decodes **smoothly** on this device (capability lists include software decoders, which stutter at high resolution), otherwise it stays on the hardware-decodable H.264 path. While the fallback rendition is still spinning up (~2–4 s after OBS starts) the player shows *connecting* instead of a false offline, and if it never appears the viewer is told why.
 
-## Start the host
+Verified end to end on this machine (MediaMTX v1.21.1 + ffmpeg 8.0 + a real browser player): both bridge directions produce ~58 fps renditions read back over RTSP with zero timestamp errors, a 1920×1080 WHIP broadcast plays in the browser at 58–61 fps measured by the player HUD, the hook starts and stops with the source, `runOnUnavailable` kills any leftover ffmpeg (PID-file guard with a command-line match, so a recycled PID is never killed by mistake), and `/live/whep`, `/live-h264/whep` and `/live-av1/whep` all answer WHEP preflights. RTSP exists only for this bridge and is bound to `127.0.0.1:8554`; RTMP cannot serve AV1 out of MediaMTX, which is why the bridge reads via RTSP.
 
-1. Double-click `start_host.bat` and keep its window open. It validates `mediamtx.yml`, starts MediaMTX, starts the Cloudflare Tunnel if setup is complete, and then starts the local website and WebRTC signaling proxy.
-2. On the laptop, open `http://127.0.0.1:3000/streaming/` to check the page.
-3. Share **`https://stream.rydius.in/`** with viewers. No Tailscale install is needed for this public link.
+Tunables (optional environment variables, defaults match `mediamtx.yml`): `BRIDGE_H264_BITRATE` (6000k), `BRIDGE_AV1_BITRATE` (3000k), `BRIDGE_AUDIO_BITRATE` (160k), `BRIDGE_FFMPEG` (explicit override; defaults to the bundled `ffmpeg_win/` 8.1 build when present, else ffmpeg on PATH), `BRIDGE_GOP` (keyframes in frames — skips the frame-rate probe), `BRIDGE_FFPROBE` (ffprobe binary for the probe; defaults to the one next to the bundled ffmpeg).
 
-Keep the laptop awake, online, and running the host window while streaming. The page and signaling pass through Cloudflare Tunnel; WebRTC media typically travels directly between the laptop and each viewer. Hotspot upload usage grows with viewer count and bitrate.
+When you raise the OBS bitrate, raise `BRIDGE_H264_BITRATE`/`BRIDGE_AV1_BITRATE` along with it: the renditions are fixed-rate, so AV1-capable viewers on an H.264 source keep receiving the `live-av1` rendition (default 3000k) no matter how high the source bitrate goes — otherwise the extra source quality never reaches them.
 
-## OBS setup
+**Audio:** RTMP and SRT carry AAC, which MediaMTX cannot convert for WebRTC readers — but the bridge now rescues it. Whenever the source audio is not Opus, `codec_bridge.js` emits a **second output** from the same ffmpeg process (H264 sources: a `-c:v copy` rendition at zero extra GPU cost; AV1 sources: an NVENC AV1 encode) with the audio re-encoded to Opus, and the player routes **every** viewer of such a broadcast to that full-quality, full-sound rendition instead of the muted native path (`live`). WHIP remains the best ingest (Opus natively, so the native path already carries sound and AV1 browsers keep the bandwidth-saving `live-av1` rendition), but an RTMP broadcast is no longer silent: viewers get video **and** audio with no OBS settings change. The bridge also re-reads the source track list after every ffmpeg restart, so an OBS auto-reconnect with a *different* encoder (H.264 ↔ AV1) re-plans the renditions instead of crash-looping on the stale plan.
 
-For a video-only RTMP stream, set **Settings → Stream → Service** to **Custom**:
+## Connection notes
 
-- **Server:** `rtmp://127.0.0.1:1935/live`
-- **Stream key:** leave empty
+Two Cloudflare pieces do different jobs, and neither requires a credit card for the primary path:
 
-Set **Settings → Video → Common FPS Values** to `60` for 60 FPS. For 1080p, use a 1920×1080 output. In **Settings → Output → Streaming**, use H.264, CBR, and a 2-second keyframe interval. Start around 5000 Kbps, then adjust to the laptop's sustained upload and number of viewers.
+- **Cloudflare STUN (free, no account, no card)** — both MediaMTX and the player receive `stun.cloudflare.com:3478` from the config and `/stream-api/turn`, so each side learns its public address and hole-punches a direct UDP path. Verified from this hotspot with a real binding request (a public mapped address came back). This is how remote viewers connect without any paid Cloudflare product.
+- **Cloudflare Tunnel** (free) carries the HTTPS page and WebRTC/WHEP signaling from `stream.rydius.in` to `server.js`. It dials outward only, so it works behind the hotspot's CGNAT without port forwarding — but it does not carry video UDP.
+- **Cloudflare TURN** (optional — metered, may require a payment method even for the free 1,000 GB/month) is the relay fallback for a viewer whose network refuses hole punching. `server.js` mints short-lived credentials at `/stream-api/turn` (the API token stays server-side) and appends them only when configured; Google STUN and browser-blocked port-53 URLs are stripped everywhere. If TURN is unavailable, a viewer behind a strict NAT may not connect — that is what the Tailscale fallback is for.
 
-To include audio in browser playback, publish with OBS **WHIP** instead of RTMP:
+MediaMTX configures Cloudflare STUN only — Google STUN was historically unreliable from this network and stays out. Hole punching is the primary remote path; TURN relay (when configured) is the fallback, and Tailscale covers the rare viewer behind a strict NAT.
 
-- **Service:** WHIP
-- **Server:** `http://127.0.0.1:8889/live/whip`
-- **Bearer token:** leave empty
+With the Tailscale fallback, WebRTC media travels over the tailnet (UDP preferred, TCP fallback); `tailscale ping <laptop-name>` from a viewer device shows whether the path is direct or relayed.
 
-WHIP sends Opus audio, which the browser WebRTC player can play. RTMP/SRT ingest uses AAC, which MediaMTX does not convert for WebRTC readers; those paths provide video without sound.
+SRT and WHIP ingest entries in the page are optional alternatives for OBS running on this laptop. The standard setup is RTMP to loopback. The MediaMTX config and binary are kept in the project so the host can start without a VPS.
 
-## Optional private Tailscale access
+## Local checks
 
-If the public hostname is unavailable, the host can expose the site to its tailnet. Check the current mapping first; run `serve --bg 3000` only if Serve is not already proxying to `127.0.0.1:3000`:
+Run `python run_tests.py` from this folder (Node.js must be on PATH). The suite covers:
 
-```powershell
-& "C:\Program Files\Tailscale\tailscale.exe" serve status
-& "C:\Program Files\Tailscale\tailscale.exe" serve --bg 3000
-& "C:\Program Files\Tailscale\tailscale.exe" serve status
-```
+- **Page integrity** — unique element IDs, every `querySelector` target in `app.js` exists in `index.html`, every `/streaming/...` asset is in the `server.js` allowlist and shares one cache version.
+- **Cross-file consistency** — RTMP, SRT, WHIP, RTSP and control-API ports must agree between `mediamtx.yml`, `index.html`, `server.js` and `start_host.ps1`.
+- **Codec bridge** — `codec_bridge.js` must be present and parseable, its default ports must match `mediamtx.yml` (RTSP/RTMP/API), the config must bind RTSP to loopback and declare both rendition paths with the `runOnAvailable`/`runOnUnavailable` hooks, and the bridge direction matrix must map AV1→`live-h264` / H.264→`live-av1` with GPU encoders, Opus-preserving audio and B-frames off.
+- **The `/stream-api` proxy** — request forwarding (path, query, body, Host), `Location` rewriting for same-origin redirects only, CORS exposure of `Location`, `/stream-api/v3/**` routed to the control API port, 404 pass-through, `no-store` on proxied answers, and 502 with a clear message when MediaMTX is down.
+- **TURN credential proxy** — `/stream-api/turn` always serves the free Cloudflare STUN entry even without Cloudflare configuration, mints through a stubbed Cloudflare API using the server-side `Authorization` header when configured, strips Google STUN and browser-blocked port-53 URLs, caches one mint for the whole room, backs off after failures, and never exposes the token to a browser.
+- **Static server hardening** — HEAD without a body, 405 with `Allow: GET, HEAD`, host source files never served, invalid `PORT`/`MEDIAMTX_*_PORT` rejected at boot.
+- **Browser logic** (`js_checks.js`) — runs the real `app.js` functions in Node: SDP tuning (bandwidth ceiling, `rtcp-fb` lines scoped to the video section, idempotence), status polling and reconnect backoff, disconnect cleanup, the latency-mode table (plus persistence of a manual choice), windowed playout-delay measurement (the drift-detection ground truth — cumulative `jitterBufferDelay` averages hide fresh drift within seconds), AV1 capability detection, and the rendition path matrix (`live` / `live-av1` / `live-h264` selection per browser codec support).
+- **MediaMTX contract** — boots the bundled MediaMTX on free ports and checks `GET /v3/paths/list` reports the `live` path state, `OPTIONS /live/whep` answers 204 with no publisher (which is why the player never probes liveness with OPTIONS), and WHEP session creation fails fast without one.
+- **Receiver-lag fixes** — the player fetches Cloudflare-STUN-plus-optional-TURN ICE config, the WHEP POST is time-bounded, the adaptive buffer supervisor stays wired into the stats loop (and sleeps while the tab is hidden, where Chrome suspends presentation and delay measurements are meaningless), sustained frame drops auto-enable Eco Mode, MediaMTX queue/UDP buffers stay tuned (per-reader queue 2048: an empty queue costs nothing on a healthy link, and on a hotspot hiccup the backlog survives instead of overflowing into lost packets that break decode), the HUD shows the measured live playout delay next to the buffer target, a manual latency choice persists across visits, a returning background tab resumes telemetry without zeroing its measurement baselines, the playout target grows with measured network jitter (a fixed target on a jitterful link turns late frames into visible drops), buffer accommodation is **drop-gated** — the target rises only while frames are actually being discarded late and the buffer has outgrown the base target, holds while Chrome sits at it (a controller that raised to meet the measured delay would chase its own tail and inflate every session to the cap), and drains 50ms per tick after sustained calm — a delay still outgrowing the cap means the session itself is stale and triggers a clean rejoin at the live edge (bounded by the switch cooldown), returning from a hidden tab measures the hidden span immediately with one fresh stats delta and rejoins right away when it is stale (a hidden span inflates the buffer to seconds), an ABR loop switches stressed viewers onto the low-bitrate rendition and back after 20 calm seconds, the SDP offer advertises NACK/PLI/transport-cc feedback for **every** video payload type (not just H.264) so AV1/VP9 streams can retransmit lost packets and request fresh keyframes, frame drops are measured through a rolling window (GOP-periodic bursts) and against actually-rendered frames (rVFC), the viewer ICE cache respects the mint half-life, and the codec bridge runs the verified low-latency pipeline (TCP RTSP read, NVDEC decode with automatic fallback, `tune=ull`, forced IDR keyframes, rendition watchdog).
+- **Connection & recovery hardening** — a `navigator.connection` interface-type change (wifi → hotspot, band switch) tears down and rejoins immediately instead of waiting for ICE failure detection; the ICE config is prefetched in parallel with the first status poll and the in-flight fetch is memoized so a connect never double-fetches; `RTCPeerConnection` uses a small `iceCandidatePoolSize` so reconnects gather candidates sooner; the volume slider no longer attenuates twice (the WebAudio graph taps the element *after* its volume property, so the old code played 50% at 25% — the multiplier now rides exactly one control); the HUD gains a **Route** row (direct hole-punch vs TURN relay — the first thing to check for a stuttering remote viewer) and the diagnostic export includes the route plus NACK/PLI recovery counters; the header shows the **live viewer count** broadcast by the server over SSE on every page join/leave; chat SSE events carry `id:` lines so an EventSource auto-reconnect replays exactly the missed messages through the server's existing Last-Event-ID support; chat dedupe sets are capped so marathon sessions cannot leak memory; ABR can step a struggling viewer down to the light rendition from the audio-rescue path too, and upgrades back to whatever the path matrix prefers (the full-sound rendition for RTMP broadcasts, not a muted native path).
+- **Server hardening** — the MediaMTX proxy rides a keep-alive connection pool (warm sockets for every viewer's status probe and WHEP handshake instead of a fresh TCP connect per request), a second launcher hitting an occupied port fails with a readable message instead of an `EADDRINUSE` stack trace, the SSE broadcast applies backpressure protection (a dead tab that stops reading is destroyed instead of buffering unbounded memory), and the chat rate-limit map is swept of expired entries.
 
-Share the current HTTPS hostname shown by `serve status` with `/streaming/` appended. Each viewer must be a member of the same tailnet and keep Tailscale connected.
-
-## Project files and checks
-
-- `index.html`, `style.css`, `app.js`: browser player and interface.
-- `server.js`: local website, signaling/API proxy, and optional TURN credential minting.
-- `mediamtx.yml`: local OBS ingest, WebRTC, and API configuration.
-- `start_host.bat`, `start_host.ps1`: Windows host launcher.
-- `setup_cloudflared.ps1`: one-time public tunnel setup.
-- `run_tests.py`, `js_checks.js`: project checks.
-- `mediamtx_win/`: Windows MediaMTX binary and its license.
-
-Run project checks from PowerShell with `python run_tests.py` (Node.js must be on `PATH`). The MediaMTX contract checks use the included Windows binary.
+Run a single check with `python run_tests.py JsLogicChecks.test_sdp_advertises_exactly_one_video_bandwidth_ceiling`; `node js_checks.js --list` prints the browser-logic cases.
