@@ -106,7 +106,53 @@ const GIVE_UP_BACKOFF_MS = (() => {
 })();
 // Wall clock of the last run long enough (>=300s) to count as a real broadcast.
 // A crash loop that never reaches that must eventually trip the breaker.
-let lastHealthyRunAt = 0;
+//
+// It is seeded with the PROCESS START TIME, not 0. The give-up site treats a
+// falsy value as "no healthy run yet" and substitutes Infinity:
+//
+//     const noHealthyRunFor = lastHealthyRunAt
+//         ? Date.now() - lastHealthyRunAt
+//         : Infinity;
+//     if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES
+//         || noHealthyRunFor > 15 * 60 * 1000) { ...give up... }
+//
+// With a 0 seed, `Infinity > 900000` is true, so that second arm fired on the
+// VERY FIRST ffmpeg exit and the bridge gave up after a single attempt. That
+// made three things unreachable: the MAX_CONSECUTIVE_FFMPEG_FAILURES = 10 retry
+// budget (it could never get past 1), the `gpuFastFailures >= 2` NVDEC -> CPU
+// fallback (it needs two failures), and the 400ms/2s backoff ladder the exit
+// site's own comment describes. Any single ffmpeg exit -- a stall-watchdog
+// kill, an OBS reconnect, a transient RTSP error -- slept the full
+// GIVE_UP_BACKOFF_MS and exited 1 with the renditions dead, instead of
+// restarting. Seeding with the start time measures the 15 minutes from process
+// start, which is what "no healthy run for 15 minutes" is supposed to mean.
+const BRIDGE_STARTED_AT = Date.now();
+let lastHealthyRunAt = BRIDGE_STARTED_AT;
+// How long the bridge may go WITHOUT producing a run long enough to count as a
+// real broadcast before the breaker trips on its own.
+const NO_HEALTHY_RUN_LIMIT_MS = 15 * 60 * 1000;
+
+/*
+ * The circuit breaker, as ONE function so it can be executed by a test.
+ *
+ * Two independent reasons to stop: the consecutive-failure cap, or the bridge
+ * crash-cycling without ever producing a genuinely long run (which the strike
+ * counter cannot see, because a 35s crash cycle keeps clearing it).
+ *
+ * The `lastHealthyRunAt` argument is a WALL CLOCK, never a sentinel. It used to
+ * be read as `lastHealthyRunAt ? now - lastHealthyRunAt : Infinity`, so seeding
+ * it with 0 made the second arm true on the very first ffmpeg exit -- the
+ * bridge gave up after ONE attempt and the MAX_CONSECUTIVE_FFMPEG_FAILURES = 10
+ * budget, the `gpuFastFailures >= 2` NVDEC -> CPU fallback and the whole
+ * 400ms/2s backoff ladder became unreachable. A falsy timestamp now simply
+ * means "no run long enough has happened yet, so that arm is simply not
+ * satisfied", and the elapsed window is measured from the bridge's own start.
+ */
+function shouldGiveUp(failures, lastHealthyRunAtStamp, now = Date.now()) {
+    const sinceHealthyRun = lastHealthyRunAtStamp ? now - lastHealthyRunAtStamp : 0;
+    return failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES
+        || sinceHealthyRun > NO_HEALTHY_RUN_LIMIT_MS;
+}
 // A transcoder that has produced no rendition video this long is hung — most
 // commonly an OBS WHIP AV1 source whose fragmented keyframes never reassemble
 // on the RTSP leg (verified live: the pre-keyframe drop loop never syncs).
@@ -1012,11 +1058,10 @@ async function main() {
         // tripped, or the bridge has been crash-cycling without ever producing
         // a genuinely long run — which the strike counter cannot see, because a
         // 35s crash cycle keeps clearing it.
-        const noHealthyRunFor = lastHealthyRunAt
-            ? Date.now() - lastHealthyRunAt
-            : Infinity;
-        if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES
-            || noHealthyRunFor > 15 * 60 * 1000) {
+        if (shouldGiveUp(failures, lastHealthyRunAt, Date.now())) {
+            const noHealthyRunFor = lastHealthyRunAt
+                ? Date.now() - lastHealthyRunAt
+                : Infinity;
             logError(`giving up after ${failures} failed attempts`
                 + (noHealthyRunFor === Infinity ? '' : ` (no healthy run for ${Math.round(noHealthyRunFor / 1000)}s)`));
             if (plan.sourceCodec === 'AV1') {
@@ -1043,7 +1088,7 @@ async function main() {
     process.exit(0);
 }
 
-module.exports = { decideBridge, buildFfmpegArgs, pickDecoderArgs, probeGopFrames, planTargets, VIDEO_CODECS };
+module.exports = { decideBridge, buildFfmpegArgs, pickDecoderArgs, probeGopFrames, planTargets, shouldGiveUp, MAX_CONSECUTIVE_FFMPEG_FAILURES, NO_HEALTHY_RUN_LIMIT_MS, VIDEO_CODECS };
 
 if (require.main === module) {
     main().catch((err) => {

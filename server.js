@@ -129,6 +129,34 @@ function proxyToMediaMTX(req, res, requestUrl) {
 
         res.writeHead(proxyRes.statusCode, setCorsHeaders(responseHeaders));
         proxyRes.pipe(res);
+
+        // A response that dies AFTER its headers is reported on proxyRes, never
+        // on proxyReq -- so the error handler below cannot see it, and pipe()
+        // does not forward source errors to the destination. The client's
+        // socket was therefore simply left open forever: measured against an
+        // upstream that destroys the socket mid-body, the client saw no end,
+        // no abort and no error in 40s, well past the 30s cap above, which only
+        // arms while there is still no response and so never fires once the
+        // body is in flight. A hung status probe is the one failure this
+        // function's timeout exists to prevent: it freezes the player's
+        // reconnect loop with no error to retry on. Cut the partial response so
+        // the client fails fast, leaving recovery to its own retry.
+        //
+        // Idempotent by construction: res.destroy() sets res.destroyed
+        // synchronously, so whichever of the three events fires first acts and
+        // the rest fall through the guard. 'close' with an incomplete message
+        // is the backstop for Node versions that emit neither of the others.
+        const cutPartialResponse = (reason) => {
+            if (res.writableEnded || res.destroyed) return;
+            console.warn(`[Proxy] MediaMTX response from ${MEDIAMTX_HOST}:${targetPort} `
+                + `ended early (${reason}); cutting the partial response.`);
+            res.destroy();
+        };
+        proxyRes.on('aborted', () => cutPartialResponse('upstream aborted'));
+        proxyRes.on('error', (error) => cutPartialResponse(error.code || error.message));
+        proxyRes.on('close', () => {
+            if (!proxyRes.complete) cutPartialResponse('upstream closed before the body completed');
+        });
     });
 
     // Cap the wait on MediaMTX: a hung response would stall the player's status
