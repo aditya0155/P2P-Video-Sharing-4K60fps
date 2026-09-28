@@ -106,6 +106,8 @@ const GIVE_UP_BACKOFF_MS = (() => {
 })();
 // Wall clock of the last run long enough (>=300s) to count as a real broadcast.
 // A crash loop that never reaches that must eventually trip the breaker.
+// Wall clock of the last run long enough (>=300s) to count as a real broadcast.
+// A crash loop that never reaches that must eventually trip the breaker.
 //
 // It is seeded with the PROCESS START TIME, not 0. The give-up site treats a
 // falsy value as "no healthy run yet" and substitutes Infinity:
@@ -126,10 +128,21 @@ const GIVE_UP_BACKOFF_MS = (() => {
 // GIVE_UP_BACKOFF_MS and exited 1 with the renditions dead, instead of
 // restarting. Seeding with the start time measures the 15 minutes from process
 // start, which is what "no healthy run for 15 minutes" is supposed to mean.
+//
+// The blast radius was a room-wide outage, because this runs as MediaMTX's
+// runOnAvailable hook under runOnAvailableRestart: one transient cold-start
+// ffmpeg error (RTSP setup racing the new publisher, the first keyframe not
+// reassembling inside the 20s startup watchdog, NVENC contention with OBS on
+// the same GPU) dropped both RTMP publishers, and a publisher drop closes EVERY
+// WHEP reader session on the path. The bridge then slept GIVE_UP_BACKOFF_MS and
+// exited, so the rendition tier stayed down ~60s at a time instead of retrying
+// in 400ms.
 const BRIDGE_STARTED_AT = Date.now();
 let lastHealthyRunAt = BRIDGE_STARTED_AT;
 // How long the bridge may go WITHOUT producing a run long enough to count as a
 // real broadcast before the breaker trips on its own.
+// Must exceed the 300s health threshold itself, or a bridge that is merely
+// between two long runs could trip on its own healthy operation.
 const NO_HEALTHY_RUN_LIMIT_MS = 15 * 60 * 1000;
 
 /*
@@ -1146,11 +1159,9 @@ async function main() {
         // a genuinely long run — which the strike counter cannot see, because a
         // 35s crash cycle keeps clearing it.
         if (shouldGiveUp(failures, lastHealthyRunAt, Date.now())) {
-            const noHealthyRunFor = lastHealthyRunAt
-                ? Date.now() - lastHealthyRunAt
-                : Infinity;
+            const noHealthyRunFor = Date.now() - (lastHealthyRunAt || BRIDGE_STARTED_AT);
             logError(`giving up after ${failures} failed attempts`
-                + (noHealthyRunFor === Infinity ? '' : ` (no healthy run for ${Math.round(noHealthyRunFor / 1000)}s)`));
+                + ` (no healthy run for ${Math.round(noHealthyRunFor / 1000)}s)`);
             if (plan.sourceCodec === 'AV1') {
                 logError(`known limitation: an OBS WHIP AV1 source whose keyframes never reassemble on `
                     + `the RTSP leg cannot be bridged — AV1-capable viewers still play the native `

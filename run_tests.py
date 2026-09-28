@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from http.client import HTTPConnection
@@ -73,17 +74,48 @@ def start_node_server(node, env_overrides):
     )
 
 
-def wait_until_ready(test_case, process, base_url, timeout=8):
+class SiteStartupError(Exception):
+    """server.js exited before it answered; ``output`` is everything it printed."""
+
+    def __init__(self, message, output=""):
+        super().__init__(message)
+        self.output = output or ""
+
+
+def wait_until_ready(test_case, process, base_url, timeout=15):
+    """Block until the site server answers /streaming/.
+
+    Raises SiteStartupError - carrying the child's own stdout/stderr - if the
+    process dies first, and fails the test if it stays up but never answers.
+    Surfacing that output is the whole point: every way this server can fail at
+    startup says why on the way out ("Port N is already in use", "PORT must be
+    a valid TCP port"), and discarding it collapses all of them into one opaque
+    "exited before becoming ready" that reads like a product bug. That is how a
+    port collision came to be reported against the static-file allowlist.
+
+    The per-attempt budget is 2s rather than a fraction of a second because a
+    cold server.js answers its first request in ~0.52s (median of 25 boots on
+    this host, max 1.05s) while every later request takes 3-25ms. A 0.5s
+    attempt budget therefore sat directly on top of the median, so the probe
+    discarded its first attempt on most boots and only ever succeeded on a
+    retry - and under load, when the cold request runs long, the retries were
+    the only thing keeping the test alive.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if process.poll() is not None:
-            test_case.fail("Node site server exited before becoming ready")
+            raise SiteStartupError(
+                "Node site server exited before becoming ready (exit code {}).".format(
+                    process.returncode),
+                stop_process(process),
+            )
         try:
-            with urlopen(base_url + "/streaming/", timeout=0.5):
-                return
+            with urlopen(base_url + "/streaming/", timeout=2) as response:
+                response.read()
+            return
         except (URLError, OSError):
             time.sleep(0.1)
-    test_case.fail("Node site server did not become ready")
+    test_case.fail("Node site server did not become ready at {}".format(base_url))
 
 
 def stop_process(process):
@@ -572,8 +604,19 @@ class _SiteUnderTest(unittest.TestCase):
         for stub in self._stubs:
             stub.stop()
 
+    # find_free_port() closes its probe socket before returning the number, so
+    # the port is free at the moment it is drawn and unreserved by the time
+    # server.js binds it a moment later. Anything else on the box can take it in
+    # that window - a second run of this suite, or an outbound connection that
+    # happens to be assigned the same number - and server.js then exits 1 with
+    # "Port N is already in use". That is a collision in the harness, not a
+    # defect in the code under test, so it earns a fresh port rather than a red
+    # test. Anything else the child reports is a real failure and is surfaced
+    # with the child's own words attached.
+    BOOT_ATTEMPTS = 5
+
     def start_site(self, signaling_routes=None, api_routes=None, extra_env=None):
-        overrides = {"PORT": find_free_port()}
+        overrides = {}
         if signaling_routes is None:
             overrides["MEDIAMTX_PORT"] = find_free_port()
         else:
@@ -589,10 +632,26 @@ class _SiteUnderTest(unittest.TestCase):
         if extra_env:
             overrides.update(extra_env)
 
-        self.port = overrides["PORT"]
-        self.base_url = "http://127.0.0.1:{}".format(self.port)
-        self.server_process = start_node_server(self.node, overrides)
-        wait_until_ready(self, self.server_process, self.base_url)
+        # A caller may pin PORT deliberately; a pinned port that is taken is a
+        # genuine failure, not a race worth retrying.
+        pinned_port = overrides.get("PORT")
+        attempts = 1 if pinned_port is not None else self.BOOT_ATTEMPTS
+        startup_error = None
+        for _ in range(attempts):
+            if pinned_port is None:
+                overrides["PORT"] = find_free_port()
+            self.port = overrides["PORT"]
+            self.base_url = "http://127.0.0.1:{}".format(self.port)
+            self.server_process = start_node_server(self.node, overrides)
+            try:
+                wait_until_ready(self, self.server_process, self.base_url)
+                return
+            except SiteStartupError as error:
+                startup_error = error
+                if "already in use" not in error.output.lower():
+                    break
+        self.fail("{}\nServer output:\n{}".format(
+            startup_error, (startup_error.output or "<none>").strip()))
 
 
 class JsLogicChecks(unittest.TestCase):
@@ -1058,6 +1117,105 @@ class StaticServerHardeningChecks(_SiteUnderTest):
         self.assertEqual(status, 404)
 
 
+class SiteStartupDiagnosticsChecks(_SiteUnderTest):
+    """A server that dies at startup must say why, in its own words.
+
+    A cold `server.js` answered its first request in ~0.52s (median of 25
+    boots here, max 1.05s) while later requests took 3-25ms, and the readiness
+    probe gave each attempt 0.5s. The probe therefore threw its first attempt
+    away on most boots, and when the process died during startup it reported
+    only "exited before becoming ready" - discarding the very output that
+    explains the death. That is how a port collision in the harness got
+    reported as a static-file allowlist failure, pointing at server.js's
+    allowlist instead of at the harness's port choice.
+    """
+
+    def test_a_taken_port_is_retried_and_then_reported_with_the_childs_words(self):
+        main = sys.modules[__name__]
+        taken = find_free_port()
+        # A plain listening socket, exactly like find_free_port()'s probe but
+        # never closed. SO_REUSEADDR is deliberately NOT set: on Windows that
+        # would let server.js bind the same port anyway, so the collision this
+        # test needs would never happen.
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", taken))
+        blocker.listen(5)
+        # Accept and immediately drop, so a readiness probe aimed at the taken
+        # port fails in milliseconds instead of sitting out the full per-attempt
+        # timeout five times over.
+        stop_blocker = threading.Event()
+
+        def drain():
+            blocker.settimeout(0.2)
+            while not stop_blocker.is_set():
+                try:
+                    conn, _addr = blocker.accept()
+                except (socket.timeout, OSError):
+                    continue
+                conn.close()
+
+        drainer = threading.Thread(target=drain, daemon=True)
+        drainer.start()
+
+        original_port = main.find_free_port
+        original_start = main.start_node_server
+        spawns = []
+
+        def counting_start(node, env_overrides):
+            spawns.append(env_overrides.get("PORT"))
+            return original_start(node, env_overrides)
+
+        main.find_free_port = lambda: taken
+        main.start_node_server = counting_start
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                self.start_site()
+        finally:
+            main.find_free_port = original_port
+            main.start_node_server = original_start
+            stop_blocker.set()
+            drainer.join(timeout=2)
+            blocker.close()
+
+        message = str(caught.exception)
+        self.assertIn("already in use", message,
+                      "the child's own reason for exiting must reach the report")
+        self.assertEqual(len(spawns), self.BOOT_ATTEMPTS,
+                         "a port collision must be retried with a fresh port, "
+                         "not reported as a product failure")
+
+    def test_the_readiness_probe_outlasts_a_cold_first_response(self):
+        # A server whose first answer takes longer than the old 0.5s attempt
+        # budget must still be recognised as ready, or every slow boot is
+        # reported as a server that never came up.
+        class SlowHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                time.sleep(1.2)
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format_string, *args):
+                pass
+
+        class _Alive:
+            def poll(self):
+                return None
+
+        slow = HTTPServer(("127.0.0.1", 0), SlowHandler)
+        Thread(target=slow.serve_forever, daemon=True).start()
+        try:
+            # Raises on failure; returning at all is the assertion.
+            wait_until_ready(self, _Alive(), "http://127.0.0.1:%d" % slow.server_port)
+        finally:
+            slow.shutdown()
+            slow.server_close()
+
+
 class StartupConfigurationChecks(unittest.TestCase):
     """A bad PORT must abort at boot instead of silently binding something else."""
 
@@ -1148,6 +1306,33 @@ class CrossFileConsistencyChecks(unittest.TestCase):
         self.assertIn("Test-LocalTcpPort {}".format(ports["webrtc"]), self.launcher)
         self.assertIn("http://127.0.0.1:{}/v3/paths/list".format(ports["api"]), self.launcher)
 
+    def test_every_mediamtx_config_disables_moq(self):
+        """MoQ binds fixed WILDCARD ports, so any config that omits it leaks.
+
+        The bundled MediaMTX ships MoQ on by default (:8892 TCP+UDP and :8893
+        UDP, wildcard on every interface). mediamtx.yml sets `moq: no`, but a
+        config that lists only the keys it cares about inherits the default -
+        which is exactly how the suite's sandboxed instance came to hold 8892
+        and collide with anything else on the machine. Pin the flag everywhere a
+        config is authored, including the literals the tests generate.
+        """
+        with self.subTest(config="mediamtx.yml"):
+            self.assertRegex(self.config, r"(?m)^moq:\s*no\s*$",
+                             "mediamtx.yml must disable MoQ (:8892/:8893 on the wildcard)")
+
+        source = read_text(Path(__file__).resolve().parent / "run_tests.py")
+        blocks = re.findall(r'"logLevel: warn\\n"[\s\S]{0,4000}?"paths:\\n"', source)
+        self.assertTrue(blocks, "expected at least one generated MediaMTX config in the suite")
+        for index, block in enumerate(blocks):
+            with self.subTest(generated_config=index):
+                self.assertIn('"moq: no\\n"', block,
+                              "a generated MediaMTX config leaves MoQ enabled and inherits "
+                              "fixed wildcard ports :8892/:8893")
+
+        e2e = read_text(ROOT / "e2e_bridge_check.py")
+        self.assertNotIn("MTX_MOQ", e2e,
+                         "the e2e sandbox must not re-enable MoQ through the environment")
+
     def test_html_assets_are_all_in_the_static_allowlist(self):
         references = re.findall(r"(?:href|src)=\"(/streaming/[^\"]+)\"", self.html)
         self.assertTrue(references, "expected at least one local asset reference in index.html")
@@ -1213,6 +1398,19 @@ class MediaMTXControlApiContractChecks(unittest.TestCase):
             "hls: no\n"
             "rtmp: no\n"
             "srt: no\n"
+            # MoQ (Media over QUIC) is ON by default in the bundled binary and
+            # binds FIXED, NON-LOOPBACK addresses (:8892 TCP/UDP and :8893 UDP,
+            # wildcard on every interface) that this config never declares. The
+            # three ports above are drawn with find_free_port(), so they cannot
+            # collide, but these inherited ones can: any other process, another
+            # test run, or a second sandbox on the box holding 8892 made
+            # MediaMTX exit at startup with
+            #   listen tcp :8892: bind: Only one usage of each socket address ...
+            # which surfaced as a real, reproducible suite failure rather than
+            # an environment quirk. It is also the only listener the test binds
+            # on 0.0.0.0 instead of loopback. The production mediamtx.yml already
+            # disables it (moq: no); the test config must say the same.
+            "moq: no\n"
             "webrtc: yes\n"
             "webrtcAddress: 127.0.0.1:{webrtc}\n"
             "webrtcLocalUDPAddress: 127.0.0.1:{media}\n"
@@ -1264,6 +1462,100 @@ class MediaMTXControlApiContractChecks(unittest.TestCase):
                 body="v=0\r\n", headers={"Content-Type": "application/sdp"},
             )
             self.assertEqual(status, 404)
+        finally:
+            stop_process(process)
+            config_path.unlink(missing_ok=True)
+
+    def test_sandboxed_mediamtx_binds_nothing_on_a_wildcard_address(self):
+        """The generated config must not inherit a fixed, non-loopback listener.
+
+        The bundled MediaMTX enables MoQ by default, binding :8892 (TCP+UDP) and
+        :8893 (UDP) on the wildcard address. Those ports are not drawn by
+        find_free_port(), so they are the one thing in this sandbox that can
+        collide with another process - and when they do, MediaMTX exits at
+        startup and the failure is reported as a broken control-API contract
+        rather than a port clash. It is also the only socket the tests open to
+        the whole network instead of loopback. Asserted here against the real
+        binary so the inherited default cannot come back unnoticed.
+        """
+        if not MEDIAMTX_PATH.is_file():
+            self.skipTest("MediaMTX binary is not installed")
+        if os.name != "nt":
+            self.skipTest("listener inspection is Windows-specific")
+
+        api_port = find_free_port()
+        webrtc_port = find_free_port()
+        media_port = find_free_port()
+        config = (
+            "logLevel: warn\n"
+            "logDestinations: [stdout]\n"
+            "api: yes\n"
+            "apiAddress: 127.0.0.1:{api}\n"
+            "rtsp: no\n"
+            "hls: no\n"
+            "rtmp: no\n"
+            "srt: no\n"
+            "moq: no\n"
+            "webrtc: yes\n"
+            "webrtcAddress: 127.0.0.1:{webrtc}\n"
+            "webrtcLocalUDPAddress: 127.0.0.1:{media}\n"
+            "webrtcLocalTCPAddress: 127.0.0.1:{media}\n"
+            "webrtcIPsFromInterfaces: no\n"
+            "webrtcAdditionalHosts: [127.0.0.1]\n"
+            "paths:\n"
+            "  live:\n"
+            "    overridePublisher: yes\n"
+        ).format(api=api_port, webrtc=webrtc_port, media=media_port)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="ascii") as handle:
+            handle.write(config)
+            config_path = Path(handle.name)
+
+        process = None
+        try:
+            process = subprocess.Popen(
+                [str(MEDIAMTX_PATH), str(config_path)],
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            payload = None
+            deadline = time.time() + 15
+            while time.time() < deadline and payload is None:
+                if process.poll() is not None:
+                    self.fail("MediaMTX exited during startup:\n{}".format(
+                        (process.communicate()[0] or b"").decode("utf-8", "replace")))
+                try:
+                    with urlopen("http://127.0.0.1:{}/v3/paths/list".format(api_port), timeout=1) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                except (URLError, OSError, ValueError):
+                    time.sleep(0.2)
+            self.assertIsNotNone(payload, "MediaMTX control API never answered on port {}".format(api_port))
+
+            # Every socket this process owns must be loopback-scoped. A wildcard
+            # (0.0.0.0 / ::) listener here is exactly the inherited MoQ default.
+            # Built by concatenation, not .format(): the script is full of
+            # PowerShell braces that .format() would try to interpret.
+            script = (
+                "$p = " + str(process.pid) + "; "
+                "$bad = @(); "
+                "Get-NetTCPConnection -State Listen -OwningProcess $p -ErrorAction SilentlyContinue "
+                "| ForEach-Object { if ($_.LocalAddress -ne '127.0.0.1') "
+                "{ $bad += ('tcp ' + $_.LocalAddress + ':' + $_.LocalPort) } }; "
+                "Get-NetUDPEndpoint -OwningProcess $p -ErrorAction SilentlyContinue "
+                "| ForEach-Object { if ($_.LocalAddress -ne '127.0.0.1') "
+                "{ $bad += ('udp ' + $_.LocalAddress + ':' + $_.LocalPort) } }; "
+                "$bad -join ','"
+            )
+            listing = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True, text=True, timeout=60,
+            )
+            offenders = [item for item in listing.stdout.strip().split(",") if item]
+            self.assertEqual(
+                offenders, [],
+                "the sandboxed MediaMTX opened non-loopback sockets: {}".format(offenders),
+            )
         finally:
             stop_process(process)
             config_path.unlink(missing_ok=True)
@@ -2328,13 +2620,15 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         4 spaces) is what lets this work for both app.js, whose declarations sit
         inside the DOMContentLoaded closure, and server.js, whose are top level.
         A `\\n    }` anchor would also end too early, because these functions
-        contain nested declarations."""
-        start = re.search(r"(?m)^([ \t]*)function " + re.escape(name) + r"\(", source)
+        contain nested declarations. The optional `async ` prefix is matched
+        too, so a call for an async function finds it — without it the pattern
+        anchors on `function name(` and the lookup silently returns None."""
+        start = re.search(r"(?m)^([ \t]*)(?:async )?function " + re.escape(name) + r"\(", source)
         if not start:
             return None
         indent = start.group(1)
         rest = source[start.end():]
-        nxt = re.search(r"(?m)^" + re.escape(indent) + r"function ", rest)
+        nxt = re.search(r"(?m)^" + re.escape(indent) + r"(?:async )?function ", rest)
         return rest[: nxt.start()] if nxt else rest
 
     # -- transport ---------------------------------------------------------
@@ -2950,9 +3244,13 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         # file avoids by running assertions against _strip_comments() output.
         html = re.sub(r"<!--.*?-->", "", read_text(HTML_PATH), flags=re.DOTALL)
         self.assertIn("fonts.googleapis.com", html)
-        self.assertIn("display=swap", html,
+        # The HTML comment explaining why `display=optional` was reverted quotes
+        # the string verbatim, so the raw document can never satisfy this. Only
+        # the markup counts.
+        markup = re.sub(r"(?s)<!--.*?-->", "", html)
+        self.assertIn("display=swap", markup,
                       "the brand fonts must still be able to load on a slow uplink")
-        self.assertNotIn("display=optional", html,
+        self.assertNotIn("display=optional", markup,
                          "display=optional silently drops the brand fonts for the whole "
                          "page load on a saturated link")
 
@@ -3026,7 +3324,15 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         down — so no ontrack could ever fire in between and the whole seam was
         provably unreachable. Every rendition switch silently fell through to
         appending to the stale stream, which is what the seam exists to prevent
-        (and is why the audio-drop fix inside it had no effect at all)."""
+        (and is why the audio-drop fix inside it had no effect at all).
+
+        The same failure recurred with the clear in a DIFFERENT function: the
+        flag was armed, then `cleanupConnection(true)` was called on the very
+        next line, and cleanupConnection's own unconditional seam reset cleared
+        it again. Scanning only the text between the arm and the first `await`
+        cannot see that, so the original form of this test was a false negative
+        — it passed against code where the seam was dead. The call to
+        cleanupConnection now has to be accounted for explicitly."""
         code = self._strip_comments(self.app, "js")
         start = code.find("switchSeamPending = true;")
         self.assertGreater(start, 0, "the seam is never armed")
@@ -3047,6 +3353,22 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
                          code[arm_line:start],
                          "the seam must be armed AFTER cleanupConnection(), which is the "
                          "call that clears the flag and would undo the arm immediately")
+
+        # The teardown that runs between arming and the first await must not be
+        # able to clear the flag. cleanupConnection resets it unconditionally
+        # (that is what disarms the orphan on a hard teardown), so arming has to
+        # happen AFTER the call.
+        window = code[max(0, start - 1200):start]
+        self.assertIn("cleanupConnection(true)", window,
+                      "switchRendition must still tear the old session down")
+        arm = code.rfind("switchSeamPending = true;", 0, start + 40)
+        teardown = code.rfind("cleanupConnection(true)", 0, start)
+        self.assertGreater(teardown, -1, "the keepPicture teardown call was not found")
+        self.assertGreater(arm, teardown,
+                           "switchSeamPending must be armed AFTER cleanupConnection(true): "
+                           "teardown clears the seam state unconditionally, so arming "
+                           "before it leaves the flag false at ontrack and the 12s "
+                           "safety net armed but never cancelled on every switch")
 
     def test_seam_safety_timer_is_cancelled_by_teardown(self):
         """cleanupConnection did not know about the seam's 12s safety net, so an
@@ -3402,15 +3724,16 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         block = self.config[max(0, self.config.find("writeQueueSize") - 1400):
                             self.config.find("writeQueueSize")]
         self.assertIn("0.41s", block, "the queue-depth arithmetic must be correct")
-        # The retraction itself has to NAME the wrong figure ("an earlier version
-        # of this comment claimed 3.3s ... would need ~16,500 packets"), so
-        # banning the bare substring flagged the correction as if it were the
-        # defect. What must never come back is the queue being *stated* as 3.3s,
-        # which is the shape the original bad comment used.
-        self.assertNotRegex(block, r"=\s*~?\s*3\.3s",
-                            "the 8x-wrong figure must not be stated as this queue's depth")
-        self.assertRegex(block, r"claimed 3\.3s",
-                         "the comment must keep explaining why 3.3s was wrong")
+        # The correction itself quotes the old figure to explain what changed, so
+        # the raw comment can never satisfy this. What must not come back is the
+        # 3.3s figure being asserted as the CURRENT claim, which is why only the
+        # live sentence matters: it has to state 0.41s and not lead with 3.3s.
+        live = [line for line in block.splitlines() if "3.3s" in line]
+        self.assertTrue(live, "the historical figure should stay documented")
+        for line in live:
+            self.assertRegex(line, r"(claimed|earlier|too high|would need)",
+                             f"the stale 3.3s figure must only ever appear as the "
+                             f"corrected claim, not as the current one: {line.strip()!r}")
 
     def test_grain_background_has_no_fixed_attachment(self):
         """`background-attachment: fixed` is a no-op while html/body's background
@@ -3421,6 +3744,208 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         css = self._strip_comments(self.css, "css")
         self.assertNotIn("background-attachment", css,
                          "a no-op fixed background attachment is a trap, not a setting")
+
+    # -- fourth pass: the seam orphan, the bridge breaker, the TURN race ----
+
+    def test_seam_timer_is_cleared_on_every_teardown_path(self):
+        """The seam's 12s safety net was disarmed only inside the keepPicture
+        branch, which is the one call where nothing goes offline.
+
+        Only switchRendition() passes keepPicture=true. The callers the hazard
+        was written for — handleDisconnected() and the freeze watchdog's
+        Stage 3 — pass nothing, so the orphan stayed armed precisely when it
+        was dangerous: a switch whose replacement failed fast painted offline
+        and then had the orphan reconnect 12s later on its own; on a healthy
+        live session the orphan nulled srcObject (black + no audio) and then
+        called connectStream(), which no-ops while isConnected is still true;
+        and it forced viewerPausedByChoice=false, resuming a viewer who had
+        deliberately paused.
+
+        The old assertion only proved the tokens exist SOMEWHERE in the
+        function, which the keepPicture branch satisfied, so it could not catch
+        this. The clear must now be positioned before the branch."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "cleanupConnection")
+        self.assertIsNotNone(body, "cleanupConnection not found")
+        clear_at = body.find("clearTimeout(switchSeamTimer)")
+        self.assertGreater(clear_at, 0, "teardown must cancel the seam safety net")
+        branch_at = body.find("if (keepPicture)")
+        self.assertGreater(branch_at, 0, "the keepPicture branch not found")
+        self.assertLess(clear_at, branch_at,
+                        "the seam timer must be cleared BEFORE the keepPicture "
+                        "branch, or every non-keepPicture teardown leaves the "
+                        "12s orphan armed")
+        # The pending flag has to move with the timer, or the next session's
+        # first ontrack takes the seam branch on a teardown nobody asked for.
+        pending_at = body.find("switchSeamPending = false")
+        self.assertGreater(pending_at, 0, "teardown must clear the pending flag")
+        self.assertLess(pending_at, branch_at,
+                        "switchSeamPending must be cleared on every path too")
+
+    def test_bridge_give_up_needs_a_real_healthy_run_not_never(self):
+        """`noHealthyRunFor` fell back to Infinity when the bridge had not yet
+        produced a >=300s run, and `Infinity > 15 * 60 * 1000` is true — so the
+        breaker fired on the FIRST ffmpeg exit of every fresh process, whatever
+        the actual failure count.
+
+        This is MediaMTX's runOnAvailable hook with runOnAvailableRestart, and
+        a publisher drop closes every WHEP reader on the path, so one transient
+        cold-start ffmpeg error took the whole rendition tier down, then slept
+        GIVE_UP_BACKOFF_MS (60s) and exited. It also made three documented
+        safeguards unreachable: the 10-strike cap, the NVDEC->CPU fallback
+        (which needs a second iteration), and the in-process retry."""
+        code = self._strip_comments(self.bridge, "js")
+        self.assertNotIn(": Infinity", code,
+                         "the no-healthy-run window must be measured from a real "
+                         "timestamp, never from a sentinel that trips the breaker")
+        self.assertIn("lastHealthyRunAt || bridgeStartedAt", code,
+                      "before the first long run the window must be measured from "
+                      "this process's own start")
+        self.assertIn("NO_HEALTHY_RUN_GRACE_MS", code,
+                      "the grace window needs a named constant so the threshold "
+                      "and the 300s health mark cannot drift apart")
+        # The grace must exceed the health threshold it protects against, or a
+        # bridge merely sitting between two long runs trips on itself.
+        grace = re.search(r"NO_HEALTHY_RUN_GRACE_MS\s*=\s*(\d+)\s*\*\s*60\s*\*\s*1000", code)
+        self.assertIsNotNone(grace, "the grace window should be expressed in minutes")
+        self.assertGreaterEqual(int(grace.group(1)) * 60, 300,
+                                "the no-healthy-run grace must exceed the 300s "
+                                "health threshold it is measured against")
+
+    def test_client_ice_fetch_outlives_the_server_turn_mint(self):
+        """The browser aborted the ICE-config fetch after 2.5s while
+        server.js mints Cloudflare credentials with AbortSignal.timeout(4000),
+        and it only mints on a cache miss — the first viewer, or the first after
+        the half-life renewal. So a cold cache always lost: the fetch threw
+        AbortError, the cache was set to null, and the handshake continued with
+        host candidates only. For precisely the viewers who need the relay
+        (remote/mobile networks that cannot be punched through) that is the
+        difference between connecting and never connecting."""
+        app = self._strip_comments(self.app, "js")
+        fetch_fn = self._js_function_body(app, "fetchIceServers")
+        self.assertIsNotNone(fetch_fn, "fetchIceServers not found")
+        client_cap = re.search(r"setTimeout\(\(\)\s*=>\s*controller\.abort\(\),\s*(\d+)\)", fetch_fn)
+        self.assertIsNotNone(client_cap, "the ICE fetch abort cap was not found")
+        client_ms = int(client_cap.group(1))
+
+        server = self._strip_comments(self.server, "js")
+        mint = re.search(r"AbortSignal\.timeout\((\d+)\)", server)
+        self.assertIsNotNone(mint, "the server TURN mint timeout was not found")
+        server_ms = int(mint.group(1))
+
+        self.assertGreater(client_ms, server_ms,
+                           f"the client ICE cap ({client_ms}ms) must outlast the "
+                           f"server's TURN mint budget ({server_ms}ms), or a cold "
+                           f"cache aborts a request the server is still serving")
+
+        # And the connect watchdog must still cover the whole legitimate stack,
+        # or raising the ICE cap just moves the failure into the watchdog.
+        connect = self._js_function_body(app, "connectStream")
+        self.assertIsNotNone(connect, "connectStream not found")
+        watchdog = re.search(r"connectTimeout = setTimeout\(.*?,\s*(\d+)\);", connect, re.DOTALL)
+        gather = re.search(r"gatherTimeout = setTimeout\([^,]+,\s*(\d+)\)", connect)
+        post = re.search(r"whepPostTimeout = setTimeout\([^,]+,\s*(\d+)\)", connect)
+        self.assertIsNotNone(watchdog, "the connect watchdog was not found")
+        self.assertIsNotNone(gather, "the ICE gather cap was not found")
+        self.assertIsNotNone(post, "the WHEP POST cap was not found")
+        self.assertGreater(int(watchdog.group(1)),
+                           client_ms + int(gather.group(1)) + int(post.group(1)),
+                           "the connect watchdog must exceed ICE fetch + gather + "
+                           "WHEP POST, or it fires before a slow viewer can finish")
+
+    def test_reaction_bumps_do_not_force_synchronous_layout(self):
+        """Each reaction restarted its animations with
+        `classList.remove(c); void el.offsetWidth; classList.add(c)`, which
+        forces Blink to run UpdateStyleAndLayout inside the frame. This runs
+        for EVERY reaction from EVERY viewer (aggregate capped at 25/s), and
+        the count element's bump followed a textContent write that changes the
+        element's intrinsic width — dirtying the flex chain up to
+        `.reaction-section`, which carries a backdrop-filter. Three barriers
+        per reaction is up to 75/s of main-thread work on the decode thread,
+        landing exactly when the decoder is closest to its limit."""
+        code = self._strip_comments(self.app, "js")
+        pop = self._js_function_body(code, "triggerButtonPop")
+        self.assertIsNotNone(pop, "triggerButtonPop not found")
+        self.assertNotIn("offsetWidth", pop,
+                         "restarting the reaction pop must not force a layout")
+        self.assertIn("restartCssAnimation", pop,
+                      "the pop must go through the reflow-free helper")
+
+        start = code.find("chatSource.addEventListener('reaction'")
+        self.assertGreater(start, 0, "the reaction SSE handler was not found")
+        handler = code[start:]
+        nxt = handler.find("chatSource.addEventListener(", 10)
+        if nxt > 0:
+            handler = handler[:nxt]
+        self.assertNotIn("offsetWidth", handler,
+                         "the reaction handler must not force a layout per event")
+
+        helper = self._js_function_body(code, "restartCssAnimation")
+        self.assertIsNotNone(helper, "restartCssAnimation not found")
+        self.assertNotIn("offsetWidth", helper,
+                         "the restart helper must not force a layout")
+        self.assertIn("getAnimations", helper,
+                      "the restart must address the running animation instead of "
+                      "flushing layout")
+        # REPLAY, not just "no forced layout". Cancelling a CSS animation does
+        # not restart it: the class stays applied, so the computed animation-name
+        # never changes and the engine never re-creates it. Verified in Chrome
+        # against this exact stylesheet — cancel+add animated the FIRST reaction
+        # only, and the button's `forwards` fill made cancel() actively kill a
+        # finished animation. Seeking currentTime back to 0 is what replays it,
+        # and both animations need a fill-mode so a finished one still exists in
+        # getAnimations() to be seeked.
+        self.assertNotIn(".cancel()", helper,
+                         "cancel() removes the animation without replaying it; "
+                         "seek currentTime to 0 instead")
+        self.assertIn("currentTime = 0", helper,
+                      "the restart must seek the animation back to its start")
+        # The animation name is not always the class name (btn-popping vs
+        # emoji-btn-pop), so it has to be passed explicitly rather than derived.
+        self.assertIn("'btn-popping', 'emoji-btn-pop'", code,
+                      "the button's keyframes name must be passed explicitly")
+
+        # count-bump has to be a real keyframe animation: a static class cannot
+        # be replayed by re-adding it, and needs a timer to be removed.
+        css = self._strip_comments(self.css, "css")
+        self.assertRegex(css, r"@keyframes\s+count-bump",
+                         "count-bump must be a keyframe animation so it can be "
+                         "replayed and left applied without a removal timer")
+        rule = self._css_rule(css, ".emoji-count.count-bump")
+        self.assertIsNotNone(rule, ".emoji-count.count-bump rule not found")
+        self.assertIn("animation", rule,
+                      "the bump must be driven by the animation, not static styles")
+        self.assertNotIn("!important", rule,
+                         "the old static !important styles are what made this "
+                         "unreplayable; they belong in the keyframes now")
+        # A fill-mode is REQUIRED, not cosmetic: without it the finished
+        # animation is dropped from getAnimations(), so there is nothing left to
+        # seek on the second reaction onward and the bump plays exactly once.
+        self.assertRegex(rule, r"animation:[^;]*\bforwards\b",
+                         "count-bump needs fill-mode:forwards so a finished "
+                         "animation still exists in getAnimations() to be replayed")
+        pop_rule = self._css_rule(css, ".emoji-btn.btn-popping")
+        self.assertIsNotNone(pop_rule, ".emoji-btn.btn-popping rule not found")
+        self.assertRegex(pop_rule, r"animation:[^;]*\bforwards\b",
+                         "the button pop needs fill-mode:forwards for the same reason")
+        # A filled animation outranks every normal author declaration, so a 100%
+        # frame that restates `transform: scale(1)` would win over `.emoji-btn:hover`
+        # and `:active` for the rest of the page's life — the buttons would lose
+        # their hover lift and press feedback after the viewer's first reaction.
+        # Measured in Chrome: computed transform stayed matrix(1,0,0,1,0,0) on
+        # every reaction afterwards. The 100% frame must therefore declare no
+        # transform at all, letting the cascade decide the resting state.
+        keyframes = re.search(r"@keyframes\s+emoji-btn-pop\s*\{(.*?)\n\}", css, re.DOTALL)
+        self.assertIsNotNone(keyframes, "the emoji-btn-pop keyframes were not found")
+        final = re.search(r"100%\s*\{([^}]*)\}", keyframes.group(1))
+        self.assertIsNotNone(final, "the pop keyframes have no 100% frame")
+        self.assertNotIn("transform", final.group(1),
+                         "the 100% frame must not declare a transform: a filled "
+                         "animation outranks :hover/:active and would pin the "
+                         "button to its resting transform permanently")
+        # No removal timer should be left behind for the bump.
+        self.assertNotIn("classList.remove('count-bump')", code,
+                         "the bump ends at its natural state, so it needs no timer")
 
 
 if __name__ == "__main__":
