@@ -1,5 +1,9 @@
 # Rydius Stream: laptop host
 
+![Rydius Stream viewer page at stream.rydius.in](screenshots/viewer-live.png)
+
+*A viewer watching a live stream at `https://stream.rydius.in` — WebRTC playback, the live-chat sidebar, quick reactions, and per-client stream stats.*
+
 This setup runs OBS and MediaMTX on the same Windows laptop. The page and WebRTC signaling are served locally and published at **https://stream.rydius.in** through a Cloudflare Tunnel, so viewers just open a link — no Tailscale install, no account. Video for viewers that cannot reach the laptop directly relays through Cloudflare TURN. OBS video enters through loopback, so it does not use the hotspot upload until viewers connect. Tailscale Serve remains as a verified fallback.
 
 ## One-time setup
