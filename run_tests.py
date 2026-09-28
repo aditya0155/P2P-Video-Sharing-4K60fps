@@ -1555,6 +1555,15 @@ class ReceiverLagFixChecks(unittest.TestCase):
     def test_hidden_tab_return_recovers_playout_delay(self):
         run_js_check(self, "catch-up-arms-on-visibility-return")
 
+    def test_live_edge_catch_up_rate_law(self):
+        run_js_check(self, "catchup-rate-drains-without-a-teardown")
+
+    def test_seam_switch_actually_lands(self):
+        run_js_check(self, "seam-switch-actually-lands")
+
+    def test_catchup_guard_ignores_a_healthy_refilling_buffer(self):
+        run_js_check(self, "catchup-self-verification-ignores-a-refilling-buffer")
+
     def test_receiver_anti_drop_hardening_is_present(self):
         # Latency is explicitly traded for smoothness in this project: the
         # playout floor grows with measured jitter (late frames left
@@ -1878,9 +1887,18 @@ class StreamingHardeningChecks(unittest.TestCase):
             "const {compileFunction,quietConsole}=require('./js_checks.js');"
             "const NOW=100000;"
             "const sb={performance:{now:()=>NOW},beginStatsLoop(){},hudRoute:{innerText:'x'},"
-            "console:quietConsole(),lastRenditionSwitchAt:NOW};"
+            "console:quietConsole(),lastRenditionSwitchAt:NOW,"
+            # startTelemetry resets the live-edge catch-up rate. playbackRate is a
+            # property of the media ELEMENT, not of the peer connection, so it
+            # survives every teardown; a new session must start at 1.0x. Stubbed
+            # here to prove the call is actually reachable from a real session.
+            "player:{playbackRate:1.06},resetLiveEdgeCatchUp:()=>{"
+            "  if(sb.player.playbackRate!==1.06){throw new Error('unexpected rate');}"
+            "  sb.player.playbackRate=1;}};"
             "const {fn,sandbox}=compileFunction('startTelemetry',sb);"
             "fn();"
+            "if(sandbox.player.playbackRate!==1){"
+            "throw new Error('a new session inherited a stale playbackRate of '+sandbox.player.playbackRate);}"
             "if(sandbox.lastRenditionSwitchAt!==NOW){"
             "throw new Error('startTelemetry reset the ABR cooldown anchor to '+sandbox.lastRenditionSwitchAt);}"
             "if(!(NOW-sandbox.lastRenditionSwitchAt<=60000)){"
@@ -2887,6 +2905,184 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertIn("switchSeamTimer", body, "teardown must cancel the seam safety net")
         self.assertIn("switchSeamPending = false", body,
                       "teardown must clear the pending flag so a later session is not hijacked")
+
+    def test_seam_is_armed_after_the_teardown_that_clears_it(self):
+        """The regression this pins is subtler than the one above, and the test
+        above could not see it.
+
+        `switchRendition` armed the seam and THEN called
+        `cleanupConnection(true)`. But cleanupConnection owns the seam's
+        lifetime — it cancels the safety net and clears the flag on every
+        teardown path (it must: Stage 2 and every graceful ICE teardown go
+        through it) — so that call destroyed the flag one statement after it
+        was set, and the seam stayed dead.
+
+        The text scan in test_seam_pending_is_actually_left_set passed
+        throughout, because the clearing statement lives in a DIFFERENT
+        function. Only the ORDER of the two calls proves anything, so that is
+        what is asserted here."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "switchRendition")
+        self.assertIsNotNone(body, "switchRendition not found")
+        arm = body.find("switchSeamPending = true;")
+        teardown = body.find("cleanupConnection(true)")
+        self.assertGreater(arm, 0, "the seam is never armed")
+        self.assertGreater(teardown, 0, "switchRendition must still tear the old session down")
+        self.assertLess(teardown, arm,
+                        "cleanupConnection clears switchSeamPending, so the seam must be "
+                        "armed AFTER it or the seam is dead code again")
+
+    def test_seam_safety_net_can_actually_reconnect(self):
+        """The 12s seam safety net could not recover, which turned it into the
+        thing it was written to prevent.
+
+        On a healthy switch it fired anyway (its only success-path cancel lives
+        inside the unreachable seam branch). When it did fire it blanked the
+        element and called cleanupConnection(), but cleanupConnection only
+        releases resources — it never clears isConnected/isConnecting, and
+        handleConnected() had set isConnected = true for the replacement
+        session. connectStream() therefore hit its own duplicate guard and
+        returned without doing anything.
+
+        The resulting state was `player.srcObject === null`,
+        `peerConnection === null`, `isConnected === true` — and every recovery
+        path is gated off by exactly that combination: the freeze watchdog needs
+        a peerConnection AND an unpaused element, the stats loop needs a
+        connected peerConnection, rVFC needs frames, and the status poll skips
+        while isConnected. The viewer was left with a permanent black screen
+        that only a manual reload could clear.
+
+        The fix is to clear the flags before reconnecting, so the net
+        genuinely reconnects instead of winding the session down."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "switchRendition")
+        self.assertIsNotNone(body, "switchRendition not found")
+        net = body.find("switchSeamTimer = setTimeout(")
+        self.assertGreater(net, 0, "the seam safety net is not armed")
+        window = body[net:net + 900]
+        self.assertIn("connectStream()", window, "the net must attempt a reconnect")
+        clear_connected = window.find("isConnected = false;")
+        clear_connecting = window.find("isConnecting = false;")
+        self.assertGreater(clear_connected, 0,
+                           "the net must clear isConnected before reconnecting, or "
+                           "connectStream() no-ops and leaves a permanent black screen")
+        self.assertGreater(clear_connecting, 0,
+                           "the net must clear isConnecting before reconnecting")
+        self.assertLess(clear_connected, window.find("connectStream()"),
+                        "the flags must be cleared BEFORE connectStream(), not after")
+        self.assertLess(clear_connecting, window.find("connectStream()"),
+                        "the flags must be cleared BEFORE connectStream(), not after")
+
+    def test_seam_safety_net_is_cancelled_on_every_teardown_path(self):
+        """The net's cancel used to sit INSIDE the `if (keepPicture)`
+        early-return, so a full teardown (Stage 3 of freeze recovery,
+        handleDisconnected) left the orphan armed. The page painted offline and
+        then, 12 seconds later, the orphan fired and reconnected the stream on
+        its own — the page flipping offline -> connecting -> live by itself,
+        which is precisely what that early return was written to prevent.
+
+        Both statements must therefore sit BEFORE the keepPicture branch."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "cleanupConnection")
+        self.assertIsNotNone(body, "cleanupConnection not found")
+        self.assertIn("switchSeamTimer", body, "teardown must cancel the seam safety net")
+        self.assertIn("switchSeamPending = false", body,
+                      "teardown must clear the pending flag so a later session is not hijacked")
+        branch = body.find("if (keepPicture)")
+        self.assertGreater(branch, 0, "the keepPicture early-return is gone")
+        timer = body.find("clearTimeout(switchSeamTimer)")
+        flag = body.find("switchSeamPending = false")
+        self.assertLess(timer, branch,
+                        "the safety-net cancel must run on the full-teardown path too, "
+                        "not only inside the keepPicture early-return")
+        self.assertLess(flag, branch,
+                        "the pending flag must be cleared on the full-teardown path too")
+
+    def test_live_edge_catch_up_replaces_the_black_screen_rejoin(self):
+        """Drift was answered with exactly one thing: tear the WHEP session
+        down and rebuild it. That costs a 2-4s HARD BLACK SCREEN plus a full
+        ICE + WHEP renegotiation to recover what is purely accumulated
+        latency — and the dominant source of it is an ordinary Alt-Tab, which
+        the project's own measurements put at 1.7-2.8s of delay.
+
+        Every production low-latency player instead speeds the media element up
+        to drain the jitter buffer and returns to 1.0x, which costs no black
+        frame and no renegotiation. The player had no playbackRate control at
+        all (its own comment at the latency-mode table described a "stepwise
+        catch-up" that did not exist), so this is the single highest-value
+        addition available on the receiver side."""
+        app = read_text(APP_PATH)
+        self.assertIn("function catchUpPlaybackRate(", app, "catch-up rate law missing")
+        self.assertIn("function updateLiveEdgeCatchUp()", app, "catch-up controller missing")
+        self.assertIn("player.playbackRate = wanted;", app,
+                      "the controller must actually drive playbackRate")
+        body = self._js_function_body(self._strip_comments(app, "js"), "superviseAdaptiveBuffer")
+        self.assertIn("updateLiveEdgeCatchUp()", body,
+                      "the stats supervisor must drive live-edge catch-up")
+        # It must run BEFORE the teardown branch, otherwise the rejoin fires on
+        # the very first drifted tick and catch-up never gets a chance to help.
+        catch_up = body.find("updateLiveEdgeCatchUp()")
+        rejoin = body.find("rejoinCapMs")
+        self.assertGreater(catch_up, 0, "catch-up must be invoked by the supervisor")
+        self.assertLess(catch_up, rejoin,
+                        "catch-up must be attempted BEFORE the hard-rejoin branch")
+        # The hard path must still exist as an escalation.
+        self.assertIn("switchRendition(activeStreamPath", body,
+                      "the hard rejoin must remain as the escalation when catch-up stalls")
+
+    def test_live_edge_catch_up_is_bounded_and_self_verifying(self):
+        """Two failure modes make catch-up worse than not having it, and both
+        are guarded:
+
+        1. An unbounded rate. `playbackRate` is not a nudge, it is a direct
+           multiplier, so a formula that scales with the raw delay turns a 5s
+           drift into a fast-forward. It is capped.
+        2. A mechanism that does not work. Some engines accept the write and
+           ignore it; a link too congested for 8% to matter looks identical.
+           Either way the viewer would sit at a permanently elevated rate with
+           the real problem untreated, so the controller PROVES the drain and
+           disables itself if the delay does not fall."""
+        app = read_text(APP_PATH)
+        self.assertIn("const CATCHUP_MAX_RATE = 1.08;", app,
+                      "the catch-up rate must be capped, and the cap is shared with "
+                      "the self-verification so the two cannot diverge")
+        self.assertIn("catchUpProvenUseless", app,
+                      "a catch-up that fails to drain must disable itself")
+        body = self._js_function_body(self._strip_comments(app, "js"), "updateLiveEdgeCatchUp")
+        self.assertIn("catchUpProvenUseless = true", body,
+                      "self-verification must exist inside the controller")
+        self.assertIn("catchUpProbeDelayMs", body,
+                      "the controller must remember the delay it started from")
+        # The proof needs a real window and a real comparison, not a flag flip.
+        self.assertIn("catchUpProbeAt > 5000", body,
+                      "self-verification needs a settling window before judging the drain")
+        # ...and it must only judge a SATURATED rate. Judged at any rate above
+        # 1.0, the early seconds of the 1%-per-tick ramp are judged on a delay
+        # that is still falling, and a healthy refilling buffer gets the
+        # working mechanism permanently disabled.
+        self.assertIn("catchUpRate >= CATCHUP_MAX_RATE", body,
+                      "the drain may only be judged once the rate is saturated; judging a "
+                      "slow ramp disables catch-up on healthy links")
+        sup = self._js_function_body(self._strip_comments(app, "js"), "superviseAdaptiveBuffer")
+        self.assertIn("catchUpProvenUseless", sup,
+                      "the supervisor must honour a proven-useless verdict")
+        self.assertIn("catchingUp", sup, "the supervisor must know catch-up is engaged")
+
+    def test_catch_up_rate_is_reset_for_every_new_session(self):
+        """`playbackRate` is a property of the media ELEMENT, not of the peer
+        connection, so it survives every teardown in this file. A session that
+        ended while catching up would otherwise hand the next session an
+        inherited fast rate the viewer cannot explain or undo. It must be reset
+        when a new session starts, and when the tab is backgrounded (where
+        presentation is suspended and there is nothing to drain)."""
+        app = read_text(APP_PATH)
+        self.assertIn("function resetLiveEdgeCatchUp()", app, "the reset helper is missing")
+        self.assertIn("player.playbackRate = 1;", app, "the reset must restore 1.0x")
+        self.assertGreaterEqual(app.count("resetLiveEdgeCatchUp();"), 2,
+                                "a new session and the tab-hide path must both reset the rate")
+        body = self._js_function_body(self._strip_comments(app, "js"), "startTelemetry")
+        self.assertIn("resetLiveEdgeCatchUp()", body,
+                      "every new session must start at 1.0x")
 
     def test_gop_env_is_bounded(self):
         """`BRIDGE_GOP` was passed to ffmpeg with only a /^\\d+$/ test, so '0'

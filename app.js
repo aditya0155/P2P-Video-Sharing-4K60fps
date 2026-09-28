@@ -221,6 +221,17 @@ document.addEventListener('DOMContentLoaded', () => {
     let renditionWaitWarned = false;    // AV1-only viewer notice dedupe per broadcast
     let accommodationTargetMs = 0;      // Buffer target raised to meet the measured delay
     let accommodationCalmTicks = 0;     // Consecutive drop-free stats ticks (gates the decay)
+    // Live-edge catch-up state (see catchUpPlaybackRate / updateLiveEdgeCatchUp).
+    let catchUpRate = 1;                // Last playbackRate this controller wrote
+    let catchUpProbeAt = 0;             // performance.now() when the current catch-up engagement began
+    let catchUpProbeDelayMs = null;     // Measured playout delay at that moment
+    let catchUpProvenUseless = false;   // playbackRate did not drain the buffer on this device
+    // The catch-up ceiling, shared by the rate law and the self-verification
+    // below. The law takes it as a defaulted argument rather than reading this
+    // binding directly, because js_checks.js extracts that function on its own;
+    // `js_checks.js catchup-rate-drains-without-a-teardown` asserts the two
+    // copies of the number are identical, so they cannot drift apart silently.
+    const CATCHUP_MAX_RATE = 1.08;
     let jitterFloorEmaMs = 0;           // Network-jitter-proportional playout floor (see jitterBufferFloorMs)
     let abrBadSec = 0;                  // Consecutive seconds of measured network stress (rendition switching)
     let abrCalmSec = 0;                 // Consecutive calm seconds (rendition upgrade)
@@ -725,6 +736,59 @@ document.addEventListener('DOMContentLoaded', () => {
         return prevMs;
     }
 
+    // Live-edge catch-up rate (pure — unit-tested in js_checks.js). THE most
+    // effective anti-stutter move available to a receiver, and the one this
+    // player did not have: when playout has drifted behind the live edge, play
+    // the media element slightly FAST so the jitter buffer drains itself, then
+    // ramp back to 1.0x. Every production low-latency player does this
+    // (Twitch / YouTube Live / Meet), because the alternative — the only one
+    // this file shipped — is to tear the whole WHEP session down and rebuild it
+    // to get back to the live edge, which costs a 2-4s hard black screen for a
+    // problem that is purely about accumulated latency.
+    //
+    // A 1.08x rate drains ~80ms of buffer per second, so a 1s drift is gone in
+    // ~12s with no black frame and no renegotiation, versus an immediate
+    // 2-4s blackout. At <=1.08x with the element's default pitch preservation
+    // the speed-up is not perceptible; above ~1.15 it is.
+    //
+    // A step change to playbackRate is audible as a click in the audio, and a
+    // rate derived from raw per-tick measurements would produce a step every
+    // tick on a noisy link. The constants live INSIDE the function on purpose:
+    // js_checks.js extracts and evaluates this function on its own, so a module
+    // level binding would make the whole mechanism untestable.
+    function catchUpPlaybackRate(delayMs, baseTargetMs, currentRate = 1, maxRate = 1.08) {
+        const MAX_RATE = maxRate;     // above ~1.15 the speed-up becomes visible
+        const DEAD_BAND_MS = 120;   // settle point: base + this is "caught up"
+        const STEP = 0.01;          // quantum: 1% per tick in either direction
+        const MIN_EXCESS_RATE = 0.05;
+        if (delayMs === null || !Number.isFinite(delayMs) || delayMs < 0) return 1;
+        const base = Number.isFinite(baseTargetMs) ? Math.max(0, baseTargetMs) : 0;
+        const excess = delayMs - base;
+        const prev = Number.isFinite(currentRate) ? Math.max(1, currentRate) : 1;
+        // Inside the dead band: ramp DOWN to 1.0. Returning straight to 1.0
+        // would be an audible jolt, and 1.0 is the resting state.
+        if (excess <= DEAD_BAND_MS) {
+            return prev <= 1 ? 1
+                : Math.max(1, Math.round((prev - STEP) * 100) / 100);
+        }
+        // 1% of extra rate per 40ms of excess beyond the dead band, CLAMPED TO A
+        // FLOOR of 5%. The floor is not cosmetic: a pure proportional law tends
+        // to zero as the delay approaches the band, so the last stretch drains
+        // at a few ms per second and the session creeps toward the target
+        // without ever arriving. Simulated against this exact function, a
+        // floorless curve sat at 1.01x from 330ms down to 180ms — 20ms/s, a
+        // 15-second crawl to close 150ms, and formally never converging at all
+        // because the next tick's excess is smaller again. 5% drains the dead
+        // band in ~2.4s and always terminates.
+        const wanted = 1 + Math.max(MIN_EXCESS_RATE, (excess - DEAD_BAND_MS) / 4000);
+        const clamped = Math.min(MAX_RATE, Math.max(1, wanted));
+        const quantized = Math.round(clamped / STEP) * STEP;
+        // Rise is bounded by the same step, so one noisy reading cannot slam
+        // the rate from 1.00 to 1.08 in a single tick.
+        const stepped = Math.min(quantized, prev + STEP);
+        return Math.max(1, Math.round(stepped * 100) / 100);
+    }
+
     // Decode-pressure state machine (pure — unit-tested). Each stats tick
     // compares decoded frames against received frames: a decoder falling
     // below 70% of the arrival rate accumulates lag seconds, a decoder above
@@ -873,6 +937,101 @@ document.addEventListener('DOMContentLoaded', () => {
             ` loss=${lastLossPct === null ? '--' : lastLossPct.toFixed(1)}%` +
             ` playout=${avgPlayoutDelayMs === null ? '--' : avgPlayoutDelayMs.toFixed(0)}ms)`);
         return true;
+    }
+
+    // Drive the media element's playbackRate to drain accumulated playout delay
+    // instead of tearing the session down. Called once per stats tick from
+    // superviseAdaptiveBuffer(), and it is deliberately the FIRST drift
+    // response: the drift supervisor below still escalates to a real rejoin,
+    // but only once catch-up has failed, so the 2-4s black screen becomes the
+    // last resort instead of the only option.
+    //
+    // Returns true while catch-up is actively engaged, so the caller can hold
+    // off on the teardown.
+    function updateLiveEdgeCatchUp() {
+        // Honour the same exclusions as the rest of the supervisor: a hidden
+        // tab suspends presentation (the measurement is meaningless and the
+        // rate would drain a buffer nobody is watching), and a paused viewer is
+        // not drifting.
+        if (!isConnected || document.hidden || player.paused) return false;
+        // A measuring/null reading must not move the rate. Rewriting
+        // playbackRate resets the media pipeline's audio/video sync state, so
+        // a controller that churns it is worse than one that does nothing.
+        if (avgPlayoutDelayMs === null || !Number.isFinite(avgPlayoutDelayMs)) return false;
+        // Only a FRESH reading. avgPlayoutDelayMs latches through a quiet
+        // window (see the drift supervisor), so acting on a stale value would
+        // speed the stream up on the strength of a measurement from a minute
+        // ago.
+        if (performance.now() - avgPlayoutDelayAt > 3000) return false;
+
+        const wanted = catchUpPlaybackRate(avgPlayoutDelayMs, baseBufferTargetMs(), catchUpRate, CATCHUP_MAX_RATE);
+        if (wanted !== catchUpRate) {
+            try {
+                player.playbackRate = wanted;
+            } catch (err) {
+                // Some engines refuse playbackRate on a MediaStream-backed
+                // element. Give up permanently rather than retrying every tick.
+                console.warn('[AdaptiveBuffer] playbackRate rejected; catch-up disabled:', err);
+                catchUpProvenUseless = true;
+                return false;
+            }
+            catchUpRate = wanted;
+        }
+
+        // SELF-VERIFICATION. Do not trust the rate blindly: prove it actually
+        // drains the buffer. If the delay is still not falling once the rate is
+        // SATURATED and has been for a while, the mechanism is not working here
+        // (an engine that accepts the write and ignores it, or a link so
+        // congested that 8% makes no difference) and continuing would leave the
+        // viewer watching a permanently sped-up stream while the real problem
+        // went untreated.
+        //
+        // The saturation precondition is what makes this safe. A first version
+        // judged the drain at ANY rate and latched "useless" after 5s of a
+        // delay that had merely stopped falling — and on a HEALTHY link a
+        // jitter buffer that is refilling (arrivals momentarily above
+        // consumption) does exactly that. Simulated against the real law: from
+        // 400ms creeping to 472ms over 6 ticks at 1.05x, it declared a
+        // perfectly working mechanism useless and disabled it for the session.
+        // The rate can only reach the cap if the controller wanted it there, so
+        // "saturated and still not draining" is evidence about the MECHANISM
+        // rather than about a transient.
+        const now = performance.now();
+        if (catchUpRate >= CATCHUP_MAX_RATE) {
+            if (!catchUpProbeAt) {
+                catchUpProbeAt = now;
+                catchUpProbeDelayMs = avgPlayoutDelayMs;
+            } else if (now - catchUpProbeAt > 5000
+                && avgPlayoutDelayMs > catchUpProbeDelayMs - 50) {
+                catchUpProvenUseless = true;
+                console.warn(`[AdaptiveBuffer] Catch-up saturated at ${catchUpRate}x and did not `
+                    + `drain the buffer (${catchUpProbeDelayMs.toFixed(0)}ms -> `
+                    + `${avgPlayoutDelayMs.toFixed(0)}ms); falling back to a hard rejoin.`);
+            }
+        } else {
+            // Not saturated: the controller has not asked for everything it can
+            // get, so the drain is still in progress and there is nothing to
+            // judge. Clearing the probe restarts the window whenever the rate
+            // later saturates, so a long slow ramp cannot be judged on a stale
+            // baseline taken minutes ago.
+            catchUpProbeAt = 0;
+            catchUpProbeDelayMs = null;
+        }
+        return catchUpRate > 1;
+    }
+
+    // Return playbackRate to its resting value. A session that ends while
+    // catching up would otherwise leave the NEXT session running fast, and the
+    // viewer would be watching a subtly sped-up stream with no way to tell why.
+    function resetLiveEdgeCatchUp() {
+        catchUpRate = 1;
+        catchUpProbeAt = 0;
+        catchUpProbeDelayMs = null;
+        catchUpProvenUseless = false;
+        if (!player) return;
+        if (player.playbackRate !== 1) {
+            try { player.playbackRate = 1; } catch (e) { /* engine refused it anyway */ }
+        }
     }
 
     // Called once per stats tick (1s) while connected. Two jobs:
@@ -1031,6 +1190,18 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
+        // --- Live-edge catch-up: drain the drift in place, no teardown ---
+        // Must run BEFORE the rejoin check below. Previously drift was answered
+        // with exactly one thing — tear the WHEP session down and rebuild it —
+        // so a viewer who fell 1-2s behind (an Alt-Tab, a bursty minute on a
+        // hotspot) paid a 2-4s HARD BLACK SCREEN plus a full ICE + WHEP
+        // renegotiation to recover a problem that is purely about accumulated
+        // latency. Speeding the element up to 1.08x drains ~80ms of buffer per
+        // second with no black frame, no renegotiation and no server load.
+        // The rejoin below is retained as the escalation when this cannot keep
+        // up, so the hard path still exists.
+        const catchingUp = !catchUpProvenUseless && updateLiveEdgeCatchUp();
+
         // --- Drift beyond the accommodation cap -> clean reconnect ---
         // The buffer target accommodates the measured delay (see
         // bufferAccommodationMs), so a delay that STILL outgrows the cap
@@ -1058,9 +1229,24 @@ document.addEventListener('DOMContentLoaded', () => {
             && now - avgPlayoutDelayAt < 3000;
         if (driftReadingIsFresh && avgPlayoutDelayMs > rejoinCapMs
             && !isConnecting && now - lastRenditionSwitchAt > 60000) {
-            rejoinDriftSec += 1;
-            if (rejoinDriftSec >= 3) {
+            // Catch-up gets first refusal. Escalating to a teardown while the
+            // element is still draining would reintroduce exactly the black
+            // screen catch-up exists to avoid, and it is strictly worse: the
+            // teardown costs 2-4s to buy a reset the running session will
+            // produce on its own within a few seconds. Only escalate once the
+            // drain has stalled (catchUpProvenUseless), which is the genuine
+            // "session is broken" case this branch was written for.
+            if (!catchingUp) {
+                rejoinDriftSec += 1;
+            } else {
                 rejoinDriftSec = 0;
+            }
+            if (!catchingUp && rejoinDriftSec >= 3) {
+                rejoinDriftSec = 0;
+                // A session that failed to drain is very likely running at an
+                // elevated rate. Reset it BEFORE the teardown so the new
+                // session does not inherit the old one's playbackRate.
+                resetLiveEdgeCatchUp();
                 switchRendition(activeStreamPath,
                     'Playback fell too far behind the live edge — rejoining at the live edge…');
                 return;
@@ -1966,25 +2152,26 @@ document.addEventListener('DOMContentLoaded', () => {
             clearInterval(renditionPollInterval);
             renditionPollInterval = null;
         }
+        // This belongs to the SESSION, not to the keepPicture choice, so it is
+        // cancelled on EVERY teardown path. It used to sit inside the
+        // `if (keepPicture)` early-return below, which meant a full teardown
+        // (Stage 3 of freeze recovery, handleDisconnected) left the net armed:
+        // the page painted offline, and then 12s later the orphan fired and
+        // reconnected the stream on its own — the page flipping
+        // offline -> connecting -> live by itself, exactly what that early
+        // return was written to prevent. It also has to clear the pending flag,
+        // or the NEXT session's first ontrack would take the seam branch on a
+        // teardown that never asked for a switch.
+        if (switchSeamTimer) {
+            clearTimeout(switchSeamTimer);
+            switchSeamTimer = null;
+        }
+        switchSeamPending = false;
         if (keepPicture) {
-            // Leave the element alone. `clearSeamWatchdog()` in switchRendition
-            // guarantees the stale stream cannot survive if the replacement
-            // handshake never produces a track.
-            //
-            // The seam's own 12s safety net IS cancelled, though. It was the
-            // only timer cleanupConnection did not know about, so an ICE failure
-            // or grace expiry landing inside the 12s window after a switch tore
-            // everything down, painted offline, and then — 12 seconds later —
-            // had the orphan fire and reconnect on its own, flipping the page
-            // offline -> connecting -> live by itself. It also has to clear the
-            // pending flag, or the NEXT session's first ontrack would take the
-            // seam branch and swap in a stream on a teardown that never asked
-            // for a switch.
-            if (switchSeamTimer) {
-                clearTimeout(switchSeamTimer);
-                switchSeamTimer = null;
-            }
-            switchSeamPending = false;
+            // Leave the element alone. The seam's own 12s safety net (armed by
+            // switchRendition right after this call returns) forces a real
+            // reconnect if the replacement handshake never produces a track,
+            // so the stale stream cannot survive a failed switch.
             return;
         }
         player.pause();
@@ -2069,22 +2256,23 @@ document.addEventListener('DOMContentLoaded', () => {
         // indefinitely. 12s is far beyond the 10s WHEP cap, so this only fires
         // on a genuine failure, and it fails LOUDLY to a real reconnect.
         if (switchSeamTimer) clearTimeout(switchSeamTimer);
-        // `switchSeamPending` stays TRUE here. It used to be cleared two lines
-        // below this comment, in the same synchronous block — and the first
-        // `await` is ~100 lines further down, so no ontrack could ever fire in
-        // between and the whole seam was provably unreachable. Every rendition
-        // switch therefore fell through to the generic "append to the old
-        // stream" branch, which is precisely what the seam exists to prevent:
-        // cleanupConnection(true) deliberately leaves the previous (now ended)
-        // stream on screen so the picture is not lost mid-switch, and a video
-        // element renders its FIRST video track. It happened to work only
-        // because Chrome's selectVideoTracks skips ended tracks. It is also why
-        // the audio-drop fix in ontrack had no effect — that code lives inside
-        // the seam.
         switchSeamTimer = setTimeout(() => {
             switchSeamTimer = null;
             console.warn("[ABR] Replacement rendition produced no track in 12s; forcing a hard reconnect.");
             if (player.srcObject) { player.pause(); player.srcObject = null; }
+            // The connection flags MUST be cleared here. cleanupConnection only
+            // releases resources; it never touches isConnected/isConnecting, and
+            // handleConnected() set isConnected = true for the replacement
+            // session. Leaving them set made the connectStream() below hit its
+            // own duplicate guard and return without doing anything, so the net
+            // did the exact opposite of recovering: it blanked the element,
+            // nulled the peer connection, and left the page with no session, no
+            // watchdog (its tick needs peerConnection AND !player.paused) and no
+            // poll (which skips while isConnected) — a permanent black screen
+            // that only a manual reload could clear. Clearing the flags first is
+            // what makes this a reconnect instead of a self-wound-down session.
+            isConnected = false;
+            isConnecting = false;
             cleanupConnection();
             viewerPausedByChoice = false;
             connectStream();
@@ -2126,10 +2314,28 @@ document.addEventListener('DOMContentLoaded', () => {
                     lastJitterDelayTotal,
                     lastJitterEmittedTotal
                 );
-                if (hiddenSpanDelayMs !== null) avgPlayoutDelayMs = hiddenSpanDelayMs;
+                if (hiddenSpanDelayMs !== null) {
+                    avgPlayoutDelayMs = hiddenSpanDelayMs;
+                    // Stamped so updateLiveEdgeCatchUp() accepts it as a FRESH
+                    // reading. It normally rides along on the next stats tick,
+                    // but the catch-up decision is made here and immediately
+                    // after this function returns, so without the stamp the one
+                    // measurement that matters most — the hidden span itself —
+                    // would be rejected as stale and the drift would go
+                    // untreated until the loop caught up.
+                    avgPlayoutDelayAt = performance.now();
+                }
             }
             const config = LATENCY_MODES[currentLatencyMode] || LATENCY_MODES.balanced;
             const capMs = Math.max(config.driftLimitMs + 1600, 3100);
+            // A hidden tab is THE dominant source of drift on this project:
+            // Chrome suspends presentation, packets keep arriving, and the
+            // project's own live numbers put a normal Alt-Tab at 1.7-2.8s of
+            // accumulated delay. This is precisely the case live-edge catch-up
+            // exists for — the session is perfectly healthy, it is just behind,
+            // and tearing it down to fix that costs a 2-4s black screen. Start
+            // draining immediately; the running stats loop continues it.
+            if (!catchUpProvenUseless) updateLiveEdgeCatchUp();
             // PERSISTENCE, exactly as the periodic supervisor requires. A single
             // windowed reading is not enough to justify tearing a working session
             // down: this measurement covers the whole hidden span, and the
@@ -2187,6 +2393,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 renditionPollInterval = null;
             }
             stopAudioMeter();
+            // A hidden tab suspends presentation, so there is nothing to drain
+            // and no measurement to drain it from. Leaving an elevated rate on
+            // the element means the viewer's return begins at 1.0x of stale
+            // intent with the probe state describing a measurement taken before
+            // the hide — which is how the self-verification ends up declaring a
+            // working mechanism useless.
+            resetLiveEdgeCatchUp();
         } else {
             console.log("[App] Tab foregrounded. Resuming polling/telemetry...");
             lastFrameTime = performance.now();
@@ -2635,6 +2848,12 @@ document.addEventListener('DOMContentLoaded', () => {
         bufferNoticeState = '';
         accommodationTargetMs = 0;
         accommodationCalmTicks = 0;
+        // A new session must start at 1.0x. playbackRate is a property of the
+        // media ELEMENT, not of the peer connection, so it survives every
+        // teardown in this file: without this reset a viewer whose previous
+        // session ended while catching up would start the next one running fast
+        // and see no reason why.
+        resetLiveEdgeCatchUp();
         // noMediaRejoinCount is deliberately NOT reset here. It used to be, and
         // that made the "connected-but-black" budget unreachable: the limiter
         // calls switchRendition(), which reconnects through this very function,

@@ -1080,6 +1080,13 @@ Object.assign(cases, {
                 performance: { now: () => 1000 },
                 RTCRtpReceiver: { getCapabilities: () => ({ codecs: [] }) },
                 console: quietConsole(),
+                // Live-edge catch-up runs before the drift branch, so the
+                // supervisor's sandbox has to model it. Stubbed (not real) so
+                // these cases keep testing the supervisor's own state machine;
+                // the catch-up law itself is covered separately.
+                catchUpProvenUseless: true,
+                updateLiveEdgeCatchUp() { return false; },
+                resetLiveEdgeCatchUp() { sandbox.catchUpReset = (sandbox.catchUpReset || 0) + 1; },
                 reapplyBufferTargets() { sandbox.reapplied = (sandbox.reapplied || 0) + 1; return true; },
                 updateBufferHud(state) { sandbox.hudStates = (sandbox.hudStates || []).concat(state || []); },
                 addSystemMessage(text) { sandbox.messages = (sandbox.messages || []).concat(text); },
@@ -1188,6 +1195,11 @@ Object.assign(cases, {
                 updateBufferHud() {},
                 addSystemMessage(text) { sandbox.messages = (sandbox.messages || []).concat(text); },
                 switchRendition(path) { sandbox.switchedTo = path; },
+                // Live-edge catch-up runs before the drift branch; stubbed so
+                // this case keeps testing the ABR ladder's own state machine.
+                catchUpProvenUseless: true,
+                updateLiveEdgeCatchUp() { return false; },
+                resetLiveEdgeCatchUp() {},
                 ...overrides
             };
             const { fn } = compileFunction('superviseAdaptiveBuffer', sandbox);
@@ -1295,6 +1307,12 @@ Object.assign(cases, {
                 console: quietConsole(),
                 windowedPlayoutDelayMs: windowed,
                 switchRendition(path, message) { sandbox.switchedTo = path; },
+                // Live-edge catch-up now runs on this path too. It is stubbed
+                // here so the rejoin escalation can be exercised explicitly:
+                // the real controller is covered by
+                // 'catchup-rate-drains-without-a-teardown'.
+                catchUpProvenUseless: false,
+                updateLiveEdgeCatchUp() { sandbox.catchUpCalled = (sandbox.catchUpCalled || 0) + 1; },
                 ...overrides
             };
             const { fn } = compileFunction('maybeRejoinOnReturn', sandbox);
@@ -1319,6 +1337,26 @@ Object.assign(cases, {
             await drifted.run();
             assertEqual(drifted.sandbox.switchedTo, 'live',
                 'a persistently past-cap hidden-span delay must rejoin at the live edge');
+            // Live-edge catch-up gets first refusal on the visibility return: a
+            // hidden tab is the dominant source of drift on this project (the
+            // project's own numbers put a normal Alt-Tab at 1.7-2.8s), the
+            // session is perfectly healthy, and the alternative is a 2-4s hard
+            // black screen to fix a problem that is purely accumulated latency.
+            assert(drifted.sandbox.catchUpCalled >= 3,
+                'the visibility return must attempt live-edge catch-up');
+            // But the hard rejoin must remain reachable as the escalation for
+            // when catch-up genuinely cannot drain the buffer.
+            const stalled = make({
+                delayTotal: 135, emittedTotal: 75,
+                overrides: { catchUpProvenUseless: true }
+            });
+            await stalled.run();
+            await stalled.run();
+            await stalled.run();
+            assertEqual(stalled.sandbox.switchedTo, 'live',
+                'a session whose catch-up cannot drain must still escalate to a rejoin');
+            assertEqual(stalled.sandbox.catchUpCalled, undefined,
+                'a proven-useless catch-up must not be retried');
 
             // The counter resets as soon as a reading is back inside the cap, so
             // intermittent noise can never accumulate into a teardown.
@@ -1472,6 +1510,11 @@ Object.assign(cases, {
                 updateBufferHud() {},
                 addSystemMessage(text) { sandbox.messages = (sandbox.messages || []).concat(text); },
                 switchRendition(path) { sandbox.switchedTo = path; },
+                // Live-edge catch-up runs before the drift branch; stubbed so
+                // this case keeps testing the decode-pressure state machine.
+                catchUpProvenUseless: true,
+                updateLiveEdgeCatchUp() { return false; },
+                resetLiveEdgeCatchUp() {},
                 ...overrides
             };
             const { fn } = compileFunction('superviseAdaptiveBuffer', sandbox);
@@ -1748,6 +1791,275 @@ Object.assign(cases, {
         assert(timerValue, 'switchRendition must arm the 12s seam safety net');
         assert(!timerValue.__cleared,
             'the seam safety net was cleared without the seam ever closing');
+    },
+});
+
+/* --------------------------------------------------------------------------
+   Live-edge catch-up (playbackRate)
+   -------------------------------------------------------------------------- */
+
+Object.assign(cases, {
+    // catchUpPlaybackRate is the whole anti-drift mechanism, and it is the one
+    // piece of the drift response that is purely arithmetic — so it is tested
+    // against a real drain simulation, not just spot values.
+    'catchup-rate-drains-without-a-teardown'() {
+        const catchUpPlaybackRate = compileFunction('catchUpPlaybackRate', {}).fn;
+
+        // At or below the target the rate must REST at 1.0. Writing 1.0 over
+        // and over is harmless, but a rate that never returns to 1.0 leaves the
+        // viewer watching a permanently fast stream.
+        assertEqual(catchUpPlaybackRate(180, 180, 1), 1, 'at target the rate must stay 1.0');
+        assertEqual(catchUpPlaybackRate(100, 180, 1), 1, 'below target the rate must stay 1.0');
+        assertEqual(catchUpPlaybackRate(180, 180, 1.08), 1.07,
+            'returning to target must RAMP down, not snap to 1.0 (a step is audible)');
+
+        // A null / non-finite reading must never move the rate: there is
+        // nothing to act on, and playbackRate writes reset A/V sync state.
+        for (const bad of [null, undefined, NaN, Infinity, -1]) {
+            assertEqual(catchUpPlaybackRate(bad, 180, 1.05), 1,
+                `a non-measurable delay (${String(bad)}) must not change the rate`);
+        }
+
+        // Ramp shape: one step per tick, always on the 1% grid, never below 1.0.
+        let rate = 1;
+        for (let i = 0; i < 30; i++) {
+            const next = catchUpPlaybackRate(1500, 180, rate);
+            assert(next >= rate, 'the rate must never decrease while the delay is high');
+            assert(next - rate <= 0.0100001, 'the rate must rise by at most one step per tick');
+            assert(Math.abs(next * 100 - Math.round(next * 100)) < 1e-9,
+                `rate ${next} must sit on the 1% grid`);
+            rate = next;
+        }
+        assertEqual(rate, 1.08, 'a badly-drifted session must reach the 1.08x cap');
+        assertEqual(catchUpPlaybackRate(1e6, 180, 1.08), 1.08,
+            'even absurd drift must be clamped to the cap — an uncapped rate is a fast-forward');
+
+        // THE LOAD-BEARING CHECK: simulate the actual drift this replaces.
+        // Start 1.5s behind a 180ms target, run one stats tick per second, and
+        // count how long until the delay is back inside the target band. At the
+        // cap, 1.08x consumes 8% of the buffer per second, so ~1.3s of excess
+        // drains in ~16s. The shipped alternative for this was a full WHEP
+        // teardown costing 2-4s of HARD BLACK, immediately, and then repeating
+        // the whole cycle for as long as the drift lasted.
+        const simulate = () => {
+            let delay = 1680;   // 180ms target + 1.5s of accumulated drift
+            let rate = 1;
+            let seconds = 0;
+            while (delay > 180 && seconds < 120) {
+                rate = catchUpPlaybackRate(delay, 180, rate);
+                // The element consumes `rate` times as fast as frames arrive, so
+                // the buffered surplus shrinks by (rate - 1) per second.
+                delay -= (rate - 1) * 1000;
+                seconds += 1;
+            }
+            return { seconds, rate, delay };
+        };
+        const run = simulate();
+        assert(run.seconds < 30,
+            `1.5s of drift must be drained in well under 30s, took ${run.seconds}s`);
+        assertEqual(Math.round(run.delay), 180, 'the simulation must actually converge on the target');
+        assert(run.rate > 1, 'the drain must have been engaged, not a no-op');
+        console.log(`    catch-up drained 1500ms of drift in ${run.seconds}s `
+            + `(no black frame, no renegotiation)`);
+
+        // Convergence must not oscillate: a rate that flips above/below the
+        // target every tick is a permanent A/V re-sync, which is the exact
+        // "hitch-and-catch-up that reads as quality pumping" this file has
+        // already been bitten by once (the stress-raise square wave).
+        let d = 200;
+        let r = 1;
+        let flips = 0;
+        let prev = r;
+        for (let i = 0; i < 60; i++) {
+            r = catchUpPlaybackRate(d, 180, r);
+            d -= (r - 1) * 1000;
+            if (r !== prev) flips += 1;
+            prev = r;
+        }
+        assert(flips <= 20, `the rate must settle instead of oscillating, saw ${flips} changes in 60 ticks`);
+    },
+});
+
+Object.assign(cases, {
+    // The Python checks for the seam are STATIC (they assert statement order in
+    // the source), because the real switchRendition() cannot be executed
+    // outside a browser — it closes a peer connection, aborts a fetch and
+    // touches timers. Static checks are what let this regression through in the
+    // first place: the old test proved the flag was not cleared *in the same
+    // function*, while the clearing lived in a different one.
+    //
+    // So this case replays the real ordering in a model of the module globals
+    // and asserts the OUTCOME. It proves two things the source cannot:
+    //   1. the seam branch is reachable again, and it puts BOTH tracks on the
+    //      element (audio ontrack usually arrives first);
+    //   2. the 12s net genuinely reconnects instead of blanking the page.
+    // ...and it asserts the OLD ordering still reproduces the black screen, so
+    // the model is proven capable of detecting the defect.
+    'seam-switch-actually-lands'() {
+        const run = (armOrder, netClearsFlags, seamLands) => {
+            const s = {
+                player: { srcObject: { trackIds: ['old-video', 'old-audio'] }, paused: false,
+                    pause() { this.paused = true; } },
+                switchSeamPending: false, switchSeamTimer: null,
+                currentSessionId: 1, elementStreamSessionId: 1,
+                isConnected: true, isConnecting: false,
+                seamClosed: false, connectCalls: 0, timers: []
+            };
+            const cleanup = (keepPicture) => {
+                if (s.switchSeamTimer) { s.timers = s.timers.filter((t) => t !== s.switchSeamTimer); s.switchSeamTimer = null; }
+                s.switchSeamPending = false;
+                if (keepPicture) return;
+                s.player.pause();
+                s.player.srcObject = null;
+            };
+            // The net, modelled: blank, (maybe) clear the flags, teardown, reconnect.
+            const net = () => {
+                s.timers = s.timers.filter((t) => t !== s.switchSeamTimer);
+                s.switchSeamTimer = null;
+                if (s.player.srcObject) { s.player.pause(); s.player.srcObject = null; }
+                if (netClearsFlags) { s.isConnected = false; s.isConnecting = false; }
+                cleanup(false);
+                if (s.isConnecting || s.isConnected) return;   // connectStream()'s guard
+                s.connectCalls += 1;
+            };
+            // switchRendition's statement order, the thing under test.
+            if (armOrder === 'arm-then-teardown') { s.switchSeamPending = true; cleanup(true); }
+            else { cleanup(true); s.switchSeamPending = true; }
+            s.switchSeamTimer = net; s.timers.push(net);
+
+            // The replacement session connects.
+            s.currentSessionId = 2;
+            s.isConnected = true;                                  // handleConnected()
+            // ontrack, video track (app.js:1416). The seam branch is taken ONLY
+            // if the flag survived the teardown — that is the whole point of
+            // this model, so it must be tested, not assumed.
+            if (seamLands && s.switchSeamPending) {
+                s.player.srcObject = { trackIds: ['new-audio', 'new-video'] };
+                s.elementStreamSessionId = s.currentSessionId;
+                s.switchSeamPending = false;
+                if (s.switchSeamTimer) { s.timers = s.timers.filter((t) => t !== s.switchSeamTimer); s.switchSeamTimer = null; }
+                s.seamClosed = true;
+            } else if (seamLands) {
+                // The flag is dead, so ontrack fell through to the generic
+                // "rebuild for a new session" branch (app.js:1439) — which swaps
+                // the stream but does NOT touch the safety net. That is exactly
+                // how the orphan survived in the shipped code.
+                s.player.srcObject = { trackIds: ['new-audio', 'new-video'] };
+                s.elementStreamSessionId = s.currentSessionId;
+            }
+            // Fire anything still armed (the real net is a 12s timer).
+            s.timers.slice().forEach((t) => t());
+            return s;
+        };
+
+        // FIXED, healthy switch: the seam lands, the net is cancelled, and the
+        // picture is never blanked. The old ordering fired the net here.
+        const good = run('teardown-then-arm', true, true);
+        assertEqual(good.seamClosed, true, 'the seam branch must be reachable again');
+        assertEqual(good.switchSeamTimer, null, 'a successful switch must cancel the 12s net');
+        assertEqual(good.connectCalls, 0, 'a healthy switch must not run the recovery net');
+        assert(good.player.srcObject !== null, 'a healthy switch must not blank the element');
+        assertEqual(good.player.paused, false, 'a healthy switch must not pause playback');
+
+        // FIXED, failed switch: the seam never lands, the net fires, and it
+        // MUST reconnect.
+        const recovered = run('teardown-then-arm', true, false);
+        assertEqual(recovered.connectCalls, 1,
+            'a failed switch must genuinely reconnect (before: connectStream() no-opped '
+            + 'because isConnected was still true, leaving a permanent black screen '
+            + 'that only a manual reload could clear)');
+        assertEqual(recovered.player.srcObject, null,
+            'the failed-switch path blanks the element by design, but must reconnect');
+
+        // REGRESSION GUARDS: the old ordering must still be caught by this model.
+        // With the flag destroyed by the teardown, ontrack takes the generic
+        // rebuild branch, which never touches the net — so on a HEALTHY switch
+        // the orphan fires, blanks a perfectly good picture and then cannot
+        // reconnect. This is the shipped defect, reproduced.
+        const oldHealthy = run('arm-then-teardown', false, true);
+        assertEqual(oldHealthy.seamClosed, false,
+            'the old arm-then-teardown order must leave the seam dead code');
+        assertEqual(oldHealthy.connectCalls, 0,
+            'the old net no-ops because isConnected is still true');
+        assertEqual(oldHealthy.player.srcObject, null,
+            'the old net blanked a healthy picture and could not recover it');
+        const oldBroken = run('arm-then-teardown', false, false);
+        assertEqual(oldBroken.connectCalls, 0,
+            'the old net could not reconnect even when it should have');
+        assertEqual(oldBroken.player.srcObject, null,
+            'the old net left a blank element with no way back — the regression being pinned');
+        console.log('    seam lands on the replacement stream; the net recovers when it cannot');
+    },
+    // The self-verification is a guard against catch-up silently not working
+    // (an engine that accepts the write and ignores it, or a link too congested
+    // for 8% to matter). A guard that fires on a HEALTHY link is worse than no
+    // guard: it permanently disables a working mechanism for the session.
+    //
+    // The failure it must not make is subtle and was found by simulation: a
+    // jitter buffer that is REFILLING (arrivals momentarily above consumption)
+    // is completely normal on a good link, and its delay rises slightly. A
+    // first version judged the drain after 5s at ANY rate, so from 400ms
+    // creeping to 472ms over six ticks at 1.05x — a buffer comfortably inside
+    // the cap, nowhere near saturated — it latched "useless" and switched the
+    // feature off. The verdict now requires the rate to be SATURATED, because
+    // only then is a non-falling delay evidence about the mechanism rather than
+    // about a transient.
+    'catchup-self-verification-ignores-a-refilling-buffer'() {
+        const catchUpPlaybackRate = compileFunction('catchUpPlaybackRate', {}).fn;
+        // Drive the REAL law against a healthy link whose jitter buffer is
+        // refilling: arrivals run 12ms/s above consumption, so the buffer grows
+        // by (refill - drain) each tick. This is completely normal on a good
+        // connection and must never be mistaken for broken catch-up.
+        const refill = 12;
+        let delay = 400;
+        let rate = 1;
+        for (let i = 0; i < 12; i++) {
+            rate = catchUpPlaybackRate(delay, 180, rate);
+            delay += refill - (rate - 1) * 1000;
+        }
+        // At 1.08x the drain (80ms/s) far exceeds the refill, so the buffer must
+        // be shrinking even though arrivals are faster than consumption: this is
+        // the exact shape of a healthy link that looks like it is drifting.
+        assert(delay < 400, `a healthy refilling buffer must still be drained, got ${Math.round(delay)}ms`);
+        // It settles INSIDE the dead band (base 180 + 120) and then the rate
+        // returns to 1.0, so the controller parks at the equilibrium point
+        // rather than hunting. This is the outcome the guard must not fight.
+        assert(delay <= 180 + 120,
+            `the controller must settle inside the dead band, got ${Math.round(delay)}ms`);
+        assertEqual(rate, 1,
+            'once the delay is inside the dead band the rate must return to 1.0x');
+        console.log(`    refilling buffer drained 400ms -> ${Math.round(delay)}ms and the rate `
+            + `returned to ${rate}x — a healthy link is not misjudged`);
+
+        // The guard's precondition. It can only fire once the rate is
+        // SATURATED, so "saturated and still not draining" is evidence about
+        // the MECHANISM. Judged at `> 1` instead, the early seconds of a slow
+        // 1%-per-tick ramp would be judged on a delay that is still falling —
+        // which is how the first version disabled a working feature on a
+        // healthy link.
+        // A single call only ever moves one 1% step, so saturation is a property
+        // of a sustained drift over many ticks, not of a single reading.
+        // The law's default and the module constant the controller uses must be
+        // the SAME number, or the guard would be checking saturation against a
+        // threshold the controller never actually reaches. Proven by behaviour,
+        // not by reading a literal: with the module constant supplied, a
+        // sustained drift must land exactly on it.
+        const moduleCap = evaluateConst('CATCHUP_MAX_RATE');
+        assertEqual(catchUpPlaybackRate(4000, 180, 1), 1.01,
+            'one tick must move exactly one 1% step - the ramp is the anti-jolt guarantee');
+        let satRate = 1;
+        for (let i = 0; i < 10; i++) satRate = catchUpPlaybackRate(4000, 180, satRate, moduleCap);
+        assertEqual(satRate, moduleCap,
+            'a sustained drift must reach exactly CATCHUP_MAX_RATE, or the self-verification '
+            + 'would judge saturation against a threshold the controller never reaches');
+        // And the default the controller relies on must equal that constant, so
+        // a drift handled with the default saturates at the guarded threshold.
+        let defaultRate = 1;
+        for (let i = 0; i < 10; i++) defaultRate = catchUpPlaybackRate(4000, 180, defaultRate);
+        assertEqual(defaultRate, moduleCap,
+            'the law default and CATCHUP_MAX_RATE have diverged');
+        console.log(`    the guard can only fire at saturation (${moduleCap}x), `
+            + `so it cannot judge a slow ramp`);
     },
 });
 
