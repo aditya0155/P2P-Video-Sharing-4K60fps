@@ -3,6 +3,8 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
+const { pipeline } = require('stream');
 const { URL } = require('url');
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
@@ -14,6 +16,7 @@ const MEDIAMTX_PORT = Number.parseInt(process.env.MEDIAMTX_PORT || '8889', 10);
 // listens on a separate port from WebRTC signaling.
 const MEDIAMTX_API_PORT = Number.parseInt(process.env.MEDIAMTX_API_PORT || '8888', 10);
 const STATIC_DIR = __dirname;
+
 const CACHE_CONTROL = 'no-store, no-cache, must-revalidate, max-age=0';
 // Static page assets are version-busted via ?v= in index.html, so browsers may
 // keep them but must revalidate (ETag) before reuse. This turns every repeat
@@ -273,6 +276,11 @@ const chatHistory = [];
 const chatSubscribers = new Set();
 const reactionCounts = { heart: 0, fire: 0, clap: 0, laugh: 0, thumbs: 0 };
 const chatRateLimits = new Map();
+const reactionRateLimits = new Map();
+// Hard ceiling on bytes an SSE subscriber may have buffered without reading.
+// write()===false cannot detect this early enough on its own (the kernel
+// socket buffer absorbs megabytes first), so the bytes are counted here.
+const SSE_MAX_QUEUED_BYTES = 256 * 1024;
 let lastChatMessageId = 0;
 
 function isDirectLocal(req) {
@@ -281,6 +289,47 @@ function isDirectLocal(req) {
     const hasProxyHeaders = Boolean(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']);
     return isLoopbackIp && !hasProxyHeaders;
 }
+
+// Client identity for rate limiting.
+//
+// `x-forwarded-for` is attacker-controlled: any client that reaches this server
+// directly (LAN, Tailscale, or the tunnel's own origin) can set it to anything,
+// and a unique value per request is a unique rate-limit key per request. The
+// old `cf-connecting-ip || x-forwarded-for || socket` chain therefore allowed
+// the per-IP reaction limit to be bypassed outright (verified: 60 reactions
+// with 60 distinct X-Forwarded-For values produced 60× 200 and zero 429s), and
+// also let one client fill the rate-limit map with one entry per spoofed string
+// — each retained for the sweep interval against a 2s window.
+//
+// The forwarded headers are therefore only honored when this process is
+// actually configured to sit behind the Cloudflare tunnel, which is the one
+// deployment that rewrites them. Otherwise the real socket address is used:
+// loopback for the tunnel, or the Tailscale/LAN address for a direct viewer.
+const TRUST_FORWARDED_HEADERS = Boolean(
+    process.env.CF_TUNNEL_HOST || process.env.TRUST_PROXY_HEADERS === '1'
+);
+function clientIpForRateLimit(req) {
+    if (TRUST_FORWARDED_HEADERS) {
+        const cfIp = req.headers['cf-connecting-ip'];
+        if (typeof cfIp === 'string' && cfIp) return cfIp.trim();
+        const xff = req.headers['x-forwarded-for'];
+        if (typeof xff === 'string' && xff) {
+            // First hop only: the rest of the chain is client-supplied.
+            const first = xff.split(',')[0].trim();
+            if (first) return first;
+        }
+    }
+    return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+
+// Per-IP reaction limits are only half the story: aggregate rate is
+// (per-viewer rate x viewer count), and every accepted reaction is broadcast to
+// every viewer, where it becomes an animated layer over live video. A global
+// token bucket bounds that aggregate no matter how many viewers there are, or
+// how a client chooses to identify itself.
+const REACTION_GLOBAL_CAP_PER_SEC = 25;
+let reactionGlobalWindowStart = Date.now();
+let reactionGlobalCount = 0;
 
 function broadcastChatEvent(eventType, data, eventId) {
     // The SSE id: line is what EventSource replays through Last-Event-ID on a
@@ -293,22 +342,54 @@ function broadcastChatEvent(eventType, data, eventId) {
     for (const sub of chatSubscribers) {
         if (!sub.destroyed && !sub.writableEnded) {
             try {
+                // Backpressure accounting, using the stream's OWN measure of
+                // what is still queued.
+                //
+                // A hand-rolled running total is wrong here and was actively
+                // harmful: `drain` only fires after a write() has previously
+                // returned false, so a perfectly HEALTHY reader (every write
+                // returns true, _slowWrites stays 0) never drains, never resets,
+                // and the accumulator climbs forever — destroying every SSE
+                // connection after ~1,300 events (~1.2h of a busy chat), for all
+                // viewers at once, each one then auto-reconnecting through
+                // EventSource. `writableLength` is Node's authoritative count of
+                // bytes currently buffered; it falls back to 0 by itself as the
+                // socket drains, so it measures exactly the quantity the guard
+                // is supposed to be about.
+                // `writableLength` is the stream's own count of what is still
+                // queued; it falls back to 0 by itself as the socket drains, so
+                // it measures exactly the quantity this guard is about. It is
+                // checked BEFORE the lagging short-circuit, because a
+                // subscriber that has already been marked lagging stops
+                // receiving new writes but keeps draining at its own pace — and
+                // the whole point of this check is to notice a subscriber that
+                // never drains and free its memory. Ordering it after
+                // `continue` made it unreachable for the only subscribers it
+                // exists to catch.
+                if (sub.writableLength > SSE_MAX_QUEUED_BYTES) {
+                    console.warn('[Chat] Destroying an SSE subscriber still holding '
+                        + `${sub.writableLength} bytes without reading.`);
+                    sub.destroy();
+                    continue;
+                }
+                if (sub._lagging) continue;
                 const buffered = sub.write(payload);
-                // Backpressure guard: a viewer that stops reading (dead tab,
-                // broken tunnel) would otherwise buffer unbounded memory on
-                // this process. HTTPServerResponse buffers internally, so
-                // write()===false is the only signal; one slow event is
-                // normal (socket momentarily busy), a long run of them means
-                // the consumer is gone. The 'error'/'close' handlers clean up.
-                if (!buffered) {
-                    sub._slowWrites = (sub._slowWrites || 0) + 1;
-                    if (sub._slowWrites > 64) {
-                        console.warn('[Chat] Destroying a stalled SSE subscriber after repeated backpressure.');
-                        sub.destroy();
-                        continue;
-                    }
-                } else {
+                if (buffered) {
+                    // Drained quickly enough: the kernel took it.
                     sub._slowWrites = 0;
+                } else {
+                    sub._slowWrites = (sub._slowWrites || 0) + 1;
+                    if (sub._slowWrites > 4) {
+                        // The consumer is not keeping up. Stop feeding it
+                        // entirely; a chat message is not worth unbounded host
+                        // memory, and a dead tab is destroyed by its own
+                        // 'close' handler anyway.
+                        if (!sub._lagging) {
+                            sub._lagging = true;
+                            sub._lagSince = Date.now();
+                            console.warn('[Chat] SSE subscriber is not reading — pausing its event stream.');
+                        }
+                    }
                 }
             } catch (err) {
                 console.warn('[Chat] Failed to write event to subscriber:', err.message);
@@ -338,22 +419,42 @@ setInterval(() => {
             chatRateLimits.set(ip, kept);
         }
     }
+    for (const [ip, stamps] of reactionRateLimits) {
+        const kept = stamps.filter((ts) => ts > cutoff);
+        if (kept.length === 0) {
+            reactionRateLimits.delete(ip);
+        } else if (kept.length !== stamps.length) {
+            reactionRateLimits.set(ip, kept);
+        }
+    }
 }, 60000).unref();
 
 function readJsonBody(req, maxBytes = 16384) {
     return new Promise((resolve, reject) => {
         let size = 0;
+        let settled = false;
         const chunks = [];
         req.on('data', (chunk) => {
+            if (settled) return;
             size += chunk.length;
             if (size > maxBytes) {
-                req.destroy(new Error('Payload too large'));
-                reject(new Error('Payload too large'));
+                // Stop consuming but leave the socket alive: rejecting with a
+                // typed error lets the caller answer 413 on a live response.
+                // Destroying the request here (the old behavior) closed the
+                // connection before any response was written, so the client
+                // saw an opaque network error instead of the 413.
+                settled = true;
+                req.pause();
+                const error = new Error(`Payload exceeds the ${maxBytes}-byte limit`);
+                error.payloadTooLarge = true;
+                reject(error);
                 return;
             }
             chunks.push(chunk);
         });
         req.on('end', () => {
+            if (settled) return;
+            settled = true;
             try {
                 const bodyStr = Buffer.concat(chunks).toString('utf8');
                 if (!bodyStr.trim()) {
@@ -365,7 +466,11 @@ function readJsonBody(req, maxBytes = 16384) {
                 reject(new Error('Invalid JSON'));
             }
         });
-        req.on('error', reject);
+        req.on('error', (err) => {
+            if (settled) return;
+            settled = true;
+            reject(err);
+        });
     });
 }
 
@@ -414,21 +519,63 @@ function handleChat(req, res, requestUrl) {
         chatSubscribers.add(res);
         broadcastViewerCount();
 
+        // Dead-viewer detection. An SSE client never sends data, and writes
+        // into a half-open socket (viewer's network dropped, tab crashed,
+        // laptop slept — common on a hotspot setup) SUCCEED until TCP itself
+        // gives up, which can take minutes. Until then the viewer count
+        // over-reports and every event buffers into a subscriber nobody will
+        // read. TCP keepalive probes the peer: the 15s comment writes below
+        // elicit ACKs from live viewers (which reset the probe timer), while
+        // a dead peer goes silent and errors the socket into the close
+        // handler after ~30-40s — bounded, cross-platform, no protocol change.
+        try {
+            if (req.socket && !req.socket.destroyed) req.socket.setKeepAlive(true, 30000);
+        } catch (_) { /* non-fatal: cleanup falls back to write failures */ }
+
         const keepAliveTimer = setInterval(() => {
             if (res.destroyed || res.writableEnded) {
                 clearInterval(keepAliveTimer);
                 chatSubscribers.delete(res);
+                if (!res.writableEnded) broadcastViewerCount();
+                return;
+            }
+            // Bounded recovery from a lag. broadcastChatEvent() stops writing to
+            // a subscriber that is not keeping up, and only the browser's own
+            // EventSource auto-reconnect can unstick a viewer whose socket never
+            // drains. If it has been dark for over a minute, drop it so that
+            // reconnect actually happens instead of the viewer sitting with a
+            // silently frozen viewer count and no chat.
+            if (res._lagging && Date.now() - (res._lagSince || 0) > 60000) {
+                console.warn('[Chat] SSE subscriber never recovered — closing so the browser reconnects.');
+                res.destroy();
                 return;
             }
             res.write(':keepalive\n\n');
         }, 15000);
+        // Do not let a live SSE connection hold the process open.
+        keepAliveTimer.unref();
 
-        req.on('close', () => {
+        // Recovery for a lagging subscriber: broadcastChatEvent() stops writing
+        // to it once it falls behind, so nothing else would clear the flag on a
+        // tab that is merely slow (a phone resuming from sleep, a tunnel
+        // hiccup) rather than gone. 'drain' means the socket flushed
+        // everything queued, so it is a healthy reader again.
+        res.on('drain', () => {
+            res._lagging = false;
+            res._slowWrites = 0;
+            res._lagSince = 0;
+        });
+
+        // res 'close' fires on some Node/OS combinations where req 'close'
+        // is delayed for a streaming response; both paths are idempotent.
+        const detachSubscriber = () => {
             clearInterval(keepAliveTimer);
             if (chatSubscribers.delete(res)) {
                 broadcastViewerCount();
             }
-        });
+        };
+        req.on('close', detachSubscriber);
+        res.on('close', detachSubscriber);
         return;
     }
 
@@ -451,7 +598,7 @@ function handleChat(req, res, requestUrl) {
         }
 
         if (req.method === 'POST') {
-            const clientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || 'unknown';
+            const clientIp = clientIpForRateLimit(req);
             const now = Date.now();
             const rateInfo = chatRateLimits.get(clientIp) || [];
             const recent = rateInfo.filter((ts) => now - ts < 2000);
@@ -518,7 +665,8 @@ function handleChat(req, res, requestUrl) {
                 }));
                 res.end(body);
             }).catch((err) => {
-                res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                const status = err && err.payloadTooLarge ? 413 : 400;
+                res.writeHead(status, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
                 res.end(JSON.stringify({ error: err.message || 'Invalid request body' }));
             });
             return;
@@ -535,6 +683,31 @@ function handleChat(req, res, requestUrl) {
 
     if (subpath === '/reactions' || subpath === '/reactions/') {
         if (req.method === 'POST') {
+            // Reactions are cheap but broadcast to every viewer; unbounded,
+            // one rogue client floods every screen with emoji animations.
+            const reactionIp = clientIpForRateLimit(req);
+            const nowMs = Date.now();
+            const reactionStamps = (reactionRateLimits.get(reactionIp) || []).filter((ts) => nowMs - ts < 2000);
+            if (reactionStamps.length >= 10) {
+                res.writeHead(429, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                res.end(JSON.stringify({ error: 'Too many reactions — slow down a little.' }));
+                return;
+            }
+            // Global aggregate ceiling, checked before the stamp is recorded so
+            // a throttled client is not also charged for the attempt.
+            if (nowMs - reactionGlobalWindowStart >= 1000) {
+                reactionGlobalWindowStart = nowMs;
+                reactionGlobalCount = 0;
+            }
+            if (reactionGlobalCount >= REACTION_GLOBAL_CAP_PER_SEC) {
+                res.writeHead(429, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                res.end(JSON.stringify({ error: 'Reactions are moving fast right now — try again in a moment.' }));
+                return;
+            }
+            reactionGlobalCount += 1;
+            reactionStamps.push(nowMs);
+            reactionRateLimits.set(reactionIp, reactionStamps);
+
             readJsonBody(req).then((data) => {
                 const emoji = typeof data.emoji === 'string' ? data.emoji.trim() : '';
                 const validEmojis = ['heart', 'fire', 'clap', 'laugh', 'thumbs'];
@@ -559,7 +732,8 @@ function handleChat(req, res, requestUrl) {
                 }));
                 res.end(body);
             }).catch((err) => {
-                res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
+                const status = err && err.payloadTooLarge ? 413 : 400;
+                res.writeHead(status, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
                 res.end(JSON.stringify({ error: err.message || 'Invalid request body' }));
             });
             return;
@@ -604,6 +778,13 @@ function handleChat(req, res, requestUrl) {
 }
 
 const server = http.createServer((req, res) => {
+    // A response can legitimately error after its request handler already
+    // returned (a socket write racing the client's disconnect, a half-closed
+    // SSE stream). Without a listener that 'error' event is unhandled and
+    // would reach the process-level handlers; swallowing it here is the
+    // correct per-connection fate — the socket is already gone.
+    res.on('error', () => {});
+
     let requestUrl;
     try {
         requestUrl = new URL(req.url, 'http://localhost');
@@ -673,25 +854,63 @@ const server = http.createServer((req, res) => {
                 'Cache-Control': STATIC_CACHE_CONTROL,
                 'CDN-Cache-Control': 'no-store',
                 'ETag': etag,
+                // The 200 below is Vary'd on Accept-Encoding because the same
+                // ETag is served both gzipped and identity. A shared cache that
+                // revalidated on a 304 and merged headers without this could
+                // hand a gzip body to a client that never advertised gzip —
+                // a hard decode error, i.e. a player that silently never boots.
+                'Vary': 'Accept-Encoding',
                 'X-Content-Type-Options': 'nosniff'
             });
             res.end();
             return;
         }
 
-        res.writeHead(200, {
-            'Content-Type': MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
-            'Content-Length': stats.size,
+        const contentType = MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+        // Compressible page assets ride gzip when the browser allows it:
+        // app.js is ~170 KB raw and ~40 KB gzipped, which cuts the first page
+        // load on the LAN/Tailscale paths roughly 4x (the Cloudflare tunnel
+        // already compresses). 304 revalidation above is untouched — the ETag
+        // identifies the uncompressed content on both paths. No store would
+        // ever serve a body without this header, so no Vary poisoning risk.
+        const gzippable = contentType.startsWith('text/') || contentType.startsWith('application/javascript');
+        const wantsGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
+        const headers = {
+            'Content-Type': contentType,
             'Cache-Control': STATIC_CACHE_CONTROL,
             'CDN-Cache-Control': 'no-store',
             'ETag': etag,
             'X-Content-Type-Options': 'nosniff'
-        });
+        };
+        if (gzippable && wantsGzip) {
+            // Content-Length must go: the encoded size is only known after
+            // streaming, and a stale value would truncate the body.
+            headers['Content-Encoding'] = 'gzip';
+            headers['Vary'] = 'Accept-Encoding';
+            res.writeHead(200, headers);
+            if (req.method === 'HEAD') {
+                res.end();
+                return;
+            }
+            pipeline(fs.createReadStream(filePath), zlib.createGzip({ level: 6 }), res, () => {});
+            return;
+        }
+        headers['Content-Length'] = stats.size;
+        res.writeHead(200, headers);
         if (req.method === 'HEAD') {
             res.end();
             return;
         }
-        fs.createReadStream(filePath).pipe(res);
+        // A read that fails mid-flight (the file was replaced or locked
+        // between stat and open — normal on a Windows editor save) must not
+        // reach the process-level handlers with a half-sent response: cut
+        // the connection cleanly instead.
+        const fileStream = fs.createReadStream(filePath);
+        fileStream.on('error', (streamError) => {
+            console.error(`[Static] Failed reading ${fileName}:`, streamError.message);
+            res.destroy();
+        });
+        fileStream.pipe(res);
     });
 });
 
@@ -705,6 +924,31 @@ server.on('error', (error) => {
     console.error('Rydius Stream host server error:', error);
     process.exit(1);
 });
+
+// Long-lived-host resilience: a single stray rejected promise (a socket write
+// racing a client disconnect, a half-closed SSE stream) would otherwise kill
+// the whole process mid-broadcast — Node's default for unhandled rejections
+// is exit. The per-request handlers above already contain the expected
+// failure modes; these two are the last line of defense, so the stream and
+// chat keep serving whatever happens. Logged loudly: anything reaching here
+// is a bug that should be fixed, not suppressed silently.
+process.on('unhandledRejection', (reason) => {
+    console.error('[Resilience] Unhandled rejection (host kept alive):', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[Resilience] Uncaught exception (host kept alive):', err);
+});
+
+// Keep-alive must outlive the client's request cadence. Node's default
+// keepAliveTimeout is 5 seconds, and the player polls stream status on a 5s
+// interval and fetches the rendition ladder on the same period — so the pooled
+// socket was being torn down in a race with the very next request. A WHEP
+// handshake is a POST, and browsers do not reliably retry a failed POST on a
+// reused socket: losing that race produced a failed handshake, a reconnect and
+// a visible freeze on a perfectly healthy link. 65s is the conventional pairing
+// with the 60s header timeout and leaves ample margin.
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 
 server.listen(PORT, '127.0.0.1', () => {
     console.log('Rydius Stream host is running on this laptop.');

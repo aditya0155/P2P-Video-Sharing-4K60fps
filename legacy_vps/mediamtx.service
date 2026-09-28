@@ -1,0 +1,18 @@
+[Unit]
+Description=MediaMTX Media Server (SRT to WebRTC)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mediamtx
+ExecStart=/opt/mediamtx/mediamtx /opt/mediamtx/mediamtx.yml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Increase file descriptor limits for high connection capabilities
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

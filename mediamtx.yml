@@ -18,8 +18,41 @@ apiAddress: 127.0.0.1:8888
 # instead of overflowing (an overflowed queue is dropped or disconnects the
 # reader — lost packets break decode until the next keyframe, which is exactly
 # the "frame drops" this setup fights). The player's buffer accommodation
-# absorbs the temporary added latency; 2048 packets ≈ 2.4s at 6 Mbps.
+# absorbs the temporary added latency. 2048 packets x 1200 B = 2.46 MB of
+# payload = ~0.41s at 6 Mbps (~0.42s on the wire at 1228 B including UDP and
+# IPv4 headers), and ~2.4 MiB of RAM per reader when fully backlogged
+# (20 viewers ~ 48 MiB). (An earlier version of this comment claimed 3.3s —
+# 8x too high; 3.3s at 6 Mbps would need ~16,500 packets. The 2048 value is
+# still sound: the measured worst 100ms window of this encode is ~104 packets,
+# about 5% of the queue.)
 writeQueueSize: 2048
+
+# Maximum UDP payload MediaMTX packetizes for readers (v1.21.1 default: 1452).
+#
+# MEASURED — and this correction matters, because an earlier version of this
+# file carried a long comment here claiming the 1452 default was fragmenting
+# every packet sent to a remote viewer (this host's Tailscale adapter reports an
+# MTU of 1280, and 1452 + 28 exceeds it). THAT CLAIM WAS FALSE.
+#
+# Measured A/B: a real 1280x720 H264 publish, a real MediaMTX, read by real
+# headless Chrome through a genuine WHEP session. Mean inbound video RTP packet
+# size, repeated across runs:
+#
+#     udpMaxPayloadSize: 200   -> 901.9 B
+#     udpMaxPayloadSize: 1200  -> 901.1 B, 901.3 B, 901.3 B
+#     udpMaxPayloadSize: 1452  -> 901.3 B, 902.1 B
+#
+# All indistinguishable — even an absurd 200-byte cap. The WebRTC path does not
+# read this key at all: it packetizes with its own ~1200-byte MTU, which puts
+# packets at ~901 B mean and comfortably inside a 1280-byte MTU (1200 + 28 on
+# the wire). So there was never IP fragmentation on the WebRTC path, and this
+# line was never a fragmentation fix.
+#
+# It is kept because the key does exist and is honoured by MediaMTX's other RTP
+# consumers, where 1200 is still the correct value on this host — 1452 + 20
+# (IPv4) + 8 (UDP) = 1480 would exceed the tunnel MTU. Just do not expect it to
+# change anything a WebRTC viewer receives.
+udpMaxPayloadSize: 1200
 
 # Enlarge per-socket UDP receive buffers so publisher bursts and viewer RTCP
 # feedback (NACK / transport-cc) are not dropped by the OS when the WebRTC or
@@ -27,9 +60,20 @@ writeQueueSize: 2048
 # decrease packet loss; 0 would keep the small OS default.
 udpReadBufferSize: 1048576
 
-# High-bitrate timeouts
-readTimeout: 10s
-writeTimeout: 10s
+# Publisher timeouts. These default to 10s and were written out as if they were
+# decisions. They are INERT for WebRTC readers (a reader is a pion
+# PeerConnection, not a byte stream with read deadlines) — they bound the
+# PUBLISHERS, and they are the only thing standing between a host hiccup and a
+# broadcast-wide disconnect. The RTMP publisher is on LOOPBACK, so 10s of
+# silence there cannot be blamed on the network: it means the publisher process
+# itself stopped running (NVENC contention, a Windows Defender scan, a driver
+# stall — this box runs OBS + the bridge's NVENC/NVDEC + MediaMTX + Node at
+# once). At 10s that flips `live` to not-ready and hard-disconnects EVERY viewer
+# for a 2-4s re-WHEP, which is a room-wide freeze, not a per-viewer stutter.
+# 20s buys host-stall immunity; a genuinely crashed publisher still exits
+# immediately on EOF, so nothing is retained.
+readTimeout: 20s
+writeTimeout: 20s
 
 ###############################################
 # Ingest Protocols (OBS Studio)
@@ -58,9 +102,37 @@ srtAddress: 127.0.0.1:8890
 webrtc: yes
 webrtcAddress: 127.0.0.1:8889
 
+# Maximum time to gather STUN candidates. MediaMTX's default is 5s, and this
+# budget is NESTED inside webrtcHandshakeTimeout (10s) alongside the 2s track
+# gather: 5 + 2 = 7 of the 10 seconds can be spent before MediaMTX writes a
+# single byte of the SDP answer — while the player aborts its own WHEP POST at
+# 10s (app.js). A single UDP binding request to stun.cloudflare.com costs
+# 20-80ms on a healthy uplink, so 2s is ~25x the real cost. The failure mode
+# this removes is not stutter, it is permanent remote-viewing failure: when the
+# STUN binding times out, the answer comes back with NO srflx candidate, and
+# the only candidates left are host addresses (the hotspot LAN 192.168.x.x and
+# Tailscale 100.x) which are unreachable from the internet. The handshake
+# succeeds, ICE never connects, and the client watchdog rejoins forever. This
+# host's uplink is a phone hotspot already saturated carrying the video —
+# exactly the condition under which a STUN binding is slow. Failing FAST means
+# a diagnosable missing-candidate instead of a 5s penalty on every connect.
+webrtcSTUNGatherTimeout: 2s
+
 # WebRTC media UDP port (RTP packets)
 webrtcLocalUDPAddress: 0.0.0.0:8189
-webrtcLocalTCPAddress: 0.0.0.0:8189
+# ICE-TCP is deliberately OFF. MediaMTX ships it disabled ("TCP is less
+# efficient than UDP and introduces a progressive delay when network is
+# congested"), and this project's media is DTLS-SRTP, so a negotiated TCP
+# candidate inherits head-of-line blocking: one lost segment stalls all
+# subsequent video until RTO expiry, turning a ~20ms UDP jitter blip on a lossy
+# hotspot into a 200-600ms hard freeze. Muxing it on the same port as UDP also
+# means a viewer on a UDP-restricting network (hotel/corporate Wi-Fi, a CGNAT
+# that throttles UDP) can win nomination onto that worse path with nothing in
+# the UI to say so. If a viewer genuinely cannot do UDP, give them TURN
+# (secrets.local.env -> /stream-api/turn) instead: TURN/UDP is not head-of-line
+# blocked. Re-enable this on a SEPARATE port if it is ever needed, never
+# multiplexed onto 8189 where it competes with the healthy path.
+webrtcLocalTCPAddress: ""
 
 # Automatically query local network adapters (LAN, Wi-Fi, Tailscale VPN)
 webrtcIPsFromInterfaces: yes
@@ -92,7 +164,7 @@ paths:
     # live-av1 low-bitrate rendition) with NVENC on the RTX 4070.
     # runOnUnavailable kills any leftover ffmpeg (see PID guard in the script).
     runOnAvailable: node "codec_bridge.js"
-    runOnAvailableRestart: false
+    runOnAvailableRestart: true
     runOnUnavailable: node "codec_bridge.js" --cleanup
     publishUser:
     publishPass:

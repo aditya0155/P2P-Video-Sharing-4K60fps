@@ -351,16 +351,21 @@ function makePollSandbox(options = {}) {
         }
     };
     // Real path-selection helpers, extracted from app.js like every other case.
-    // browserSupportsAv1 gets an RTCRtpReceiver stub only when the scenario
-    // models an AV1-capable viewer; without it, typeof-guard returns false.
+    // browserSupportsAv1/browserSupportsH265 get an RTCRtpReceiver stub only
+    // when the scenario models a capable viewer; without it, the typeof-guard
+    // returns false (the browser-support default).
     sandbox.chooseStreamPath = compileFunction('chooseStreamPath', { console: quietConsole() }).fn;
     const rtcSandbox = { console: quietConsole() };
-    if (options.av1Capable) {
+    const rtcCodecs = [];
+    if (options.av1Capable) rtcCodecs.push({ mimeType: 'video/AV1' });
+    if (options.h265Capable) rtcCodecs.push({ mimeType: 'video/H265' });
+    if (rtcCodecs.length) {
         rtcSandbox.RTCRtpReceiver = {
-            getCapabilities: () => ({ codecs: [{ mimeType: 'video/AV1' }] })
+            getCapabilities: () => ({ codecs: rtcCodecs })
         };
     }
     sandbox.browserSupportsAv1 = compileFunction('browserSupportsAv1', rtcSandbox).fn;
+    sandbox.browserSupportsH265 = compileFunction('browserSupportsH265', rtcSandbox).fn;
     // The Media Capabilities probe runs on the real navigator in a browser;
     // scenarios pin the outcome (null keeps the capability-list behavior).
     sandbox.probeAv1DecodeSmooth = async () => (options.av1Smooth === undefined ? null : options.av1Smooth);
@@ -527,8 +532,26 @@ Object.assign(cases, {
             'B-frames break WebRTC decoders (README rule)');
 
         const aacPlan = bridge.decideBridge(['MPEG-4 Audio', 'H264']);
-        assertEqual(aacPlan.audioArgs, ['-c:a', 'libopus', '-b:a', '160k'],
+        assertEqual(aacPlan.audioArgs,
+            ['-c:a', 'libopus', '-b:a', '160k', '-af', 'aresample=async=1'],
             'AAC source audio must be re-encoded to Opus for WebRTC readers');
+        // Drift correction on the rescue audio: without it a source clock that
+        // runs slightly fast makes Opus timestamps walk ahead of video, and the
+        // browser's A/V sync layer then nudges playbackRate forever — a
+        // permanent micro-correction that reads as jank rather than desync.
+        assert(aacPlan.audioArgs.join(' ').includes('aresample=async=1'),
+            'the Opus rescue must resample asynchronously to stop A/V timestamp drift');
+        // ... but it must NOT re-base the audio onto the video head. Measured
+        // with the bundled ffmpeg on a source whose audio starts 279ms after its
+        // video (an ordinary OBS audio-device offset):
+        //     async=1:first_pts=0  -> output skew  -7ms  (offset destroyed, sign flipped)
+        //     async=1              -> output skew +294ms  (offset preserved)
+        // Forcing the first sample to PTS 0 drags the audio track onto the video
+        // track's first packet, so every rendition gets a permanent lip-sync
+        // error equal to the source's own A/V offset — which viewers report as
+        // the video being "janky" when it is purely an audio offset.
+        assert(!aacPlan.audioArgs.join(' ').includes('first_pts'),
+            'the Opus rescue must not re-base audio with first_pts: it destroys the source A/V offset');
 
         assertEqual(bridge.decideBridge(['Opus']), null, 'audio-only source must not bridge');
         assertEqual(bridge.decideBridge(null), null, 'missing tracks must not bridge');
@@ -698,6 +721,27 @@ Object.assign(cases, {
         // them directly regardless of codec support.
         const audioOnly = items([ready('live', ['MPEG-4 Audio'])]);
         assertEqual(fn(audioOnly, true), 'live', 'audio-only source must not wait for a rendition');
+
+        // --- H265 sources (WHIP HEVC ingest): MediaMTX answers a WHEP
+        // handshake with the source codec even when the browser has no H265
+        // receiver, which would be a connected-but-black session. Browsers
+        // without H265 support must ride the bridge's AV1 rendition instead.
+        const h265Source = items([
+            ready('live', ['H265', 'Opus']),
+            { name: 'live-av1', ready: false, online: false }
+        ]);
+        const h265RenditionReady = items([
+            ready('live', ['H265', 'Opus']),
+            ready('live-av1', ['AV1', 'Opus'])
+        ]);
+        assertEqual(fn(h265Source, false, true, 'auto', true), 'live',
+            'an H265-capable browser plays the native path of an H265 source');
+        assertEqual(fn(h265Source, false, true, 'auto', false), null,
+            'a browser without H265 decode must wait for the AV1 rendition, not take a black session');
+        assertEqual(fn(h265RenditionReady, false, true, 'auto', false), 'live-av1',
+            'a browser without H265 decode takes the AV1 rendition once ready');
+        assertEqual(fn(h265RenditionReady, false, true, 'auto', true), 'live',
+            'H265 capability keeps the native path even when the rendition exists');
     },
 
     // AV1 source + browser without AV1 + bridge not ready: the poll must keep
@@ -950,6 +994,32 @@ Object.assign(cases, {
         assertEqual(fn(350, 200, 180, false, 0), 200,
             'a larger measurement without drops must not raise');
 
+        // THE OTHER HALF OF THE SAME REGRESSION, and the one that actually fires
+        // in production. The drop-gate only ever stopped the climb for the
+        // NO-DROPS case. baseBufferTargetMs() deliberately excludes
+        // accommodationTargetMs, so `delay > base + 150` stayed permanently true
+        // once Chrome converged on the granted target — and on a real link
+        // frames ARE being discarded, which is the whole reason the gate exists.
+        // Simulated against the real function: 180ms -> 2200ms in 19 ticks, one
+        // re-pace each, each above the filled level so Chrome holds frames
+        // (~1.1s of frozen picture in the first 20s of any rough session).
+        assertEqual(fn(450, 450, 180, true, 0), 450,
+            'a raise must never climb against its own grant while frames are dropping');
+        assertEqual(fn(2200, 2200, 180, true, 0), 2200,
+            'the cap must hold, not oscillate');
+        // Monotonicity: the "raise" branch must never return LESS than the level
+        // already granted. It used to: 2200 -> 500 in a single tick, then a 1ms
+        // step across `base + 150` flipped the output by 50ms, so a noisy
+        // measurement could collapse the buffer under the viewer.
+        assertEqual(fn(400, 2200, 180, true, 0), 2200,
+            'the raise branch must never return less than the level already granted');
+        // A genuine, LARGER need still gets through — the fix is not "freeze".
+        assertEqual(fn(700, 450, 180, true, 0), 800,
+            'a measured need well beyond the current grant must still raise');
+        // And the drain still works.
+        assertEqual(fn(400, 400, 180, false, 5), 350,
+            'sustained calm still drains one 50ms step');
+
         // Decode/GPU-pressure drops with the buffer at the target are not a
         // buffer problem: the 150ms margin keeps them from inflating latency.
         assertEqual(fn(260, 0, 180, true, 0), 0,
@@ -987,11 +1057,14 @@ Object.assign(cases, {
                     smooth: { ms: 350, driftLimitMs: 1100 }
                 },
                 rejoinDriftSec: 2,
-                adaptiveRaiseUntil: 0,
+                decodeLagSec: 0,
+                lastFramesReceived: 0,
+                adaptiveRaiseLevelMs: 0,
                 stressRunSec: 0,
                 calmRunSec: 0,
                 bufferNoticeState: '',
                 avgPlayoutDelayMs: 5000,
+              avgPlayoutDelayAt: 1000, // fresh: the drift supervisor requires a live reading
                 lastNetJitterMs: 2,
                 lastLossPct: 0,
                 lastAppliedTargetMs: null,
@@ -1002,6 +1075,7 @@ Object.assign(cases, {
                 lastRenditionSwitchAt: -60000,
                 renditionPathsItems: null,
                 activeStreamPath: 'live',
+                player: { paused: false },
                 document: { hidden },
                 performance: { now: () => 1000 },
                 RTCRtpReceiver: { getCapabilities: () => ({ codecs: [] }) },
@@ -1071,13 +1145,16 @@ Object.assign(cases, {
                     smooth: { ms: 350, driftLimitMs: 3000 }
                 },
                 rejoinDriftSec: 0,
-                adaptiveRaiseUntil: 0,
+                decodeLagSec: 0,
+                lastFramesReceived: 0,
+                adaptiveRaiseLevelMs: 0,
                 stressRunSec: 0,
                 calmRunSec: 0,
                 bufferNoticeState: '',
                 accommodationTargetMs: 0,
                 isConnecting: false,
                 avgPlayoutDelayMs: 150,
+              avgPlayoutDelayAt: 100000,
                 lastNetJitterMs: 10,
                 lastLossPct: 0,
                 lastAppliedTargetMs: null,
@@ -1088,8 +1165,21 @@ Object.assign(cases, {
                 renditionPathsItems: ladder.h264Source,
                 activeStreamPath: 'live',
                 rejoinDriftSec: 0,
+                decodeLagSec: 0,
+                lastFramesReceived: 0,
                 av1DecodeSmooth: true,
+                // The downgrade must consult the real decode capability: the
+                // default sandbox models an AV1-capable viewer, and the
+                // legacy-viewer sub-case below overrides it.
+                browserSupportsAv1() { return true; },
+                browserSupportsH265() { return true; },
                 chooseStreamPath() { return 'live'; },
+                // superviseAdaptiveBuffer() treats a paused viewer as "not under
+                // stress" (RTP keeps arriving while paused, so loss/jitter look
+                // stressed forever and the controller would act on it). These
+                // cases all model a PLAYING viewer, so the element is present and
+                // not paused. Cases about the paused path override this.
+                player: { paused: false },
                 document: { hidden: false },
                 performance: { now: () => 100000 },
                 RTCRtpReceiver: { getCapabilities: () => ({ codecs: [] }) },
@@ -1109,6 +1199,14 @@ Object.assign(cases, {
         down.run();
         assertEqual(down.sandbox.switchedTo, 'live-av1',
             'sustained stress on the full-bitrate path must downgrade to live-av1');
+
+        // A browser WITHOUT AV1 decode must never be downgraded onto the AV1
+        // rendition — an undecodable session is strictly worse than the
+        // stutter it is escaping. Buffer accommodation still protects it.
+        const legacy = make({ abrBadSec: 7, lastLossPct: 8, browserSupportsAv1() { return false; } });
+        legacy.run();
+        assertEqual(legacy.sandbox.switchedTo, undefined,
+            'a browser without AV1 decode must keep its decodable full-bitrate path under stress');
 
         // 20 calm seconds on the rendition -> upgrade back to the source.
         const up = make({
@@ -1189,6 +1287,9 @@ Object.assign(cases, {
                 },
                 activeStreamPath: 'live',
                 rejoinDriftSec: 0,
+                returnDriftChecks: 0,
+                decodeLagSec: 0,
+                lastFramesReceived: 0,
                 lastRenditionSwitchAt: -60000,
                 performance: { now: () => 100000 },
                 console: quietConsole(),
@@ -1202,13 +1303,31 @@ Object.assign(cases, {
         return Promise.resolve().then(async () => {
             // 25 frames presented while hidden, each held 5s longer than the
             // pre-hide baseline (delta 125s / 25 frames): far past Balanced's
-            // 4100ms cap -> rejoin at the live edge immediately.
+            // 4100ms cap. PERSISTENCE is required — one reading is not enough
+            // to tear down a working session, because a normal Alt-Tab
+            // measures 1.7-2.8s and sits within 300ms of the 3.1s trip point.
+            // The first two over-cap checks must not switch; the third must.
             const drifted = make({ delayTotal: 135, emittedTotal: 75 });
             await drifted.run();
-            assertEqual(drifted.sandbox.switchedTo, 'live',
-                'a hidden-span delay past the reconnection cap must rejoin at the live edge');
+            assertEqual(drifted.sandbox.switchedTo, undefined,
+                'a single over-cap hidden-span reading must not rejoin');
             assertEqual(drifted.sandbox.avgPlayoutDelayMs, 5000,
                 'the hidden-span measurement must feed the supervisor state');
+            await drifted.run();
+            assertEqual(drifted.sandbox.switchedTo, undefined,
+                'two consecutive over-cap readings must still not rejoin');
+            await drifted.run();
+            assertEqual(drifted.sandbox.switchedTo, 'live',
+                'a persistently past-cap hidden-span delay must rejoin at the live edge');
+
+            // The counter resets as soon as a reading is back inside the cap, so
+            // intermittent noise can never accumulate into a teardown.
+            const flaky = make({ delayTotal: 135, emittedTotal: 75 });
+            await flaky.run();
+            await flaky.run();
+            await make({ delayTotal: 60, emittedTotal: 75 }).run();
+            assertEqual(flaky.sandbox.switchedTo, undefined,
+                'an in-cap reading between over-cap ones must reset the persistence counter');
 
             // A 2s hidden-span delay stays inside the cap: no rejoin, and the
             // measured value is adopted so the accommodation can absorb it.
@@ -1247,6 +1366,215 @@ Object.assign(cases, {
 /* --------------------------------------------------------------------------
    Unmute prompt synchronisation
    -------------------------------------------------------------------------- */
+
+Object.assign(cases, {
+    // Decode-pressure state machine: a decoder falling below 70% of the
+    // arrival rate accumulates lag seconds, >=90% sheds them, and windows
+    // with under 15 received frames are unmeasurable (static screens and
+    // paused publishers must not look like decode pressure).
+    'decode-lag-state-machine'() {
+        const { fn: update } = compileFunction('updateDecodeLag', {});
+        const { fn: decay } = compileFunction('decayDecodeLag', {});
+        assertEqual(update(0, 60, 60), 0, 'a keeping-up decoder accumulates nothing');
+        assertEqual(update(0, 40, 60), 1, 'below 70% of arrivals accumulates lag');
+        assertEqual(update(1, 40, 60), 2, 'lag accumulates per stressed tick');
+        assertEqual(update(3, 59, 60), 2, 'at 90-99% of arrivals lag sheds one tick');
+        assertEqual(update(3, 60, 60), 2, 'a fully caught-up decoder sheds lag');
+        assertEqual(update(3, 5, 3), 2, 'a low-rate window is unmeasurable and decays');
+        assertEqual(update(2, -1, 60), 3, 'a decode counter reset counts as pressure');
+        assertEqual(decay(5), 4, 'decay sheds one second');
+        assertEqual(decay(0), 0, 'decay never goes negative');
+
+        // Transport-discarded frames must NOT be charged to the decoder.
+        // `framesReceived` counts every frame the transport delivered to the
+        // jitter buffer, including frames the decoder then dropped. The ratio
+        // was computed from it directly, so a lossy link — a problem the
+        // buffers already absorb — looked exactly like a struggling decoder and
+        // fired a full session teardown (2-4s black) with the user-facing
+        // message "this device's decoder can't keep up". `framesDiscarded` is
+        // the decoder's own drops (the net of "needs resize" / "decoder
+        // failure"), so it belongs in the numerator: frames the decoder had the
+        // opportunity to show.
+        assertEqual(update(0, 40, 60, 20), 0,
+            'frames the decoder itself discarded are still delivered frames, not a shortfall');
+        assertEqual(update(0, 40, 60, 0), 1,
+            'without a discard signal the same ratio is real decode pressure');
+
+        // The old dead band was [0.70, 0.90): a decoder stuck at 83% of arrivals
+        // — a permanently stuttering picture, the exact case the hardware-path
+        // switch exists for — sat in the hold band forever and never
+        // accumulated. The band is now [0.85, 0.98).
+        assertEqual(update(0, 25, 30, 0), 1,
+            'a decoder delivering 83% of arrivals must accumulate, not sit in a dead band');
+        assertEqual(update(0, 29, 30, 0), 0,
+            'a decoder delivering 96% of arrivals is marginal and holds');
+        assertEqual(update(3, 30, 30, 0), 2, 'full delivery sheds lag');
+    },
+
+    // A decoder that cannot sustain the stream must be moved onto the
+    // hardware-decodable path: AV1 source -> live-h264 (H264 decodes in
+    // hardware everywhere), an H264 source viewed through live-av1 -> back
+    // to the native path. Guards: 60s shared cooldown, rendition readiness,
+    // no switch when already on the hardware-decodable path.
+    'decode-pressure-switching'() {
+        const ladder = {
+            av1Source: [
+                { name: 'live', ready: true, online: true, tracks: ['AV1', 'Opus'] },
+                { name: 'live-h264', ready: true, online: true, tracks: ['H264', 'Opus'] }
+            ],
+            av1SourceNoFallback: [
+                { name: 'live', ready: true, online: true, tracks: ['AV1', 'Opus'] },
+                { name: 'live-h264', ready: false, online: false, tracks: [] }
+            ],
+            h264Source: [
+                { name: 'live', ready: true, online: true, tracks: ['H264', 'Opus'] },
+                { name: 'live-av1', ready: true, online: true, tracks: ['AV1', 'Opus'] }
+            ]
+        };
+        const make = (overrides = {}) => {
+            const sandbox = {
+                isConnected: true,
+                isConnecting: false,
+                currentLatencyMode: 'balanced',
+                LATENCY_MODES: {
+                    ultra: { ms: 80, driftLimitMs: 900 },
+                    balanced: { ms: 180, driftLimitMs: 1000 },
+                    smooth: { ms: 350, driftLimitMs: 1100 }
+                },
+                rejoinDriftSec: 0,
+                decodeLagSec: 0,
+                lastFramesReceived: 0,
+                adaptiveRaiseLevelMs: 0,
+                stressRunSec: 0,
+                calmRunSec: 0,
+                bufferNoticeState: '',
+                accommodationTargetMs: 0,
+                avgPlayoutDelayMs: 200,
+              avgPlayoutDelayAt: 100000,
+                lastNetJitterMs: 10,
+                lastLossPct: 0,
+                decodeLagSec: 8,
+                lastFramesReceived: 0,
+                lastAppliedTargetMs: null,
+                jitterFloorEmaMs: 0,
+                abrBadSec: 0,
+                abrCalmSec: 0,
+                lastRenditionSwitchAt: -60000,
+                renditionPathsItems: ladder.av1Source,
+                activeStreamPath: 'live',
+                player: { paused: false },
+                document: { hidden: false },
+                performance: { now: () => 100000 },
+                RTCRtpReceiver: { getCapabilities: () => ({ codecs: [] }) },
+                chooseStreamPath() { return 'live'; },
+                console: quietConsole(),
+                reapplyBufferTargets() { return true; },
+                updateBufferHud() {},
+                addSystemMessage(text) { sandbox.messages = (sandbox.messages || []).concat(text); },
+                switchRendition(path) { sandbox.switchedTo = path; },
+                ...overrides
+            };
+            const { fn } = compileFunction('superviseAdaptiveBuffer', sandbox);
+            return { sandbox, run: fn };
+        };
+
+        // 8 lag seconds on native AV1 with live-h264 ready -> hardware path.
+        const down = make();
+        down.run();
+        assertEqual(down.sandbox.switchedTo, 'live-h264',
+            'decode pressure on native AV1 must switch to the hardware-decodable rendition');
+
+        // No ready live-h264 -> nothing to switch to.
+        const noFallback = make({ renditionPathsItems: ladder.av1SourceNoFallback });
+        noFallback.run();
+        assertEqual(noFallback.sandbox.switchedTo, undefined,
+            'without a ready hardware-decodable rendition there is nothing to switch to');
+
+        // Cooldown suppresses repeat switches.
+        const cooled = make({ lastRenditionSwitchAt: 99000 });
+        cooled.run();
+        assertEqual(cooled.sandbox.switchedTo, undefined,
+            'a decode-pressure switch within the 60s cooldown must be suppressed');
+
+        // Below the 8-second threshold: no switch.
+        const short = make({ decodeLagSec: 7 });
+        short.run();
+        assertEqual(short.sandbox.switchedTo, undefined,
+            'fewer than 8 lag seconds must not switch');
+
+        // H264 source viewed through live-av1 under decode pressure -> 'live'.
+        const h264Up = make({
+            renditionPathsItems: ladder.h264Source,
+            activeStreamPath: 'live-av1'
+        });
+        h264Up.run();
+        assertEqual(h264Up.sandbox.switchedTo, 'live',
+            'decode pressure on the AV1 rendition must return to the native H264 path');
+
+        // An RTMP/SRT (AAC) source has no sound on the native path: the
+        // decode-pressure recovery must prefer the audio-rescue rendition
+        // (full quality + Opus audio) over the muted native path.
+        const h264AacSource = [
+            { name: 'live', ready: true, online: true, tracks: ['MPEG-4 Audio', 'H264'] },
+            { name: 'live-av1', ready: true, online: true, tracks: ['AV1', 'Opus'] },
+            { name: 'live-h264', ready: true, online: true, tracks: ['H264', 'Opus'] }
+        ];
+        const aacRescue = make({
+            renditionPathsItems: h264AacSource,
+            activeStreamPath: 'live-av1'
+        });
+        aacRescue.run();
+        assertEqual(aacRescue.sandbox.switchedTo, 'live-h264',
+            'decode pressure on an AAC source must recover onto the full-sound rendition, not the muted native path');
+        // Rescue rendition not ready yet: hold position instead of muting.
+        const h264AacNoRescue = [
+            { name: 'live', ready: true, online: true, tracks: ['MPEG-4 Audio', 'H264'] },
+            { name: 'live-av1', ready: true, online: true, tracks: ['AV1', 'Opus'] }
+        ];
+        const aacHold = make({
+            renditionPathsItems: h264AacNoRescue,
+            activeStreamPath: 'live-av1'
+        });
+        aacHold.run();
+        assertEqual(aacHold.sandbox.switchedTo, undefined,
+            'without a ready full-sound rendition the viewer must stay put, not land on the muted path');
+        // Already on the hardware-decodable path: nothing to do.
+        const already = make({
+            renditionPathsItems: ladder.h264Source,
+            activeStreamPath: 'live'
+        });
+        already.run();
+        assertEqual(already.sandbox.switchedTo, undefined,
+            'a viewer already on the native H264 path must not switch');
+
+        // An H265 source + a browser WITHOUT H265 receive support sits on the
+        // AV1 rendition (chooseStreamPath routed it there for exactly that
+        // reason): decode pressure must NOT "recover" it onto the undecodable
+        // native path — that would trap it in a switch/limbo-rejoin loop.
+        const h265Source = [
+            { name: 'live', ready: true, online: true, tracks: ['H265', 'Opus'] },
+            { name: 'live-av1', ready: true, online: true, tracks: ['AV1', 'Opus'] }
+        ];
+        const h265NoDecode = make({
+            renditionPathsItems: h265Source,
+            activeStreamPath: 'live-av1',
+            browserSupportsH265() { return false; }
+        });
+        h265NoDecode.run();
+        assertEqual(h265NoDecode.sandbox.switchedTo, undefined,
+            'a browser without H265 decode must keep the AV1 rendition under decode pressure');
+
+        // An H265-CAPABLE browser may take the native path back.
+        const h265Capable = make({
+            renditionPathsItems: h265Source,
+            activeStreamPath: 'live-av1',
+            browserSupportsH265() { return true; }
+        });
+        h265Capable.run();
+        assertEqual(h265Capable.sandbox.switchedTo, 'live',
+            'an H265-capable browser returns to the native path under decode pressure');
+    },
+});
 
 Object.assign(cases, {
     // Unmuting (or muting) through the mute button, volume slider, wheel or

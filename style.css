@@ -77,8 +77,14 @@ html, body {
     border-radius: 50%;
     filter: blur(100px);
     opacity: 0.25;
-    animation: drift 20s ease-in-out infinite alternate;
-    will-change: transform;
+    /* STATIC on purpose. These orbs sit behind .app-header, .sidebar-section
+       and .reaction-section, all three of which carry a backdrop-filter
+       (blur(24px) / blur(24px) / blur(12px)). A backdrop-filter re-samples and
+       re-blurs whenever the backdrop changes, so while the orbs drifted, those
+       three surfaces recomputed ~half a million pixels of Gaussian blur EVERY
+       FRAME — on the same GPU compositing the decoded video, for the whole
+       session. Frozen orbs let the compositor cache the blur result. */
+    animation: none;
     transform: translate3d(0, 0, 0);
 }
 
@@ -86,15 +92,14 @@ html, body {
     width: 600px; height: 600px;
     background: radial-gradient(circle, var(--primary) 0%, transparent 70%);
     top: -15%; left: -10%;
-    animation-duration: 25s;
+    transform: translate3d(30px, 20px, 0);
 }
 
 .ambient-orb-2 {
     width: 500px; height: 500px;
     background: radial-gradient(circle, var(--cyan) 0%, transparent 70%);
     bottom: -20%; right: -8%;
-    animation-duration: 30s;
-    animation-delay: -5s;
+    transform: translate3d(-25px, -30px, 0);
 }
 
 .ambient-orb-3 {
@@ -102,18 +107,46 @@ html, body {
     background: radial-gradient(circle, var(--magenta) 0%, transparent 70%);
     top: 50%; left: 50%;
     transform: translate3d(-50%, -50%, 0);
-    animation-duration: 22s;
-    animation-delay: -10s;
     opacity: 0.12;
 }
 
-.noise-overlay {
-    position: fixed; inset: 0;
-    z-index: 1; pointer-events: none;
-    opacity: 0.035;
-    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+/* The film grain is NOT a layer any more. It used to be this fixed, inset:0,
+   z-index:1 box — a full-viewport texture layer the compositor had to carry
+   over the whole ambient stack, and which sat above the (entirely
+   decorative) blurred orbs, so it was composited every frame for a 0.035
+   opacity texture nobody can see behind the player. It was NOT painted over
+   the video: .noise-overlay is z-index 1 and .app-container is z-index 2, so
+   it was underneath the app entirely. Either way the cost was real and the
+   benefit was not. The identical data-URI is now painted once on the body
+   background, where it composites into a static layer. index.html still ships
+   this element (#noise-overlay) and is not ours to edit, so the rule stays as
+   an explicit display:none: the markup keeps validating, the layer is gone. Do
+   not give this element a background-image back. */
+.noise-overlay { display: none; }
+
+/* The relocated grain, painted once into the BODY background instead of into a
+   fixed, inset:0 overlay element. A background-image on the root paints into
+   the canvas and is composited as part of the page's static layer — there is no
+   separate full-viewport element to carry, promote or blend per frame.
+
+   THE 0.035 ALPHA LIVES INSIDE THE SVG, AND IT MUST STAY THERE. The old overlay
+   element carried `opacity: 0.035`, but a background-image cannot be alpha'd
+   from CSS at all — there is no background-opacity property. Relocating the
+   identical data-URI without carrying the alpha forward therefore painted the
+   grain at FULL strength, and the whole page turned into visible TV static
+   (see the 0.035 attribute on the rect below; SVG applies opacity AFTER the
+   filter, so it scales the finished turbulence exactly as the element's
+   opacity:0.035 used to). Any future edit of this data-URI must keep it. */
+body {
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");
     background-repeat: repeat;
     background-size: 200px;
+    /* No background-attachment: fixed. It is a no-op today (html/body's
+       background is colour-only, so this background propagates to the canvas,
+       and canvas backgrounds never scroll) but it becomes a real per-scroll
+       repaint cost the moment propagation stops applying — e.g. if anyone gives
+       html a background-image, or at <=992px where the document scrolls. It
+       bought nothing, so it is gone rather than left as a trap. */
 }
 
 /* Low-Power / Turbo Performance Mode */
@@ -122,8 +155,14 @@ body.perf-mode .ambient-orb {
     opacity: 0.1;
     filter: blur(40px);
 }
-body.perf-mode .noise-overlay {
-    display: none;
+/* Eco Mode drops the grain too. This used to be `body.perf-mode .noise-overlay
+   { display: none }`, but the grain now lives on the BODY background-image, so
+   that selector was dead on arrival: the overlay is already display:none
+   unconditionally, and hiding an element cannot unset a background on an
+   ancestor. Left unpatched, Eco Mode quietly stopped removing the one texture
+   this mode is meant to shed. Unset the image on the element that owns it. */
+body.perf-mode {
+    background-image: none;
 }
 body.perf-mode .video-container {
     animation: none;
@@ -132,10 +171,11 @@ body.perf-mode .video-container {
 /* Eco Mode also drops backdrop blur: the telemetry HUD, volume toast and
    action ripple sit ON TOP of the video, so their backdrop-filter re-runs on
    every decoded frame — exactly the GPU time Eco Mode exists to give back to
-   the decoder. Header/sidebar/reaction blurs sample the (already frozen)
-   ambient layer; dropping them guarantees the compositor never re-samples a
-   blur while the stream plays. Solid backgrounds stay, so nothing becomes
-   unreadable. */
+   the decoder. The over-video blurs (unmute button, ripple, toast, telemetry
+   HUD) are gone outright now, so Eco Mode only has to strip the three larger
+   ones (header/sidebar/reaction). Those sample the ambient layer, which is
+   frozen by default, so dropping them is a free extra margin rather than a
+   rescue. */
 body.perf-mode .app-header,
 body.perf-mode .sidebar-section,
 body.perf-mode .reaction-section,
@@ -281,6 +321,19 @@ body.perf-mode .action-feedback {
 .app-container.theatre-mode .player-section {
     max-width: 100%;
     padding: 12px 24px;
+    /* One scrollport, not two. .main-content is the theatre scroller (column
+       flex, overflow-y:auto) and the base .player-section is its own
+       overflow-y:auto box, so the player column is a height-constrained box
+       that scrolls itself AND is scrolled by its ancestor: a phantom inner
+       scrollbar on desktop, and on touch a nested compositor that has to be
+       dragged while video is decoding. Playback of the whole theatre column
+       below is unaffected — the container's overflow propagates to
+       .main-content's scrollable area, so the page moves as one surface.
+       Nothing in this column is position:sticky (the control bar is
+       position:absolute inside the self-contained .video-container, which is
+       position:relative with overflow:hidden), so nothing loses a pin. This
+       mirrors the max-width:992px rule further down. */
+    overflow: visible;
 }
 .app-container.theatre-mode .sidebar-section {
     width: 100%;
@@ -306,12 +359,20 @@ body.perf-mode .action-feedback {
         0 0 0 1px rgba(0,0,0,0.5),
         0 8px 32px rgba(0, 0, 0, 0.6),
         0 0 20px var(--primary-glow);
-    /* Breathe only the 1px border. Animating box-shadow here (previous border-breathe)
-       forced a full repaint of this video-sized layer on every animation frame and
-       competed with 4K60 decode for GPU time. */
-    animation: border-breathe 6s ease-in-out infinite alternate;
-    will-change: transform;
-    transform: translate3d(0, 0, 0);
+    /* NOTHING on this element may animate, and it must not carry will-change
+       or its own transform. This box IS the video surface, so every animated
+       property here costs a full-video-sized repaint per frame, forever:
+
+       - `border-color` (the old `border-breathe`) is a PAINT property, so
+         dropping box-shadow out of the keyframes did NOT make it free — the
+         animation still invalidated paint on a 16:9 layer every single frame
+         for the whole session, competing with decode for GPU time.
+       - `will-change: transform` + `transform: translate3d(...)` promoted
+         this element to its own composited layer, which is the documented way
+         to pull a <video> off the low-latency hardware-overlay path.
+
+       `contain: layout paint` is kept: it bounds style/layout invalidation to
+       this box without forcing a layer of its own. */
     contain: layout paint;
     cursor: pointer;
 }
@@ -329,21 +390,27 @@ body.perf-mode .action-feedback {
     transform: translate3d(-50%, -50%, 0) scale(0.5);
     width: 72px; height: 72px;
     background: rgba(8, 6, 16, 0.75);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
     border: 1px solid var(--border-glow);
     border-radius: 50%;
     display: flex; justify-content: center; align-items: center;
     color: var(--cyan);
     font-size: 26px;
     opacity: 0;
+    /* visibility, not just opacity: an opacity:0 element still participates in
+       the render tree, which is what keeps this from being free. These two
+       overlays are idle for the entire session between gestures, and both sit
+       directly on top of live video, so the idle state keeps neither a render
+       surface nor a per-frame sample of the video texture. */
+    visibility: hidden;
     pointer-events: none;
     z-index: 8;
     box-shadow: 0 0 24px var(--cyan-glow);
-    transition: opacity 0.2s, transform 0.2s;
+    transition: opacity 0.2s, transform 0.2s, visibility 0s linear 0.2s;
 }
 
 .action-feedback.active {
+    visibility: visible;
+    transition: opacity 0.2s, transform 0.2s, visibility 0s;
     animation: action-ripple 0.5s ease-out forwards;
 }
 
@@ -353,8 +420,6 @@ body.perf-mode .action-feedback {
     top: 24px; left: 50%;
     transform: translate3d(-50%, 0, 0);
     background: rgba(8, 6, 16, 0.85);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
     border: 1px solid var(--border-glow);
     border-radius: var(--radius-full);
     padding: 8px 18px;
@@ -366,10 +431,12 @@ body.perf-mode .action-feedback {
     pointer-events: none;
     z-index: 8;
     opacity: 0;
+    visibility: hidden;   /* see .action-feedback — keeps the idle overlay out of the render tree */
     box-shadow: 0 4px 20px rgba(0,0,0,0.5);
 }
 
 .volume-toast.active {
+    visibility: visible;
     animation: toast-fade 0.8s ease-out forwards;
 }
 
@@ -395,6 +462,17 @@ body.perf-mode .action-feedback {
 .unmute-overlay {
     background: transparent;
     pointer-events: none;
+    /* Hidden by DEFAULT, exactly like .player-loader above. The grouped rule
+       sets display:flex for all three overlays, and the markup ships the
+       element with no inline display — so on the very first paint, before the
+       status poll has answered, the unmute prompt was laid out on top of the
+       offline banner (both are inset:0 and both centre their content) and
+       "Click to unmute" landed straight across "Stream is Offline". Nothing in
+       the page can show this overlay before a stream is actually live: only
+       app.js shows it, and only from the 'live' branch of updateUIState() or
+       the muted-autoplay fallbacks. Inlining display there already overrides
+       this rule, so the default can simply be the safe one. */
+    display: none;
 }
 
 /* Spinner */
@@ -507,10 +585,13 @@ body.perf-mode .action-feedback {
 /* Unmute Button — Clean video platform aesthetic (Twitch / YouTube style) */
 .unmute-btn {
     pointer-events: auto;
-    background: rgba(15, 17, 26, 0.88);
+    background: rgba(15, 17, 26, 0.92);
     border: 1px solid rgba(255, 255, 255, 0.16);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
+    /* No backdrop-filter here. This button sits directly on top of live video
+       and the overlay is shown for the WHOLE session to every viewer who has
+       not clicked yet — autoplay is only permitted muted, so this is the
+       default state. A permanent backdrop-filter over a video texture forces a
+       render surface and a per-frame sample of that texture for nothing. */
     color: #ffffff;
     padding: 10px 22px;
     border-radius: var(--radius-full);
@@ -552,9 +633,19 @@ body.perf-mode .action-feedback {
 .telemetry-hud {
     position: absolute; top: 16px; left: 16px;
     width: 310px;
+    /* NO backdrop-filter here, and never put one back for the looks. This panel
+       is pinned inside the top-left corner of the video box, so its backdrop IS
+       the live video texture: a 20px Gaussian blur re-samples and re-blurs that
+       texture on every decoded frame — 2.07M px per 1080p frame, ~124M px/s at
+       60fps, plus a blur surface allocated and freed every frame — inside the
+       same compositor that is trying to present the next frame. The HUD stays
+       open for the whole session whenever stats are on, so unlike the
+       hover-only overlays this was never a burst cost; it was a standing one.
+       The 0.92 alpha below is the same one the unmute button and the player
+       loader use, and it is already opaque enough on its own: composited over
+       pure white it lands at ~#14121a, which leaves --text-primary (#f0eef6)
+       at roughly 15:1 contrast without blurring a single pixel. */
     background: rgba(8, 6, 16, 0.92);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
     border: 1px solid var(--border-glow);
     border-radius: var(--radius-md);
     padding: 14px 16px;
@@ -610,9 +701,25 @@ body.perf-mode .action-feedback {
 }
 
 .hud-audio-level {
+    /* Full track width, always — `width` is a layout property, so expressing
+       the level as a width (with the 0.1s transition that used to sit here)
+       relaid this bar's box on every ~12Hz meter tick and relaid it six more
+       times per tick while the transition interpolated, all on the main thread
+       that has to be handing frames to the video decoder. scaleX resamples
+       pixels on the compositor and never touches geometry.
+       The --level fallback is 1, deliberately, not 0: app.js still writes
+       style.width today and index.html ships an inline width:0%, and an inline
+       style outranks any stylesheet width — a 0 fallback would blank the meter
+       the moment this rule applied, long before the JS side moves over. As
+       written both paths are correct at once: a style.width write (40%) shows a
+       40% bar unscaled, and once app.js writes --level instead, the same
+       declaration animates the scale with no further CSS change. */
+    width: 100%;
     height: 100%;
+    transform: scaleX(var(--level, 1));
+    transform-origin: left center;
     background: linear-gradient(90deg, var(--green), var(--cyan), var(--amber));
-    transition: width 0.1s linear;
+    transition: transform 0.1s linear;
 }
 
 .hud-grid {
@@ -671,13 +778,26 @@ body.perf-mode .action-feedback {
     padding: 24px 16px 12px;
     z-index: 6;
     opacity: 0;
+    /* visibility, not only opacity — the same reasoning as .action-feedback and
+       .volume-toast. The stream is what the viewer came for, and this bar is
+       idle for most of every second of it: opacity:0 leaves the gradient as a
+       composited layer over live video, keeps the buttons, the slider and the
+       LIVE label in the render tree, and still invalidates on every cursor
+       move across the container. visibility takes the whole subtree out. */
+    visibility: hidden;
     pointer-events: none;
-    transition: opacity var(--speed-fast) var(--ease);
+    /* visibility is a discrete property, not an interpolable one, so the hide is
+       deferred to the end of the existing 0.18s opacity fade and every
+       show-state rule below resets that delay to 0s. The fade survives in both
+       directions; between them the bar costs nothing. */
+    transition: opacity var(--speed-fast) var(--ease), visibility 0s linear var(--speed-fast);
 }
 
 .video-container:hover .player-controls,
 .video-container.controls-active .player-controls {
     opacity: 1;
+    visibility: visible;
+    transition: opacity var(--speed-fast) var(--ease), visibility 0s;
     pointer-events: auto;
 }
 
@@ -687,12 +807,15 @@ body.perf-mode .action-feedback {
 .video-container:fullscreen .player-controls,
 .video-container:-webkit-full-screen .player-controls {
     opacity: 0;
+    visibility: hidden;
     pointer-events: none;
 }
 
 .video-container:fullscreen.controls-active .player-controls,
 .video-container:-webkit-full-screen.controls-active .player-controls {
     opacity: 1;
+    visibility: visible;
+    transition: opacity var(--speed-fast) var(--ease), visibility 0s;
     pointer-events: auto;
 }
 
@@ -889,6 +1012,11 @@ body.perf-mode .action-feedback {
     -webkit-user-select: none;
     animation: btn-burst-fly 1.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     filter: drop-shadow(0 4px 12px rgba(0,0,0,0.6));
+    /* Scoped, not permanent: this element is created per reaction, animates
+       immediately, and is removed with the burst 1.8s later, so the promotion
+       lives and dies inside one gesture. A will-change that is never removed
+       instead holds a compositor surface and its video memory for the rest of
+       the session. */
     will-change: transform, opacity;
 }
 
@@ -900,7 +1028,10 @@ body.perf-mode .action-feedback {
     pointer-events: none;
     z-index: 50;
     animation: fly-up 2.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;
-    filter: drop-shadow(0 4px 12px rgba(0,0,0,0.7));
+    /* No drop-shadow: a `filter` on a promoted layer forces its own render
+       pass, and these float over live video. The emoji glyph alone is legible
+       against any content. will-change keeps the transform on the compositor
+       so the flight itself costs no layout. */
     will-change: transform, opacity;
     user-select: none;
     -webkit-user-select: none;
@@ -1401,16 +1532,9 @@ kbd {
     to { opacity: 1; transform: translate3d(0, 0, 0); }
 }
 
-@keyframes border-breathe {
-    /* Border color only — see .video-container note on why box-shadow must not animate here */
-    0% { border-color: rgba(139, 92, 246, 0.2); }
-    100% { border-color: rgba(34, 211, 238, 0.2); }
-}
-
-@keyframes drift {
-    0%   { transform: translate3d(0, 0, 0) scale(1); }
-    100% { transform: translate3d(40px, -30px, 0) scale(1.1); }
-}
+/* `border-breathe` and `drift` were removed: both animated continuously for the
+   whole session on the video surface and on the backdrop sampled by three
+   backdrop-filter layers. See .video-container and .ambient-orb. */
 
 @keyframes action-ripple {
     0% { opacity: 0; transform: translate3d(-50%, -50%, 0) scale(0.6); }
@@ -1495,7 +1619,11 @@ kbd {
    :focus-visible on mouse clicks to range inputs (the volume slider), so an
    unblurred slider would otherwise keep the bar painted forever regardless
    of what the JS does — visible only when Alt+Tab re-evaluated focus. */
-.video-container:not(:fullscreen):not(:-webkit-full-screen):has(:focus-visible) .player-controls { opacity: 1; pointer-events: auto; }
+.video-container:not(:fullscreen):not(:-webkit-full-screen):has(:focus-visible) .player-controls {
+    opacity: 1; visibility: visible;
+    transition: opacity var(--speed-fast) var(--ease), visibility 0s;
+    pointer-events: auto;
+}
 
 button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
     outline: 2px solid var(--cyan);
@@ -1504,7 +1632,14 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 }
 
 @media (hover: none) {
-    .player-controls { opacity: 1; pointer-events: auto; }
+    /* Touch has no hover to reveal the bar, so it is always shown — and it must
+       be shown with visibility too, or the bar leaves the render tree the
+       moment this media query stops matching (rotating back to a mouse). */
+    .player-controls {
+        opacity: 1; visibility: visible;
+        transition: opacity var(--speed-fast) var(--ease), visibility 0s;
+        pointer-events: auto;
+    }
 }
 
 @media (max-width: 992px) {

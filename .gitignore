@@ -1,30 +1,20 @@
-# Local credentials and generated configuration
-.env
-.env.*
-!.env.example
+# Machine-local secrets — never commit
 secrets.local.env
-cloudflared_config.yml
-*.key
-*.pem
-*.p12
 *.crt
+*.key
+cloudflared_config.yml
 
-# Runtime downloads and generated artifacts
-/cloudflared_win/
-/mediamtx_win/*
-!/mediamtx_win/LICENSE
-!/mediamtx_win/mediamtx.exe
-*.zip
+# Heavy local binaries (re-downloadable; see README one-time setup)
+ffmpeg_win/
+mediamtx_win.zip
+
+# Runtime & test artifacts
+__pycache__/
 *.log
 *.err
-test_out.txt
-_*.txt
-__pycache__/
-*.py[cod]
-node_modules/
-coverage/
-
-# Legacy deployment material and OS files
-/legacy_vps/
-.DS_Store
-Thumbs.db
+_e2e_*
+# Scratch dirs from manual audits — includes a real Chrome profile (Login Data,
+# Cookies, History, Preferences). Never commit.
+_audit_tmp/
+JS_CHECKS_REBUILD_NOTE.md
+repo_checkout/
