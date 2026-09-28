@@ -857,7 +857,7 @@ Object.assign(cases, {
     // table the button silently stops changing anything.
     'latency-mode-cycle-matches-mode-table'() {
         const modes = evaluateConst('LATENCY_MODES');
-        assertEqual(Object.keys(modes), ['ultra', 'balanced', 'smooth'], 'latency mode table keys');
+        assertEqual(Object.keys(modes), ['ultra', 'balanced', 'smooth', 'cinema'], 'latency mode table keys');
         for (const [key, cfg] of Object.entries(modes)) {
             assert(Number.isFinite(cfg.ms) && cfg.ms > 0, `${key} must declare a positive ms value`);
             assertEqual(cfg.s, cfg.ms / 1000, `${key} seconds must match its ms value`);

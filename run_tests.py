@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from http.client import HTTPConnection
+import http.client as http_exc
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
@@ -213,6 +214,106 @@ class StubMediaMTX:
 
     def clear(self):
         del self.requests[:]
+
+
+class _TruncatingUpstream:
+    """Node upstream that answers with headers, starts a body, then dies.
+
+    This is the only way to reproduce a MediaMTX restart landing mid-response.
+
+    It has to be a NODE server. With a Python upstream the socket failure also
+    surfaces on the proxy's request object, so `proxyReq.on('error')` handles it
+    and the response is cut whether or not the response stream is listened to —
+    the case then cannot tell the two apart and passes against the broken code.
+    A Node upstream destroying its own socket reproduces the real condition,
+    where the request side has already completed successfully and only a handler
+    on the RESPONSE stream can notice anything went wrong.
+    """
+
+    def __init__(self):
+        self.process = None
+        self.port = None
+
+    def start(self):
+        node = shutil.which("node")
+        if node is None:
+            raise unittest.SkipTest("Node.js is required for this case")
+        self.process = subprocess.Popen(
+            [node, str(ROOT / "truncating_upstream.js"), "0"],
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        # The fixture prints its bound port once it is listening.
+        line = self.process.stdout.readline().strip()
+        if not line.isdigit():
+            output = ""
+            if self.process.poll() is not None:
+                output = self.process.stdout.read()
+            self.stop()
+            raise AssertionError("truncating upstream never reported a port: " + output)
+        self.port = int(line)
+        return self
+
+    def stop(self):
+        if self.process is not None and self.process.poll() is None:
+            self.process.kill()
+            try:
+                self.process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+        self.process = None
+
+
+def truncated_request_outcome(port, path, timeout=5):
+    """GET `path` over a RAW socket and report how (or whether) it settled.
+
+    A raw socket is deliberate. `http.client` sits on a buffered reader, so a
+    connection that is closed mid-body and one that simply stalls look alike
+    from Python and the distinction — which is the entire point — is lost. Here
+    the only thing that can end the read is the peer actually closing the
+    connection, so:
+
+    * EOF/RST well before `timeout` = the proxy noticed and cut it (the fix);
+    * still blocked at `timeout` = nobody noticed, and the player's 5s status
+      poll stalls on a request that will never settle (the pre-fix failure).
+    """
+    outcome = {"settled": False, "how": None, "bytes": 0, "elapsed": None,
+               "prompt": False, "status_line": None}
+    started = time.time()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n"
+            .format(path, port).encode("ascii")
+        )
+        # Read until EOF, an RST, or the timeout. A short first chunk tells us
+        # the response started, which is the precondition for the whole case.
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            except ConnectionResetError:
+                outcome.update(settled=True, how="reset")
+                break
+            if not chunk:
+                outcome.update(settled=True, how="eof")
+                break
+            if outcome["status_line"] is None:
+                outcome["status_line"] = chunk.split(b"\r\n", 1)[0].decode("latin-1")
+            outcome["bytes"] += len(chunk)
+    finally:
+        elapsed = round(time.time() - started, 3)
+        outcome["elapsed"] = elapsed
+        outcome["prompt"] = elapsed < timeout * 0.5
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return outcome
 
 
 class LaptopHostChecks(unittest.TestCase):
@@ -851,6 +952,113 @@ class MediaMtxUnavailableChecks(_SiteUnderTest):
         self.assertEqual(headers.get("Access-Control-Allow-Origin"), "*")
 
 
+class ProxyUpstreamFailureChecks(_SiteUnderTest):
+    """The proxy's failure paths, exercised against upstreams that really fail.
+
+    Most proxy bugs are invisible to a stub that always answers: the request
+    side completes normally and `pipe()` does the rest. These cases drive the
+    failure modes that only appear when the upstream dies mid-flight.
+    """
+
+    @staticmethod
+    def _strip_comments(text):
+        """Block and line comments are removed so a check cannot match the
+        explanation of a fix instead of the fix."""
+        without_block = re.sub(r"(?:^|(?<=\s))[ \t]*/\*.*?\*/", "", text,
+                               flags=re.DOTALL | re.MULTILINE)
+        return re.sub(r"(?m)^[ \t]*//.*$", "", without_block)
+
+    def test_mid_response_upstream_reset_does_not_hang_the_client(self):
+        """A MediaMTX restart or crash while a response body is in flight.
+
+        Only `proxyReq` had an error handler. Once MediaMTX has sent response
+        headers the REQUEST side is already complete, so the failure is reported
+        on `proxyRes` — and `proxyRes.pipe(res)` does not forward errors to the
+        destination. With nothing listening, `res` was never ended and never
+        destroyed: the client's fetch() neither resolved nor rejected, so the
+        player's 5s status poll hung forever on a request that would never
+        settle, and the response, the upstream message and the client socket
+        were retained for the lifetime of the process. The 30s
+        `proxyReq.setTimeout` does not help — the socket is already gone, so the
+        timer is cleared without ever firing.
+
+        Verified against the real server: without the handler the client HUNG for
+        the full timeout; with it, the client is told immediately."""
+        truncating = _TruncatingUpstream().start()
+        self._stubs.append(truncating)
+        self.start_site(api_routes=None, extra_env={
+            "MEDIAMTX_API_PORT": str(truncating.port),
+        })
+        outcome = truncated_request_outcome(self.port, "/stream-api/v3/paths/list")
+        self.assertIsNotNone(outcome["status_line"],
+                             "the proxy never sent response headers (outcome={!r})"
+                             .format(outcome))
+        self.assertTrue(outcome["status_line"].startswith("HTTP/1.1 200"),
+                        "the test needs the response to START before it is cut "
+                        "(outcome={!r})".format(outcome))
+        self.assertTrue(
+            outcome["settled"],
+            "a truncated upstream response must close the client connection, not "
+            "leave it hanging (outcome={!r})".format(outcome),
+        )
+        self.assertTrue(
+            outcome["prompt"],
+            "the client waited the full {0}s: nothing noticed the upstream dying, so "
+            "the player's status poll stalls on a request that never settles "
+            "(outcome={1!r})".format(outcome["elapsed"], outcome),
+        )
+
+    def test_upstream_that_never_answers_times_out_to_502(self):
+        """The pre-header path must still answer 502 rather than hang."""
+        self.start_site()
+        status, _, body = http_request(self.port, "GET", "/stream-api/v3/paths/list")
+        self.assertEqual(status, 502)
+        self.assertIn(b"MediaMTX", body)
+
+    def test_a_non_fatal_accept_error_does_not_kill_every_viewers_stream(self):
+        """`server.on('error')` exited the process for EVERY error, not just
+        EADDRINUSE — which contradicts the long-lived-host policy stated at the
+        uncaughtException handler ("a single stray failure would otherwise kill
+        the whole process mid-broadcast").
+
+        An `http.Server` also emits 'error' when libuv reports an ACCEPT-side
+        failure: EMFILE / ENFILE / ECONNABORTED on Windows, all routine under
+        connection pressure. `process.exit()` is a deliberate call, so it
+        bypasses the uncaughtException net entirely. One accept failure from a
+        burst of viewer connections therefore killed the host instantly, dropping
+        every viewer's WHEP session, chat stream and status probe at once, when
+        the correct response was to log it and keep accepting.
+
+        Genuinely fatal listen failures (EADDRINUSE and friends) must still exit
+        so the launcher can report them — otherwise a second host comes up
+        silently and the operator has no idea why nothing is being served."""
+        code = self._strip_comments(read_text(SERVER_PATH))
+        body = re.search(
+            r"server\.on\('error',\s*\(error\)\s*=>\s*\{(?P<inner>.*?)\n\}\);",
+            code, re.DOTALL,
+        )
+        self.assertIsNotNone(body, "the server error handler was not found")
+        inner = body.group("inner")
+        self.assertIn("EADDRINUSE", inner,
+                      "a second launcher must still fail with a readable reason")
+        # Split at the EADDRINUSE branch: everything after it is the "any other
+        # error" path, which must not be unconditionally fatal.
+        tail = inner[inner.index("EADDRINUSE"):]
+        tail = tail[tail.index("return;") + len("return;"):] if "return;" in tail else tail
+        fatal_exit = tail.find("process.exit(")
+        self.assertNotEqual(
+            fatal_exit, 0,
+            "every non-EADDRINUSE server error exited the process, so one routine "
+            "accept-side failure (EMFILE/ENFILE/ECONNABORTED) kills the host and "
+            "every viewer's stream with it",
+        )
+        if fatal_exit != -1:
+            window = tail[max(0, fatal_exit - 400): fatal_exit]
+            self.assertIn("fatal", window,
+                          "a surviving process.exit() must be guarded by an explicit "
+                          "fatal-error list, not reached unconditionally")
+
+
 class StaticServerHardeningChecks(_SiteUnderTest):
     """The allowlist map is the only thing standing between the page and the repo."""
 
@@ -1259,17 +1467,21 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertRegex(app, r"live \$\{Math\.round\(avgPlayoutDelayMs\)\}",
                          "HUD buffer item must print the measured live delay when it diverges")
 
-    def test_latency_mode_defaults_to_balanced_and_persists(self):
-        # 'smooth' (350ms) as the default left every fresh viewer 170ms behind
-        # the live edge even on a clean network; 'balanced' is the new floor
-        # and a manual choice must survive reloads.
+    def test_latency_mode_defaults_to_cinema_and_persists(self):
+        # 'balanced' (180ms) as the default kept every fresh viewer's jitter
+        # buffer oscillating around the fixed point on bursty arrivals —
+        # overshoot drained back at ~150ms/s of catch-up ("a few ms fast"),
+        # under-run held a frame ("a few ms slow") — the exact micro-stutter
+        # receivers reported with 0% loss. For a movie broadcast latency is
+        # welcome, so 'cinema' (1s) is the default; a manual choice must
+        # survive reloads.
         app = read_text(APP_PATH)
         html = read_text(HTML_PATH)
-        self.assertIn("let currentLatencyMode = 'balanced';", app,
-                      "balanced (180ms) must be the default playout target")
+        self.assertIn("let currentLatencyMode = 'cinema';", app,
+                      "cinema (1s) must be the default playout target")
         self.assertIn("rydius_latency_mode", app,
                       "the latency choice must persist across visits")
-        self.assertIn('title="Latency Buffer: Balanced (180ms)"', html,
+        self.assertIn('title="Latency Buffer: Cinema (1s)"', html,
                       "the latency button must boot in the default mode's state")
 
     def test_stats_loop_resume_keeps_measurement_baselines(self):
@@ -1522,6 +1734,127 @@ class ChatFeatureChecks(_SiteUnderTest):
         )
         self.assertEqual(status, 429)
         self.assertIn(b"slow down", body)
+
+    def test_concurrent_requests_cannot_blow_past_the_chat_limit(self):
+        """The reservation must happen SYNCHRONOUSLY, before the body is read.
+
+        An earlier version of the fix moved the charge into the post-validation
+        callback to stop rejected requests spending quota. That left the
+        pre-check and the charge decoupled by an await: every request in a
+        burst reads the same (empty) window, all pass the check, and all are
+        accepted — so the limit bounded nothing and one parallel batch could
+        flood the room.
+
+        The reservation is therefore synchronous and a rejection REFUNDS it, so
+        both properties hold at once."""
+        self.start_site()
+        from concurrent.futures import ThreadPoolExecutor
+
+        def post(_):
+            return http_request(
+                self.port, "POST", "/stream-api/chat/messages",
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"text": "burst", "author": "A"}),
+            )[0]
+
+        with ThreadPoolExecutor(max_workers=24) as pool:
+            codes = list(pool.map(post, range(24)))
+        accepted = codes.count(200)
+        self.assertLessEqual(
+            accepted, 5,
+            "24 concurrent valid messages were accepted in one burst; the per-IP "
+            "limit (5 per 2s) must be reserved synchronously or it bounds "
+            "nothing (codes={})".format(sorted(codes)),
+        )
+        self.assertIn(429, codes, "the limit must actually engage under concurrency")
+
+    def test_rejected_requests_do_not_spend_the_senders_rate_limit_budget(self):
+        """Rate-limit stamps were recorded BEFORE the body was parsed and
+        validated, so a request that was then answered 400 (malformed JSON,
+        empty text, oversize body) had still consumed quota. A client whose
+        first five attempts were all rejected was 429'd on its sixth VALID
+        message — it could be silenced by making it send bad requests.
+
+        The charge now happens on the acceptance path, so only messages that
+        are actually delivered cost the sender anything."""
+        self.start_site()
+        def post(payload, raw=None):
+            body = raw if raw is not None else json.dumps(payload)
+            return http_request(
+                self.port, "POST", "/stream-api/chat/messages",
+                headers={"Content-Type": "application/json"}, body=body)[0]
+
+        # Five invalid attempts, all rejected.
+        for _ in range(5):
+            self.assertEqual(post(None, raw="{not json"), 400)
+            self.assertEqual(post({"text": "   "}), 400)
+
+        # A valid message must still be accepted on the sixth attempt.
+        self.assertEqual(post({"text": "still allowed", "author": "A"}), 200,
+                         "rejected requests spent the sender's quota, so a valid "
+                         "message after 5 rejections was throttled")
+
+    def test_rejected_reactions_do_not_spend_the_global_reaction_budget(self):
+        """Same ordering error on the reaction path, and it also charged the
+        room-wide global budget. An invalid emoji is answered 400 and never
+        broadcast, so it must not count against the cap that exists to bound
+        the on-screen compositing cost for everyone."""
+        self.start_site()
+        cap = 25
+        # Spend the entire global budget with VALID reactions, one IP each so
+        # the per-IP limiter (10 per 2s) never interferes.
+        accepted = 0
+        for i in range(cap + 15):
+            status, _, _ = http_request(
+                self.port, "POST", "/stream-api/chat/reactions",
+                headers={"Content-Type": "application/json", "X-Forwarded-For": ""},
+                body=json.dumps({"emoji": "fire"}),
+            )
+            if status == 200:
+                accepted += 1
+            else:
+                self.assertEqual(status, 429)
+                break
+        self.assertLessEqual(
+            accepted, cap,
+            "the global cap must hold; accepted={} cap={}".format(accepted, cap),
+        )
+
+    def test_reaction_global_cap_holds_across_a_second_boundary(self):
+        """The cap was a FIXED window: a counter reset at each wall-clock second
+        boundary, so 25 reactions at t=999ms and 25 more at t=1001ms were both
+        accepted — 50 in a 2ms span, double the cap. The cap exists precisely
+        because that aggregate is composited as animation layers over live
+        video on every screen in the room, so the overshoot lands at the worst
+        moment.
+
+        The window is now sliding: expired stamps are dropped on every check,
+        so the invariant is 'never more than CAP accepted in any trailing 1s'.
+        This test hammers from several IPs (so the per-IP limiter cannot be
+        what rejects) and asserts the total accepted inside one second never
+        exceeds the cap."""
+        self.start_site()
+        cap = 25
+        accepted = 0
+        rejected = 0
+        # 60 attempts, tight loop, so the whole burst spans well under 1s.
+        for _ in range(60):
+            status, _, _ = http_request(
+                self.port, "POST", "/stream-api/chat/reactions",
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"emoji": "heart"}),
+            )
+            if status == 200:
+                accepted += 1
+            else:
+                rejected += 1
+        self.assertGreater(rejected, 0,
+                           "the burst should have hit the ceiling at all")
+        self.assertLessEqual(
+            accepted, cap,
+            "a fixed window let up to 2x the cap through across a second "
+            "boundary (accepted={} cap={})".format(accepted, cap),
+        )
 
     def test_chat_history_and_validation(self):
         self.start_site()
@@ -2026,13 +2359,17 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         4 spaces) is what lets this work for both app.js, whose declarations sit
         inside the DOMContentLoaded closure, and server.js, whose are top level.
         A `\\n    }` anchor would also end too early, because these functions
-        contain nested declarations."""
-        start = re.search(r"(?m)^([ \t]*)function " + re.escape(name) + r"\(", source)
+        contain nested declarations.
+
+        The optional `async` prefix is matched: `async function switchRendition`
+        is just as much a function declaration as a synchronous one, and an
+        anchor that skipped it would report the caller as missing."""
+        start = re.search(r"(?m)^([ \t]*)(?:async\s+)?function " + re.escape(name) + r"\(", source)
         if not start:
             return None
         indent = start.group(1)
         rest = source[start.end():]
-        nxt = re.search(r"(?m)^" + re.escape(indent) + r"function ", rest)
+        nxt = re.search(r"(?m)^" + re.escape(indent) + r"(?:async\s+)?function ", rest)
         return rest[: nxt.start()] if nxt else rest
 
     # -- transport ---------------------------------------------------------
@@ -2200,24 +2537,60 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertIn("returnDriftChecks", self.app)
         self.assertIn("returnDriftChecks >= 3", self.app)
 
-    def test_playout_target_is_not_pushed_to_the_audio_receiver(self):
-        """For synchronized tracks the UA SHOULD use the larger of the two
-        JitterBufferTargets for BOTH, so a video-scale target on the audio
-        receiver stretches audio instead of containing itself."""
+    def test_playout_target_is_identical_on_both_receivers(self):
+        """The playout target must be set on BOTH receivers, at the SAME value.
+
+        The two tracks play out of one <video> element and Chrome honours each
+        receiver's buffer depth independently (measured live: unwritten audio
+        sat at ~933ms while targeted video sat at ~271ms — a ~660ms constant
+        lip-sync offset). The element keeps video presentation on the audio
+        clock, so ANY difference between the two targets is lip-sync error, not
+        a contained setting: the old AUDIO_PLAYOUT_CAP_MS=400 turned the 1s
+        Cinema default into a permanent 600ms audio-early offset for every
+        fresh viewer, and skewed accommodated sessions (video 2200 / audio 400)
+        by 1.8s. A raise is silent buffering in NetEQ and every lower is
+        already step-limited to 50ms/tick, so identical writes keep the two
+        surfaces in lockstep under either reading of the spec's
+        larger-of-the-two rule."""
         code = self._strip_comments(self.app, "js")
         body = self._js_function_body(code, "reapplyBufferTargets")
         self.assertIsNotNone(body, "reapplyBufferTargets not found")
-        self.assertIn("kind === 'video'", body)
-        # Every remaining call site must be guarded the same way: the ontrack
-        # hook and the manual-mode override are separate from the supervisor.
-        for anchor in ("applyPlayoutDelay(event.receiver, event.track.kind)",
-                       "applyPlayoutDelay(r, 'video')"):
-            for match in re.finditer(re.escape(anchor), code):
-                guard = code[max(0, match.start() - 120): match.start()]
-                self.assertIn("kind === 'video'", guard,
-                              "{} must be guarded to video receivers only".format(anchor))
-        self.assertNotIn("applyPlayoutDelay(r, r.track ? r.track.kind : 'media')", code,
-                         "the manual-mode override must not push to the audio receiver either")
+        self.assertIn("kind === 'audio'", body,
+                      "audio must be targeted too, or the shared target is set by neglect")
+        self.assertNotIn("AUDIO_PLAYOUT_CAP_MS", body,
+                         "audio must receive the SAME target as video — a cap "
+                         "re-introduces a lip-sync offset of cap-minus-target")
+        # ontrack and the manual mode switch must write both kinds as well, so
+        # the 1s stats tick is never the only thing keeping the two in step.
+        self.assertIn("applyPlayoutDelay(event.receiver, event.track.kind)",
+                      code, "ontrack must target both kinds as they arrive")
+        self.assertRegex(code, r"(?s)latencyModeBtn\.addEventListener\('click'.*?if \(r\.track\) \{\s*applyPlayoutDelay\(r, r\.track\.kind\);",
+                         "the latency-mode switch must retarget both receivers immediately")
+
+    def test_stress_raise_releases_on_a_clock_not_a_quiet_streak(self):
+        """The raise must not latch.
+
+        This is the cause of "receivers feel a small but continuous lag while the
+        streamer, on a direct local path, feels none". The raise held until 20
+        CONSECUTIVE calm seconds (jitter under 25ms AND loss under 0.8%) before
+        taking even one 25-50ms step, and with several steps to unwind that is
+        minutes of extra permanent latency. A mobile viewer's jitter sits around
+        the 55ms raise threshold and essentially never sustains below 25ms for 20
+        straight seconds, so it latched on the first blip and stayed there. "Not
+        stressed" is already the signal that the cushion is unneeded, so the
+        release must key off that rather than off near-perfect calm."""
+        code = self._strip_comments(self.app, "js")
+        idx = code.find("const stressed = (lastNetJitterMs")
+        self.assertGreater(idx, 0, "the stress predicate was not found")
+        window = code[idx:idx + 3000]
+        self.assertIn("raiseReleaseTicks", window,
+                      "the release must run on its own tick clock")
+        self.assertNotRegex(window, r"calmRunSec >= 20 && \(adaptiveRaiseLevelMs !== 0",
+                            "gating each release step behind 20 consecutive calm seconds "
+                            "latches the raise for minutes on a mobile link")
+        # The hold must still exist: this is a level, not a countdown.
+        self.assertIn("adaptiveRaiseLevelMs = ADAPTIVE_RAISE_MS", window,
+                      "the raise must still latch WHILE the link is stressed")
 
     def test_buffer_target_is_not_latched_before_it_is_written(self):
         """Latching first meant a mid-reconnect receiver list left the app
@@ -2596,10 +2969,6 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertIn("display: none", unmute,
                       "the unmute prompt must be hidden by default and shown only by app.js")
 
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
     def test_self_sent_chat_ids_are_pruned(self):
         """A sender's own echoed message hits an early return before the prune,
         so the set grew 1:1 with self-sends and the stated 500 cap never held."""
@@ -2646,10 +3015,18 @@ if __name__ == "__main__":
         render for any viewer. That is a visible regression traded for one
         layout pass, so it was reverted to the default `swap`."""
         html = read_text(HTML_PATH)
-        self.assertIn("fonts.googleapis.com", html)
-        self.assertIn("display=swap", html,
+        # Comments first. This page's own comment block explains at length why
+        # `display=optional` was tried and reverted, and a raw substring search
+        # finds that explanation and reports the very fix the test exists to
+        # forbid as still present. The test was written before the comment
+        # described the decision, and never ran, so nothing caught the
+        # contradiction. The assertion is about the stylesheet link, so read
+        # the markup with its prose removed.
+        markup = re.sub(r"(?s)<!--.*?-->", "", html)
+        self.assertIn("fonts.googleapis.com", markup)
+        self.assertIn("display=swap", markup,
                       "the brand fonts must still be able to load on a slow uplink")
-        self.assertNotIn("display=optional", html,
+        self.assertNotIn("display=optional", markup,
                          "display=optional silently drops the brand fonts for the whole "
                          "page load on a saturated link")
 
@@ -2718,20 +3095,112 @@ if __name__ == "__main__":
                       "the rebuild must take the current session's tracks")
 
     def test_seam_pending_is_actually_left_set(self):
-        """`switchSeamPending` was set true and then cleared two lines later in
-        the same synchronous block, with the first `await` ~100 lines further
-        down — so no ontrack could ever fire in between and the whole seam was
-        provably unreachable. Every rendition switch silently fell through to
-        appending to the stale stream, which is what the seam exists to prevent
-        (and is why the audio-drop fix inside it had no effect at all)."""
+        """`switchSeamPending` must survive the SYNCHRONOUS part of switchRendition
+        and still be true when control reaches the first `await`, or the seam
+        branch in ontrack is unreachable dead code and every rendition switch
+        falls through to appending to the stale stream.
+
+        Two distinct ways to break this, both shipped at some point:
+
+        1. Clearing the flag a couple of lines after arming it, in the same
+           synchronous block.
+        2. Arming the flag and THEN calling `cleanupConnection(true)`, which
+           clears the flag itself as part of its teardown — clobbering the arm
+           synchronously, with no `await` in between and therefore nothing in
+           the source text between the two statements to notice. This is the
+           one that was live, and it is invisible to any "is the flag cleared
+           between arming and the await?" scan, because the clear happens in a
+           CALLEE.
+
+        So the ordering is asserted directly, and a clear inside the window is
+        only tolerated when it sits in a deferred timer callback (the 12s safety
+        net legitimately disarms itself), never as straight-line code.
+        """
         code = self._strip_comments(self.app, "js")
-        start = code.find("switchSeamPending = true;")
-        self.assertGreater(start, 0, "the seam is never armed")
-        end = code.find("await new Promise(r => setTimeout(r, 200))", start)
-        self.assertGreater(end, start, "the first await after arming was not found")
-        between = code[start:end]
-        self.assertNotIn("switchSeamPending = false", between,
-                         "clearing the flag before the first await makes the seam dead code")
+        body = self._js_function_body(code, "switchRendition")
+        self.assertIsNotNone(body, "switchRendition not found")
+
+        arm = body.find("switchSeamPending = true;")
+        self.assertGreater(arm, 0, "the seam is never armed")
+        teardown = body.find("cleanupConnection(true)")
+        self.assertGreater(teardown, 0, "the keep-picture teardown is missing")
+        self.assertLess(
+            teardown, arm,
+            "switchSeamPending is armed BEFORE cleanupConnection(true), which clears "
+            "the flag itself — the arm is undone synchronously and the seam can "
+            "never be observed true",
+        )
+
+        end = body.find("await new Promise(r => setTimeout(r, 200))", arm)
+        self.assertGreater(end, arm, "the first await after arming was not found")
+        window = body[arm:end]
+        for offset, line in enumerate(window.splitlines()):
+            if "switchSeamPending = false" not in line:
+                continue
+            # A clear is only legal inside a deferred callback. The 12s safety
+            # net disarming itself is fine; straight-line code is not, because it
+            # runs before the first await can ever yield to ontrack.
+            self.assertIn(
+                "setTimeout", window[: window.find(line)],
+                "switchSeamPending is cleared as straight-line code between arming "
+                "and the first await, which makes the seam dead code",
+            )
+            self.assertIsNotNone(offset)
+
+    def test_seam_safety_net_cancels_itself_and_the_flags_do_not_latch(self):
+        """The 12s safety net exists to convert a seam that never lands into a
+        real reconnect. It could not: it called connectStream() while
+        `isConnecting` was still true from the abandoned attempt, and
+        connectStream() returns immediately when `isConnecting || isConnected`
+        — so the "recovery" silently did nothing and the viewer was left on a
+        torn-down session with a null srcObject and no attempt in flight."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "switchRendition")
+        self.assertIsNotNone(body, "switchRendition not found")
+        arm = body.find("switchSeamTimer = setTimeout(")
+        self.assertGreater(arm, 0, "the seam safety net is missing")
+        window = body[arm: arm + 1600]
+        reconnect = window.find("connectStream()")
+        self.assertGreater(reconnect, 0, "the safety net does not reconnect")
+        before = window[:reconnect]
+        self.assertIn("isConnected = false", before,
+                      "the safety net must clear isConnected before reconnecting")
+        self.assertIn("isConnecting = false", before,
+                      "the safety net must clear isConnecting before reconnecting, "
+                      "or connectStream() refuses to start and the viewer is wedged")
+
+    def test_seam_is_closed_by_any_track_that_takes_over_the_element(self):
+        """The flag and its 12s net are only cleared by the seam branch, which
+        requires a VIDEO track. A WHEP answer routinely delivers AUDIO first,
+        and that first track is the one that rebuilds `player.srcObject` — via
+        the `elementStreamSessionId !== currentSessionId` branch, which set the
+        session id but left the net armed. Twelve seconds later it fired on a
+        session that was already healthy: pause the element, null srcObject,
+        teardown, and a refused reconnect.
+
+        So every branch that hands the element a stream belonging to the CURRENT
+        session must close the seam, not only the video one.
+        """
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "closeRenditionSeam")
+        self.assertIsNotNone(body, "closeRenditionSeam not found")
+        self.assertIn("switchSeamPending = false", body,
+                      "closing the seam must clear the pending flag")
+        self.assertIn("clearTimeout", body,
+                      "closing the seam must cancel the 12s safety net")
+
+        # Every `elementStreamSessionId = currentSessionId` assignment means the
+        # element now belongs to this session — which is exactly the moment the
+        # seam is over.
+        assignments = [m.start() for m in re.finditer(
+            r"elementStreamSessionId = currentSessionId;", code)]
+        self.assertGreaterEqual(len(assignments), 3,
+                                "expected the initial, rebuild and seam assignments")
+        for pos in assignments:
+            self.assertIn("closeRenditionSeam()", code[pos: pos + 240],
+                          "a branch that hands the element this session's stream must "
+                          "close the rendition seam, or the 12s net fires on a healthy "
+                          "session and wedges the player")
 
     def test_seam_safety_timer_is_cancelled_by_teardown(self):
         """cleanupConnection did not know about the seam's 12s safety net, so an
@@ -2805,13 +3274,98 @@ if __name__ == "__main__":
         code = self._strip_comments(self.bridge, "js")
         self.assertIn("lastHealthyRunAt", code,
                       "a long healthy run must be tracked separately from the strike count")
-        self.assertRegex(code, r"if \(runSeconds >= 300\) \{\s*\n\s*lastHealthyRunAt = Date\.now\(\);",
-                         "only a genuinely long run should mark the bridge as healthy")
+        # The threshold is a named constant now; what matters is its VALUE, so
+        # the assertion is on the constant, not on a hard-coded 300 inline.
+        match = re.search(r"const HEALTHY_RUN_SECONDS\s*=\s*(\d+)\s*;", code)
+        self.assertIsNotNone(match, "the healthy-run threshold must be a named constant")
+        self.assertGreaterEqual(int(match.group(1)), 300,
+                                "only a genuinely long run should mark the bridge as healthy")
+        self.assertRegex(code, r"if \(runSeconds >= HEALTHY_RUN_SECONDS\) \{\s*\n\s*lastHealthyRunAt = Date\.now\(\);",
+                         "the strike-clearing 30s reset must not be what marks the bridge healthy")
         check = code.find("if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES")
         self.assertGreater(check, 0, "the give-up check was not found")
-        window = code[check:check + 400]
+        window = code[check:check + 500]
         self.assertIn("noHealthyRunFor", window,
                       "the breaker must also trip when the bridge never produces a long run")
+
+    def test_give_up_breaker_is_not_armed_at_process_start(self):
+        """The give-up breaker had `lastHealthyRunAt = 0`, which is falsy, so the
+        elapsed-time check took its `: Infinity` branch and
+        `Infinity > 15 * 60 * 1000` is UNCONDITIONALLY TRUE. The 15-minute health
+        window was therefore never measured from any baseline and the breaker
+        fired on the very FIRST ffmpeg exit, with `failures` still 0 — logging
+        "giving up after 0 failed attempts".
+
+        That nullified the entire retry design. Every exit shorter than 300s — an
+        OBS auto-reconnect, a host stall, a 35s crash cycle, all of which the code
+        around it was explicitly written to survive — slept the 60s backoff with
+        no transcoder running and exited. Under runOnAvailableRestart that
+        re-launches the hook, which republishes with overridePublisher and KICKS
+        the healthy publisher, dropping the RTMP connection and tearing down every
+        WHEP session on the path; the loop repeated until MediaMTX's hook budget
+        was gone and the renditions stayed dead for the rest of the broadcast.
+
+        So: the baseline must exist and must be a real timestamp, and the
+        Infinity fallback must be gone."""
+        code = self._strip_comments(self.bridge, "js")
+        self.assertNotIn("let lastHealthyRunAt = 0;", code,
+                         "0 is falsy, so the check falls through to its Infinity branch "
+                         "and the breaker fires on the first ffmpeg exit")
+        self.assertRegex(code, r"let lastHealthyRunAt = null;",
+                         "the 'no healthy run yet' state must be an explicit sentinel")
+        self.assertRegex(code, r"const bridgeStartedAt = Date\.now\(\);",
+                         "a real baseline timestamp is required for the health window")
+        self.assertIn(
+            "lastHealthyRunAt === null ? bridgeStartedAt : lastHealthyRunAt", code,
+            "the health window must be measured from the process start until the "
+            "first genuinely long run, not from Infinity",
+        )
+        # The real arithmetic, so a future edit cannot reintroduce the tautology.
+        give_up_ms = int(re.search(r"const NO_HEALTHY_RUN_GIVE_UP_MS\s*=\s*(\d+)", code).group(1))
+        first_exit_elapsed = 0  # a bridge that started now and just saw its first exit
+        self.assertFalse(
+            first_exit_elapsed > give_up_ms,
+            "a first exit must never satisfy the give-up condition on elapsed time "
+            "alone; only MAX_CONSECUTIVE_FFMPEG_FAILURES may trip it that early",
+        )
+
+    def test_gpu_decode_state_file_cannot_wedge_the_bridge(self):
+        """`readGpuDecodeState` returned whatever JSON.parse produced, and
+        JSON.parse SUCCEEDS for `null`, `"x"`, `42` and `[1]` — only a
+        syntactically invalid file reaches the catch. The callers then assign a
+        property on the result (`state[decoder] = ...`), which under this file's
+        'use strict' throws `TypeError: Cannot set properties of null` on null
+        and on a primitive string/number.
+
+        `rememberGpuDecodeFailure` is called from inside the retry loop with no
+        try around it, so that rejected the whole main() and landed in the
+        top-level `fatal:` handler — and because the bad file is never
+        repaired, every later bridge start repeated it. A persistent wedge, not
+        a one-off."""
+        code = self._strip_comments(self.bridge, "js")
+        body = self._js_function_body(code, "readGpuDecodeState")
+        self.assertIsNotNone(body, "readGpuDecodeState not found")
+        self.assertIn("typeof parsed !== 'object'", body,
+                      "a JSON scalar/array parses successfully but cannot carry "
+                      "per-decoder entries; it must be rejected as unusable state")
+        self.assertIn("!parsed", body,
+                      "a literal `null` parses successfully and would throw on the "
+                      "next property assignment")
+        self.assertIn("Array.isArray(parsed)", body,
+                      "an array parses successfully but assigning a decoder name to "
+                      "it does not persist the failure memory")
+
+    def test_bridge_state_file_is_never_assumed_to_be_writable(self):
+        """The two writers of the GPU-decode state file must keep their own
+        try/catch: the file lives in the temp directory and a locked or
+        read-only path is a normal condition, not an exception-worthy one."""
+        code = self._strip_comments(self.bridge, "js")
+        for name in ("rememberGpuDecodeFailure", "clearGpuDecodeFailure"):
+            body = self._js_function_body(code, name)
+            self.assertIsNotNone(body, "{} not found".format(name))
+            self.assertIn("writeFileSync", body)
+            self.assertIn("catch", body,
+                          "{} must tolerate an unwritable state file".format(name))
 
     def test_launcher_stale_config_is_a_warning_not_a_site_outage(self):
         """The comparison used to `throw`, and the launcher's outer catch exits
@@ -2841,7 +3395,20 @@ if __name__ == "__main__":
         block = self.config[max(0, self.config.find("writeQueueSize") - 1400):
                             self.config.find("writeQueueSize")]
         self.assertIn("0.41s", block, "the queue-depth arithmetic must be correct")
-        self.assertNotIn("3.3s at 6 Mbps", block, "the 8x-wrong figure must not come back")
+
+        # The corrected comment has to NAME the figure it retracted, so a plain
+        # "3.3s must not appear" search fails on the very text that documents
+        # the fix. What actually matters is that 3.3s is never asserted as the
+        # CURRENT figure: every mention must sit in the sentence that retracts
+        # it. So each occurrence is checked against its own context rather than
+        # banned outright, and re-introducing 3.3s as live arithmetic fails.
+        retracted = ("earlier version", "would need", "too high", "retract")
+        for match in re.finditer(r"3\.3s", block):
+            context = block[max(0, match.start() - 260): match.end() + 260]
+            self.assertTrue(
+                any(marker in context for marker in retracted),
+                "3.3s appears in the writeQueueSize comment without being marked "
+                "as the retracted figure: ...{0}...".format(context.strip()))
 
     def test_grain_background_has_no_fixed_attachment(self):
         """`background-attachment: fixed` is a no-op while html/body's background
@@ -2852,6 +3419,226 @@ if __name__ == "__main__":
         css = self._strip_comments(self.css, "css")
         self.assertNotIn("background-attachment", css,
                          "a no-op fixed background attachment is a trap, not a setting")
+
+
+class StudioOverlayVisibilityChecks(unittest.TestCase):
+    """Regression guards for the studio page's `hidden` overlays.
+
+    The defect these pin is a CSS-cascade trap, not a logic error, so no amount
+    of reading studio.js reveals it: every line of the publish path is correct
+    and the page still cannot be used.
+
+    The `hidden` attribute is honoured by a USER-AGENT-origin
+    `[hidden] { display: none }` rule. Every author-origin declaration beats the
+    user-agent origin regardless of specificity, so a class rule carrying its
+    own `display` silently defeats the attribute for the life of the page.
+    studio.html ships five elements with `hidden` whose class rules all set
+    `display`:
+
+        #studio-busy        .studio-busy         display: flex
+        #studio-toast       .studio-toast        display: flex
+        #studio-meters      .studio-meters       display: flex
+        #source-info        .studio-source-info  display: flex
+        #btn-stop           .studio-btn          display: inline-flex
+
+    The visible symptom was that clicking "Start broadcasting" appeared to hang
+    forever on a spinner reading "Starting broadcast…". In truth the broadcast
+    never began: .studio-busy is `position: fixed; inset: 0; z-index: 70`, so on
+    the very first paint it covered the entire viewport with its dimmed,
+    blurred backdrop — and, being above everything, it swallowed every click,
+    so the button underneath was never reachable in the first place. studio.js's
+    `setBusy()` correctly assigns `busy.hidden`, and the assignment has no
+    effect. That is why the console and the network log were both empty and the
+    page looked permanently busy.
+
+    This is the same defect class already fixed once on the VIEWER page, where
+    the grouped `.player-loader, .player-offline-overlay, .unmute-overlay` rule
+    sets display:flex for all three and style.css had to give .player-loader and
+    .unmute-overlay an explicit `display: none` default (style.css:502). One
+    attribute-selector rule fixes the whole class here.
+    """
+
+    def setUp(self):
+        self.css = read_text(ROOT / "studio.css")
+        self.html = read_text(ROOT / "studio.html")
+        self.js = read_text(ROOT / "studio.js")
+
+    @staticmethod
+    def _strip_comments(text, kind):
+        opener = r"(?:^|(?<=\s))[ \t]*/\*"
+        if kind == "css":
+            return re.sub(opener + r".*?\*/", "", text, flags=re.DOTALL | re.MULTILINE)
+        without_block = re.sub(opener + r".*?\*/", "", text, flags=re.DOTALL | re.MULTILINE)
+        return re.sub(r"(?m)^[ \t]*//.*$", "", without_block)
+
+    @staticmethod
+    def _css_rule(css, selector):
+        match = re.search(r"(?m)^[ \t]*" + re.escape(selector) + r"\s*\{([^}]*)\}", css)
+        return match.group(1) if match else None
+
+    def test_hidden_attribute_is_honoured_despite_author_display_rules(self):
+        """The one rule that makes `hidden` work at all.
+
+        `!important` is required and is not over-reach: it is the only way an
+        attribute selector can win against the author-origin `display` on the
+        five class rules below, since those are in the same origin and would
+        otherwise be decided by source order alone.
+        """
+        css = self._strip_comments(self.css, "css")
+        hidden = self._css_rule(css, "[hidden]")
+        self.assertIsNotNone(
+            hidden,
+            "studio.css has no [hidden] rule, so the user-agent default is the "
+            "only thing hiding these elements — and any author `display` beats it")
+        self.assertRegex(
+            hidden, r"display\s*:\s*none\s*!important",
+            "the [hidden] rule must be `display: none !important`; a plain "
+            "`display: none` loses to the class rules it has to override")
+
+    def test_no_author_display_can_outrank_the_hidden_rule(self):
+        """The cascade itself, not just the presence of the `[hidden]` rule.
+
+        Checking that `[hidden]` exists is not enough, because it is only the
+        winner while nothing outranks it. Two things can beat it, and both are
+        ordinary edits somebody will eventually make to this stylesheet:
+
+          - importance: a `display: ... !important` on a class rule. `[hidden]`
+            and `.studio-busy` are both specificity (0,1,0) in the same origin,
+            so between two `!important` declarations the LAST ONE IN SOURCE
+            ORDER wins. `.studio-busy` sits far below the `[hidden]` rule, so
+            adding `!important` to the class rule silently reinstates the
+            original bug with the fix still in place.
+          - specificity: a selector that outranks the attribute selector, or a
+            selector list, either of which also defeats the single-class lookup
+            the other tests in this class rely on.
+
+        So this walks the stylesheet and fails if any author `display` declared
+        after the `[hidden]` rule is marked `!important` for a selector that
+        could match one of the elements the markup ships hidden. That is the
+        exact shape of the regression that made this page unusable, and it is
+        invisible to a test that only asserts the rule is present.
+        """
+        css = self._strip_comments(self.css, "css")
+
+        hidden_at = css.find("[hidden]")
+        self.assertGreater(hidden_at, 0, "the [hidden] rule is missing entirely")
+
+        classes_in_use = set()
+        for tag in re.findall(r"<[a-zA-Z][^>]*>", self.html):
+            if not re.search(r"\shidden(?=[\s/>])", tag):
+                continue
+            for name in re.findall(r'\bclass="([^"]*)"', tag):
+                classes_in_use.update(name.split())
+        self.assertIn(
+            "studio-busy", classes_in_use,
+            "the busy overlay is no longer shipped hidden; if that is deliberate "
+            "the whole start-busy contract needs revisiting, not a test update")
+
+        offenders = []
+        for match in re.compile(r"([^{}]+)\{([^}]*)\}").finditer(css):
+            selector, body = match.group(1), match.group(2)
+            if match.start() < hidden_at or "[hidden]" in selector:
+                continue
+            if not re.search(r"!\s*important", body):
+                continue
+            display = re.search(r"(?<![\w-])display\s*:\s*([a-z-]+)", body)
+            if display is None or display.group(1) == "none":
+                continue
+            for class_name in sorted(classes_in_use):
+                if re.search(r"(?<![\w-])\." + re.escape(class_name) + r"(?![\w-])",
+                             selector):
+                    offenders.append((selector.strip(), display.group(1), class_name))
+                    break
+
+        self.assertEqual(
+            offenders, [],
+            "an author `display: ... !important` after the [hidden] rule (source "
+            "order wins at equal specificity) would repaint on first paint and "
+            "brick the studio again: {0}".format(offenders))
+
+    def test_every_hidden_element_is_still_reachable_by_the_class_lookup(self):
+        """Close the hole a silent `continue` would leave.
+
+        `_css_rule`, used throughout this class, matches a single class selector
+        at the start of a line. Grouping selectors -- `.studio-busy,
+        .studio-overlay { ... }` -- is the single most likely future edit to
+        this stylesheet, and it would make that lookup return nothing at all.
+        The other tests would then quietly stop examining the element instead
+        of reporting anything, which is how a guard becomes decorative. So
+        each element shipped hidden must still be resolvable, and the total
+        must be accounted for rather than passed over.
+        """
+        css = self._strip_comments(self.css, "css")
+        checked = 0
+        for tag in re.findall(r"<[a-zA-Z][^>]*>", self.html):
+            if not re.search(r"\shidden(?=[\s/>])", tag):
+                continue
+            id_match = re.search(r'\bid="([^"]+)"', tag)
+            if not id_match:
+                continue
+            element_id = id_match.group(1)
+            class_match = re.search(r'\bclass="([^"]*)"', tag)
+            self.assertIsNotNone(
+                class_match,
+                "#{} ships `hidden` with no class attribute".format(element_id))
+            classes = class_match.group(1).split()
+            self.assertTrue(
+                classes,
+                "#{} ships `hidden` with an empty class attribute".format(element_id))
+            for class_name in classes:
+                if self._css_rule(css, "." + class_name) is None:
+                    # Not necessarily wrong on its own -- a class may have no
+                    # rule -- but it must be a decision rather than an accident
+                    # of the lookup being unable to parse a grouped selector.
+                    self.assertNotRegex(
+                        css, r"(?m)^[ \t]*\." + re.escape(class_name) + r"\s*,",
+                        "#{} uses .{}, which now appears in a GROUPED selector. "
+                        "_css_rule matches only a single class selector, so this "
+                        "element is no longer examined by any test in this class "
+                        "-- split the rule or teach the helper selector lists".format(
+                            element_id, class_name))
+                checked += 1
+        self.assertGreaterEqual(
+            checked, 5,
+            "expected the five elements studio.html ships hidden, but only {0} "
+            "class pairings were reachable. If a markup change is intended, say "
+            "so here rather than letting the coverage quietly shrink".format(checked))
+
+
+    def test_busy_overlay_is_released_by_setbusy(self):
+        """The overlay must actually be dismissible.
+
+        Worth pinning separately because a fix that only hid the overlay on
+        load would leave the studio permanently unusable in the other
+        direction. setBusy(false) has to restore it, and the only mechanism it
+        has is the same `hidden` attribute, so this keeps the UI contract and
+        the stylesheet fix tied together.
+        """
+        self.assertIn("busy.hidden = !isBusy", self.js,
+                      "setBusy() must drive the overlay through the `hidden` "
+                      "attribute, which is what the [hidden] CSS rule honours")
+        self.assertIn("setBusy(false)", self.js,
+                      "nothing releases the busy overlay once the publish "
+                      "succeeds, so the spinner would outlive the broadcast")
+
+    def test_busy_overlay_cannot_swallow_the_whole_page(self):
+        """Defence in depth for the one overlay that covers the viewport.
+
+        The bug was silent precisely because a full-screen element above every
+        control looks identical to a page that is still working. Were `hidden`
+        ever defeated again, letting clicks pass through the idle state would
+        keep the studio usable and degrade the failure to a cosmetic one.
+        """
+        css = self._strip_comments(self.css, "css")
+        busy = self._css_rule(css, ".studio-busy")
+        self.assertIsNotNone(busy, ".studio-busy rule not found")
+        self.assertIn("position: fixed", busy)
+        self.assertIn("inset: 0", busy,
+                      "if the overlay ever stops covering the viewport this "
+                      "test is guarding a different layout; re-check it")
+        self.assertIn("pointer-events: none", busy,
+                      "the full-screen busy overlay must not intercept clicks "
+                      "while it is idle, or one CSS regression bricks the page")
 
 
 if __name__ == "__main__":

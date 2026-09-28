@@ -172,20 +172,30 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentBitrateMbps = null;
     let currentFrameRate = null;
 
-    // Latency & Jitter Buffer Modes: 'ultra' (80ms), 'balanced' (180ms), 'smooth' (350ms).
-    // 'balanced' is the default: enough cushion for hotspot jitter while keeping a
-    // fresh viewer 170ms closer to the live edge than 'smooth' would. The adaptive
-    // supervisor still raises the target automatically whenever the network turns
-    // rough (jitter floor up to 600ms), so smoothness is not traded away — only
-    // the starting point moves closer to live. The drift limits sit ~1s above
-    // each mode: Chrome's buffer grows past the fixed target on bursty hotspot
-    // arrivals (measured live: 180ms target drifting to 1.2s), and the stepwise
-    // catch-up drains it back at 150ms/s — smooth enough to run often.
-    let currentLatencyMode = 'balanced';
+    // Latency & Jitter Buffer Modes: 'ultra' (80ms), 'balanced' (180ms),
+    // 'smooth' (350ms), 'cinema' (1000ms).
+    // 'cinema' is the default for a reason this project finally accepted: for
+    // a movie broadcast, latency is explicitly welcome and playout EVENNESS is
+    // the product. A thin base target makes the jitter buffer oscillate around
+    // the fixed point instead of sitting above it: bursty arrivals overshoot
+    // (measured live: a 180ms target drifting to 1.2s) and Chrome drains the
+    // overshoot back at ~150ms/s of catch-up — an inaudible ~1% speed-up that
+    // reads as "a few milliseconds fast" — while a gap in arrivals under-runs
+    // the thin buffer and holds a frame — "a few milliseconds slow". Zero
+    // packet loss, zero drops in the stats, and still not smooth, because the
+    // clock itself is breathing. A 1s starting buffer sits decisively above
+    // the whole arrival-delay distribution (the jitter floor caps at 600ms,
+    // IDR-GOP bursts measure ~1.4x bitrate in 100ms windows), so the buffer
+    // neither under-runs nor needs catch-up drain, and both failure modes
+    // disappear together. The other modes remain one click away; a manual
+    // choice still persists. The drift limits sit ~1s above each mode: past
+    // that the session itself is stale and rejoins at the live edge.
+    let currentLatencyMode = 'cinema';
     const LATENCY_MODES = {
         ultra: { label: 'Ultra-Low (80ms)', ms: 80, s: 0.08, icon: 'fa-bolt', driftLimitMs: 900 },
         balanced: { label: 'Balanced (180ms)', ms: 180, s: 0.18, icon: 'fa-gauge-high', driftLimitMs: 1000 },
-        smooth: { label: 'Anti-Stutter (350ms)', ms: 350, s: 0.35, icon: 'fa-shield-halved', driftLimitMs: 1100 }
+        smooth: { label: 'Anti-Stutter (350ms)', ms: 350, s: 0.35, icon: 'fa-shield-halved', driftLimitMs: 1100 },
+        cinema: { label: 'Cinema (1s)', ms: 1000, s: 1.0, icon: 'fa-film', driftLimitMs: 2000 }
     };
     // A manual latency choice sticks across visits; unknown values fall back to the default.
     try {
@@ -204,6 +214,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let dropTickPending = true;         // first tick after beginStatsLoop only re-baselines
     let stressRunSec = 0;               // Consecutive seconds of jitter/loss stress
     let calmRunSec = 0;                 // Consecutive calm seconds (restores mode target)
+    let raiseReleaseTicks = 0;         // Ticks since the stress raise last stepped down
     let rejoinDriftSec = 0;             // Consecutive seconds past the reconnection drift cap
     let adaptiveRaiseLevelMs = 0;      // Held 350ms floor while the link is stressed (0 = off)
     let lastNetJitterMs = null;         // Smoothed inbound network jitter (ms)
@@ -290,8 +301,22 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
             if (!AudioContextClass) return;
-            // 'interactive' keeps the WebAudio processing quantum small for minimal A/V path latency
-            audioCtx = new AudioContextClass({ latencyHint: 'interactive' });
+            // 'playback', not 'interactive'. This context only drives the
+            // element's audio through a gain/analyser chain — there is no
+            // round-trip processing that needs a small quantum. What the hint
+            // actually selects is the size of the hardware output buffer the
+            // audio thread renders into: 'interactive' requests the smallest
+            // the platform allows (~10ms on Windows shared-mode WASAPI), where
+            // any scheduling hiccup — GPU contention, a busy compositor, a
+            // timer-resolution change — underruns the render quantum and
+            // glitches. And because a media element with a live audio track
+            // slaves its playback clock to audio output, an audio-render
+            // hiccup does not stay an audio problem: the playout clock itself
+            // stutters, which reads as video micro-jank with 0% packet loss.
+            // 'playback' requests the larger buffer (~2x) and trades a few
+            // milliseconds of added audio latency — irrelevant here — for an
+            // output path that survives main-thread and GPU contention.
+            audioCtx = new AudioContextClass({ latencyHint: 'playback' });
             if (audioCtx.state === 'suspended') {
                 audioCtx.resume().catch(() => {});
             }
@@ -785,10 +810,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Apply the effective playout delay target to one receiver. Returns true
     // when a target was actually written, so callers can avoid latching a
-    // change that never landed.
-    function applyPlayoutDelay(receiver, kind) {
+    // change that never landed. `overrideMs` lets a receiver be given a
+    // deliberately different target.
+    function applyPlayoutDelay(receiver, kind, overrideMs) {
         if (!receiver) return false;
-        const targetMs = currentBufferTargetMs();
+        const targetMs = overrideMs === undefined ? currentBufferTargetMs() : overrideMs;
         try {
             if ('jitterBufferTarget' in receiver) {
                 receiver.jitterBufferTarget = targetMs;
@@ -845,19 +871,32 @@ document.addEventListener('DOMContentLoaded', () => {
             const dwell = urgent ? BUFFER_TARGET_EMERGENCY_DWELL_MS : BUFFER_TARGET_DWELL_MS;
             if (sinceLast < dwell) return false;
         }
-        // Only the VIDEO receiver. Per the WebRTC-PC spec, for tracks
-        // synchronized with another receiver the user agent SHOULD use the
-        // LARGER of the two JitterBufferTargets for BOTH. So a 2200ms
-        // video-scale target written to the audio receiver does not stay
-        // contained: the UA is expected to reach it by decelerating playout
-        // (insertedSamplesForDeceleration), which stretches and desyncs audio,
-        // and the video target ends up pinned to the audio one. The video never
-        // benefits from a target that large, and the viewer gets A/V artifacts
-        // instead. Audio keeps the browser's own default.
+        // BOTH receivers, with the SAME target.
+        //
+        // The two tracks play out of one <video> element, and Chrome honours
+        // each receiver's buffer depth independently — measured on a live
+        // session: audio left unwritten sat at ~933ms while targeted video sat
+        // at ~271ms, a ~660ms constant lip-sync offset. The element keeps
+        // video presentation on the audio clock, so ANY difference between the
+        // two targets is lip-sync error, not a contained setting: a
+        // 400ms-audio / 1000ms-video pair would show every frame 600ms after
+        // its samples play. The old AUDIO_PLAYOUT_CAP_MS=400 protected ears in
+        // the 180ms era; with Cinema (1000ms) as the default it *created* a
+        // 600ms offset for every fresh viewer, and it skewed every
+        // accommodated session (video 2200 / audio 400) by 1.8s under the
+        // per-receiver depths Chrome actually implements. One synchronized
+        // playout surface therefore gets one number, always. A raise is silent
+        // buffering — NetEQ accumulates the difference and stretches only to
+        // bridge an underrun — and every lower is already step-limited to
+        // 50ms/tick by the state machines above, so the audio-side
+        // acceleration drains in lockstep with the video drain. (A UA that
+        // implements the spec's larger-of-the-two rule resolves the identical
+        // writes to the same value either way.)
+        const videoTargetMs = currentBufferTargetMs();
         let applied = 0;
         peerConnection.getReceivers().forEach(r => {
-            if (r.track && r.track.kind === 'video') {
-                if (applyPlayoutDelay(r, 'video')) applied += 1;
+            if (r.track && (r.track.kind === 'video' || r.track.kind === 'audio')) {
+                if (applyPlayoutDelay(r, r.track.kind, videoTargetMs)) applied += 1;
             }
         });
         // Latch only after a receiver actually accepted the write. Latching
@@ -1088,8 +1127,11 @@ document.addEventListener('DOMContentLoaded', () => {
         // instead of an oscillator.
         const stressed = (lastNetJitterMs !== null && lastNetJitterMs > 55)
             || (lastLossPct !== null && lastLossPct > 2.5);
-        const calm = (lastNetJitterMs === null || lastNetJitterMs < 25)
-            && (lastLossPct === null || lastLossPct < 0.8);
+        // There is deliberately no `calm` predicate any more. The release used
+        // to require 20 consecutive calm seconds (jitter < 25ms AND loss <
+        // 0.8%) per step, which is what latched the raise for minutes on a
+        // mobile link; the release now keys off "not stressed" instead. The
+        // dead variable is removed rather than left to invite the old rule back.
 
         if (stressed) {
             calmRunSec = 0;
@@ -1101,43 +1143,51 @@ document.addEventListener('DOMContentLoaded', () => {
                     addSystemMessage('Network jitter detected — widening the playout buffer to keep video smooth.');
                 }
             }
-        } else if (calm) {
+        } else if (adaptiveRaiseLevelMs > 0) {
+            // RELEASE ON A CLOCK, NOT ON A QUIET STREAK.
+            //
+            // "Not stressed" is already the signal that the cushion is no longer
+            // needed — demanding 20 CONSECUTIVE calm seconds (jitter < 25ms and
+            // loss < 0.8%) before taking even one 25ms step meant a viewer on a
+            // mobile link, whose jitter sits around the 55ms threshold and
+            // essentially never sustains below 25ms for 20 straight seconds,
+            // latched the raise. With 14 steps to unwind, that is up to ~4.7
+            // MINUTES of an extra ~170ms of permanent latency — the source of
+            // "receivers feel a small but continuous lag while the streamer, on
+            // a direct local path, feels none".
+            //
+            // The level is still a HOLD rather than a countdown (a timestamp
+            // expiry oscillated, which the previous round measured as a 15s/7s
+            // square wave), and it still steps down rather than jumping, because
+            // a downward jitterBufferTarget makes Chrome discard frames to reach
+            // the new level. Only the release CONDITION is wrong, and this fixes
+            // it: step down every 2 ticks (~2s) whenever the link is not
+            // stressed, so 350ms unwinds in about half a minute instead of
+            // minutes.
             stressRunSec = 0;
             calmRunSec += 1;
-            if (calmRunSec >= 20 && (adaptiveRaiseLevelMs !== 0 || bufferNoticeState === 'raised')) {
-                // RAMP OUT, never a single step. This level is the largest move in
-                // the system (350ms over an 180ms mode) and it was the only one
-                // with no ramp: releasing it wrote 350 -> 0 in one go, and a
-                // downward jitterBufferTarget is exactly what makes Chrome
-                // DISCARD frames to reach the new level — 170ms of frames, 5
-                // dropped at 30fps, on every stress->calm transition. The jitter
-                // floor already decays in 25ms steps and the accommodation in
-                // 50ms ones; this matches them, and the existing 50ms band plus
-                // 3s dwell space the steps out.
-                if (adaptiveRaiseLevelMs > ADAPTIVE_RAISE_STEP_MS) {
-                    adaptiveRaiseLevelMs -= ADAPTIVE_RAISE_STEP_MS;
-                    calmRunSec = 0;   // each step needs its own calm window
-                } else {
-                    adaptiveRaiseLevelMs = 0;
-                    calmRunSec = 0;
-                    if (bufferNoticeState === 'raised') {
-                        bufferNoticeState = '';
-                        addSystemMessage(`Network is stable again — back to the ${config.label} buffer.`);
-                    }
+            raiseReleaseTicks += 1;
+            if (raiseReleaseTicks >= 2) {
+                raiseReleaseTicks = 0;
+                adaptiveRaiseLevelMs = Math.max(0, adaptiveRaiseLevelMs - ADAPTIVE_RAISE_STEP_MS);
+            }
+            if (adaptiveRaiseLevelMs === 0) {
+                calmRunSec = 0;
+                if (bufferNoticeState === 'raised') {
+                    bufferNoticeState = '';
+                    addSystemMessage(`Network is stable again — back to the ${config.label} buffer.`);
                 }
             }
+        } else {
+            stressRunSec = 0;
+            calmRunSec += 1;
         }
-        // No else: the dead band (jitter 25-55ms, or loss 0.8-2.5%) is neither
-        // stressed nor calm, and zeroing BOTH counters here meant a link that was
-        // stressed 2 ticks in 3 could never reach stressRunSec >= 3, so the 350ms
-        // raise never latched and the target stayed at the mode value on exactly
-        // the marginal links it exists for. The jitter floor cannot cover that
-        // case either — it is driven by `jitter` alone, and a lossy-but-not-
-        // jittery link (3% loss, 20ms jitter) reports LOW jitter, so the floor
-        // stays at 0 while the buffer never grows to contain the loss bursts.
-        // Each branch already zeroes the other counter on a genuine state
-        // change, and `stressed`/`calm` are mutually exclusive, so holding here
-        // cannot leak or deadlock: it only stops an ambiguous tick from erasing
+        // Dead band handling. The `else` above covers a link that is neither
+        // stressed nor released (nothing to release), so no separate reset is
+        // needed here. What still matters is that an AMBIGUOUS tick never erases
+        // a genuine state change: `stressed` zeroes calmRunSec, the release
+        // branch zeroes stressRunSec, and the two are mutually exclusive, so
+        // holding cannot leak or deadlock.
         // evidence.
 
         reapplyBufferTargets();
@@ -1365,13 +1415,12 @@ document.addEventListener('DOMContentLoaded', () => {
             peerConnection.ontrack = (event) => {
                 console.log("[WebRTC] Track received! Kind:", event.track.kind, "ID:", event.track.id, "Streams count:", event.streams.length);
                 
-                // Video only — see reapplyBufferTargets(). A video-scale target
-                // on the audio receiver does not stay contained: the UA is
-                // expected to use the larger of two synchronized targets for
-                // both, so it stretches the audio instead.
-                if (event.track.kind === 'video') {
-                    applyPlayoutDelay(event.receiver, event.track.kind);
-                }
+                // BOTH kinds, same target — see reapplyBufferTargets(): the
+                // element presents video on the audio clock, so the audio
+                // receiver must move with video from the first frame or the
+                // depth difference is lip-sync error until the first stats
+                // tick catches up.
+                applyPlayoutDelay(event.receiver, event.track.kind);
 
                 // Track mute/unmute listeners for freeze guard.
                 // A track 'mute' event also fires on brief publisher hiccups and short packet-loss
@@ -1433,8 +1482,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     });
                     player.srcObject = replacement;
                     elementStreamSessionId = currentSessionId;
-                    switchSeamPending = false;
-                    if (switchSeamTimer) { clearTimeout(switchSeamTimer); switchSeamTimer = null; }
+                    closeRenditionSeam();
                     console.log(`[ABR] Seam closed: ${replacement.getTracks().length} track(s) now on screen.`);
                 } else if (elementStreamSessionId !== currentSessionId) {
                     // The element is holding a stream from an EARLIER session
@@ -1449,12 +1497,14 @@ document.addEventListener('DOMContentLoaded', () => {
                     });
                     player.srcObject = fresh;
                     elementStreamSessionId = currentSessionId;
+                    closeRenditionSeam();
                     console.log(`[WebRTC] Rebuilt player.srcObject for session ${currentSessionId} `
                         + `(${fresh.getTracks().length} track(s)); a stale stream was on the element.`);
                 } else if (!player.srcObject || !(player.srcObject instanceof MediaStream)) {
                     // Initialize srcObject as a new MediaStream if it doesn't exist yet
                     player.srcObject = new MediaStream();
                     elementStreamSessionId = currentSessionId;
+                    closeRenditionSeam();
                     console.log("[WebRTC] Initialized player.srcObject with a new MediaStream.");
                 } else {
                     // Add the track to the player's MediaStream if not already present
@@ -1886,6 +1936,25 @@ document.addEventListener('DOMContentLoaded', () => {
         schedulePoll();
     }
 
+    // The rendition seam is open from the moment switchRendition tears the old
+    // session down until the element is actually showing the replacement. Any
+    // ontrack that hands the element a stream belonging to the CURRENT session
+    // closes it — not just the video track of the seam branch below. A WHEP
+    // answer routinely delivers AUDIO first, and that first track is exactly
+    // the one that rebuilds srcObject; the branch it takes sets
+    // elementStreamSessionId without touching the flag, so the 12s watchdog
+    // stayed armed and fired on a session that was already healthy — pausing
+    // the element, nulling srcObject and calling connectStream() while
+    // isConnected was still true, which refuses to start. That is the exact
+    // failure the watchdog exists to prevent, caused by the watchdog.
+    function closeRenditionSeam() {
+        switchSeamPending = false;
+        if (switchSeamTimer) {
+            clearTimeout(switchSeamTimer);
+            switchSeamTimer = null;
+        }
+    }
+
     // Gracefully clean up connection and send WHEP DELETE to server.
     // keepPicture=true is the ABR path: it releases every network resource but
     // deliberately leaves `player.srcObject` attached. The old MediaStream's
@@ -2049,31 +2118,46 @@ document.addEventListener('DOMContentLoaded', () => {
         // "stressed" forever), but a rebuild must not override their choice.
         const wasPaused = player.paused;
         viewerPausedByChoice = wasPaused;
-        switchSeamPending = true;
+        // ORDER MATTERS. `switchSeamPending` is armed AFTER cleanupConnection
+        // returns, never before it. cleanupConnection(true) clears the flag as
+        // part of its own teardown (a hard teardown that lands inside the seam
+        // window must not leave the next session's first ontrack thinking it is
+        // a replacement), so setting the flag first and then calling it meant
+        // the callee undid the arm on the very next statement — synchronously,
+        // with no await in between. The flag could therefore never be observed
+        // true anywhere, the seam branch in ontrack was unreachable dead code,
+        // and every rendition switch fell through to the generic "append to the
+        // old stream" branch, which is precisely what the seam exists to
+        // prevent: cleanupConnection(true) deliberately leaves the previous
+        // (now ended) stream on screen so the picture is not lost mid-switch,
+        // and a video element renders its FIRST video track. It happened to work
+        // only because Chrome's selectVideoTracks skips ended tracks. It is also
+        // why the audio-drop fix in ontrack had no effect — that code lives
+        // inside the seam.
         cleanupConnection(true);
         // Safety net for the seam: if the replacement handshake never yields a
         // track, the stale (now-ended) stream would otherwise stay on screen
         // indefinitely. 12s is far beyond the 10s WHEP cap, so this only fires
         // on a genuine failure, and it fails LOUDLY to a real reconnect.
-        if (switchSeamTimer) clearTimeout(switchSeamTimer);
-        // `switchSeamPending` stays TRUE here. It used to be cleared two lines
-        // below this comment, in the same synchronous block — and the first
-        // `await` is ~100 lines further down, so no ontrack could ever fire in
-        // between and the whole seam was provably unreachable. Every rendition
-        // switch therefore fell through to the generic "append to the old
-        // stream" branch, which is precisely what the seam exists to prevent:
-        // cleanupConnection(true) deliberately leaves the previous (now ended)
-        // stream on screen so the picture is not lost mid-switch, and a video
-        // element renders its FIRST video track. It happened to work only
-        // because Chrome's selectVideoTracks skips ended tracks. It is also why
-        // the audio-drop fix in ontrack had no effect — that code lives inside
-        // the seam.
+        switchSeamPending = true;
         switchSeamTimer = setTimeout(() => {
             switchSeamTimer = null;
+            switchSeamPending = false;
             console.warn("[ABR] Replacement rendition produced no track in 12s; forcing a hard reconnect.");
             if (player.srcObject) { player.pause(); player.srcObject = null; }
             cleanupConnection();
             viewerPausedByChoice = false;
+            // closeRenditionSeam() normally fires from ontrack the moment the
+            // replacement track lands, so reaching this callback means the
+            // handshake genuinely never produced one. It must still reset the
+            // connection flags before reconnecting: connectStream() returns
+            // immediately when isConnecting || isConnected, and a partially
+            // completed attempt leaves isConnecting true — so the "recovery"
+            // silently did nothing and the viewer was left on a torn-down
+            // session with a null srcObject and no attempt in flight, which is
+            // the permanent wedge this watchdog is supposed to prevent.
+            isConnected = false;
+            isConnecting = false;
             connectStream();
         }, 12000);
         isConnected = false;
@@ -3261,6 +3345,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     });
                     player.srcObject = freshStream;
                     elementStreamSessionId = currentSessionId;
+                    // Same invariant as the ontrack branches: the element is now
+                    // showing THIS session, so a pending rendition seam is over.
+                    // The freeze watchdog is stopped at the top of a switch, but
+                    // a recovery queued beforehand can still land here, and
+                    // leaving the 12s net armed would have it tear down a
+                    // session that had just been successfully rebuilt.
+                    closeRenditionSeam();
                     // Same bound as stage 1, and the flush now has to PROVE it
                     // restored playback — an unchecked return skipped stage 3
                     // (the only stage that can fix a broken session) whenever
@@ -3518,7 +3609,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (latencyModeBtn) {
         latencyModeBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            const modes = ['ultra', 'balanced', 'smooth'];
+            const modes = ['ultra', 'balanced', 'smooth', 'cinema'];
             const nextIdx = (modes.indexOf(currentLatencyMode) + 1) % modes.length;
             currentLatencyMode = modes[nextIdx];
             const cfg = LATENCY_MODES[currentLatencyMode];
@@ -3544,9 +3635,12 @@ document.addEventListener('DOMContentLoaded', () => {
             // anchor, so the very next adaptive tick cannot immediately undo it.
             if (peerConnection) {
                 peerConnection.getReceivers().forEach(r => {
-                    // Video receivers only — see reapplyBufferTargets().
-                    if (r.track && r.track.kind === 'video') {
-                        applyPlayoutDelay(r, 'video');
+                    // Both kinds, same target — see reapplyBufferTargets(): a
+                    // mode switch that moves only video leaves the audio
+                    // receiver at the old depth until the next stats tick,
+                    // which the element renders as a lip-sync jump.
+                    if (r.track) {
+                        applyPlayoutDelay(r, r.track.kind);
                     }
                 });
                 lastAppliedTargetMs = currentBufferTargetMs();

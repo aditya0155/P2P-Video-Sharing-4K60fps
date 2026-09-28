@@ -260,6 +260,51 @@ body.perf-mode .action-feedback {
     box-shadow: 0 0 10px var(--cyan-glow);
 }
 
+/* Broadcast Studio Link — opens the no-install screen-share broadcaster in a
+   new tab. It is an <a>, not a <button>, so it inherits link behaviour:
+   middle-click and "open in new tab" work, and it is reachable by keyboard in
+   the normal tab order. That is why the reset below is needed — the global
+   anchor styling would otherwise underline it and give it the brand underline
+   animation, which reads as "external link" rather than "a page of this site".
+   The hover colours deliberately mirror .perf-toggle-btn:hover so the two
+   header pills look like one set. */
+.studio-link-btn {
+    text-decoration: none;
+    background: var(--bg-glass);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    padding: 5px 12px;
+    border-radius: var(--radius-full);
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--font-display);
+    letter-spacing: 0.5px;
+    display: flex; align-items: center; gap: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all var(--speed-fast) var(--ease);
+}
+
+.studio-link-btn:hover {
+    background: var(--primary-dim);
+    color: var(--text-primary);
+    border-color: rgba(139, 92, 246, 0.35);
+}
+
+/* Keyboard focus must be visible on this link; the global :focus-visible rule
+   covers buttons but the anchor is styled separately here. */
+.studio-link-btn:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+    /* The label is the first thing to go: the icon still reads as "broadcast",
+       and the title attribute still names it for a screen reader. */
+    .studio-link-btn span { display: none; }
+    .studio-link-btn { padding: 5px 9px; }
+}
+
 /* Status Badge */
 .status-badge {
     display: flex; align-items: center; gap: 7px;
@@ -354,9 +399,14 @@ body.perf-mode .action-feedback {
     background: #000;
     border-radius: var(--radius-lg);
     overflow: hidden;
-    border: 1px solid var(--border-glow);
+    /* The 1px ring is a box-shadow, NOT a border: the universal border-box
+       sizing made the border part of the 16:9 box, so the video's content
+       box was (W-2)x(H-2) — never exactly 16:9 — and object-fit: contain
+       letterboxed a hairline bar into every frame. A shadow ring paints the
+       same edge without touching the content box. */
     box-shadow:
-        0 0 0 1px rgba(0,0,0,0.5),
+        0 0 0 1px var(--border-glow),
+        0 0 0 2px rgba(0,0,0,0.5),
         0 8px 32px rgba(0, 0, 0, 0.6),
         0 0 20px var(--primary-glow);
     /* NOTHING on this element may animate, and it must not carry will-change
@@ -707,13 +757,11 @@ body.perf-mode .action-feedback {
        times per tick while the transition interpolated, all on the main thread
        that has to be handing frames to the video decoder. scaleX resamples
        pixels on the compositor and never touches geometry.
-       The --level fallback is 1, deliberately, not 0: app.js still writes
-       style.width today and index.html ships an inline width:0%, and an inline
-       style outranks any stylesheet width — a 0 fallback would blank the meter
-       the moment this rule applied, long before the JS side moves over. As
-       written both paths are correct at once: a style.width write (40%) shows a
-       40% bar unscaled, and once app.js writes --level instead, the same
-       declaration animates the scale with no further CSS change. */
+       The --level fallback is 1, deliberately, not 0: before the first meter
+       sample there is no --level at all, and a 0 fallback would blank the
+       meter; 1 shows a full bar until real audio data arrives. index.html no
+       longer ships an inline width (the old inline width:0% outranked this
+       stylesheet and hid the bar until the first sample cleared it). */
     width: 100%;
     height: 100%;
     transform: scaleX(var(--level, 1));
@@ -804,6 +852,20 @@ body.perf-mode .action-feedback {
 /* Fullscreen: the controls follow the inactivity timer, not :hover — the
    fullscreen container always sits under the cursor, so the hover rule alone
    would keep the bar up forever. Cursor hides together with the bar. */
+
+/* Fullscreen also drops the rounded corners: a border-radius clip on the
+   video's surface is a non-rectangular compositor clip, which disqualifies
+   the video from hardware-overlay promotion and forces every decoded frame
+   through a compositor texture quad for the whole session. In fullscreen the
+   corners are off-screen anyway, so the radius is free to go — the overlay
+   path it unlocks is zero-copy. (Windowed keeps the design's radius; the
+   fallback quad there is the accepted cosmetic cost.) */
+.video-container:fullscreen,
+.video-container:-webkit-full-screen {
+    border-radius: 0;
+    box-shadow: none;
+}
+
 .video-container:fullscreen .player-controls,
 .video-container:-webkit-full-screen .player-controls {
     opacity: 0;
@@ -1453,11 +1515,6 @@ kbd {
     50% { opacity: 1; transform: scale(1.1); }
 }
 
-@keyframes pulse-button {
-    0%, 100% { box-shadow: 0 0 15px var(--primary-glow); }
-    50% { box-shadow: 0 0 30px var(--primary-glow), 0 0 12px var(--cyan-glow); }
-}
-
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @keyframes dots {
@@ -1539,14 +1596,23 @@ kbd {
 @keyframes action-ripple {
     0% { opacity: 0; transform: translate3d(-50%, -50%, 0) scale(0.6); }
     30% { opacity: 1; transform: translate3d(-50%, -50%, 0) scale(1.15); }
-    100% { opacity: 0; transform: translate3d(-50%, -50%, 0) scale(1.3); }
+    100% { opacity: 0; visibility: hidden; transform: translate3d(-50%, -50%, 0) scale(1.3); }
 }
 
 @keyframes toast-fade {
     0% { opacity: 0; transform: translate3d(-50%, 8px, 0); }
     20% { opacity: 1; transform: translate3d(-50%, 0, 0); }
     70% { opacity: 1; transform: translate3d(-50%, 0, 0); }
-    100% { opacity: 0; transform: translate3d(-50%, -8px, 0); }
+    /* visibility ends HIDDEN, not just transparent. These two overlays are
+       only ever classList.remove + classList.add within the same task, so
+       `.active` — and with it `visibility: visible` — is in practice present
+       from the first gesture onwards. Ending at opacity:0 therefore left a
+       `visibility: visible; opacity: 0` layer sitting over the live video for
+       the rest of the session, carrying a box-shadow and z-index 8, which is
+       exactly what moving the base state to `visibility: hidden` was meant to
+       avoid. An opacity-0 element is still in the render tree; only
+       `visibility: hidden` leaves it. */
+    100% { opacity: 0; visibility: hidden; transform: translate3d(-50%, -8px, 0); }
 }
 
 /* ── Responsive ─────────────────────────────────────────────────────────── */

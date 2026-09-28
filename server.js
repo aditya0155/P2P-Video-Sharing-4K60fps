@@ -81,17 +81,66 @@ const STATIC_FILES = new Map([
     ['/streaming', 'index.html'],
     ['/streaming/', 'index.html'],
     ['/streaming/index.html', 'index.html'],
+    // In-browser broadcaster (the "no OBS install" path). It publishes over
+    // WHIP to the same `live` path OBS uses, so the two coexist: whichever
+    // publisher is newest owns the path (mediamtx.yml sets overridePublisher),
+    // and the studio warns before taking over rather than silently cutting the
+    // other feed. Aliased the same way index.html is, because the tunnel and
+    // Tailscale both rewrite to /streaming/**.
+    ['/studio', 'studio.html'],
+    ['/studio/', 'studio.html'],
+    ['/studio/index.html', 'studio.html'],
+    ['/streaming/studio', 'studio.html'],
+    ['/streaming/studio/', 'studio.html'],
+    ['/streaming/studio/index.html', 'studio.html'],
     ['/style.css', 'style.css'],
     ['/streaming/style.css', 'style.css'],
+    ['/studio.css', 'studio.css'],
+    ['/streaming/studio.css', 'studio.css'],
     ['/app.js', 'app.js'],
-    ['/streaming/app.js', 'app.js']
+    ['/streaming/app.js', 'app.js'],
+    ['/studio.js', 'studio.js'],
+    ['/streaming/studio.js', 'studio.js']
 ]);
 
+// Writes the CORS headers onto a response, replacing any that are already there.
+//
+// The replacement is not optional. Node lower-cases every header name it reads
+// off an upstream socket, so a proxied response arrives as
+// `access-control-allow-origin` (lowercase) while these keys are written
+// capitalised. Assigning `headers['Access-Control-Allow-Origin']` therefore
+// ADDS a second, differently-cased key instead of overwriting the first, and
+// res.writeHead emits both. A duplicated `Access-Control-Allow-Origin` makes a
+// browser reject the whole response as a CORS failure — a bare "TypeError:
+// Failed to fetch" in JS, with no clue which header caused it. It is currently
+// latent only because the page and the API are same-origin (CORS is not
+// enforced for same-origin requests), which is exactly the kind of thing that
+// breaks the first time someone embeds the player from another host or moves
+// the API behind a different origin.
 function setCorsHeaders(headers) {
+    // Delete every case variant of the four names we are about to set, so the
+    // result is exactly one of each rather than a mixture of cases.
+    for (const name of Object.keys(headers)) {
+        const lower = name.toLowerCase();
+        if (lower === 'access-control-allow-origin'
+            || lower === 'access-control-allow-methods'
+            || lower === 'access-control-allow-headers'
+            || lower === 'access-control-expose-headers') {
+            delete headers[name];
+        }
+    }
     headers['Access-Control-Allow-Origin'] = '*';
     headers['Access-Control-Allow-Methods'] = 'GET, POST, PATCH, DELETE, OPTIONS';
+    // `If-Match` is required by the WHIP trickle-ICE PATCH and the session
+    // DELETE. `Content-Type` has to stay here because `application/sdp` is not
+    // a CORS-safelisted value, so the studio's WHIP POST preflights.
     headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, If-Match';
-    headers['Access-Control-Expose-Headers'] = 'Location';
+    // A WHIP publisher reads four headers off the 201: Location (the resource
+    // to DELETE on teardown), plus ETag/ID/Link, which MediaMTX emits and a
+    // browser cannot see unless they are named here. Only Location was exposed
+    // before, which was enough for WHEP (the player only ever needed the
+    // session URL) and not enough for WHIP.
+    headers['Access-Control-Expose-Headers'] = 'Location, ETag, ID, Link, Accept-Post, Accept-Patch';
     return headers;
 }
 
@@ -128,6 +177,33 @@ function proxyToMediaMTX(req, res, requestUrl) {
         }
 
         res.writeHead(proxyRes.statusCode, setCorsHeaders(responseHeaders));
+        // The upstream RESPONSE stream needs its own error handling, and the
+        // proxyReq handler below cannot cover it. Once MediaMTX has sent
+        // response headers the request side is already complete, so any later
+        // failure (MediaMTX restarted or crashed mid-body, a proxy in front of
+        // it reset the connection) is reported on `proxyRes` — and
+        // `proxyRes.pipe(res)` does NOT forward errors to the destination.
+        // With nothing listening, `res` was never ended and never destroyed:
+        // the client's fetch() neither resolved nor rejected, so the player's
+        // 5s status probe hung forever and its reconnect loop stalled on a
+        // request that would never settle, while the ServerResponse, the
+        // IncomingMessage and the client socket were retained for the lifetime
+        // of the process — one permanent leak per interrupted request. The
+        // 30s proxyReq.setTimeout does not help: the socket is already gone by
+        // then, so the timer is cleared without ever firing.
+        //
+        // `aborted` is emitted alongside `error` for a truncated body on some
+        // Node versions, so both are handled and the handler is idempotent.
+        const abortUpstream = () => {
+            if (res.destroyed || res.writableEnded) return;
+            // Headers are already on the wire, so there is no status code left
+            // to change: cutting the connection is the only honest signal, and
+            // appending an error body would corrupt the partial payload.
+            res.destroy();
+        };
+        proxyRes.on('error', abortUpstream);
+        proxyRes.on('aborted', abortUpstream);
+        // A clean upstream end is the normal path; pipe() calls res.end().
         proxyRes.pipe(res);
     });
 
@@ -325,11 +401,20 @@ function clientIpForRateLimit(req) {
 // Per-IP reaction limits are only half the story: aggregate rate is
 // (per-viewer rate x viewer count), and every accepted reaction is broadcast to
 // every viewer, where it becomes an animated layer over live video. A global
-// token bucket bounds that aggregate no matter how many viewers there are, or
+// ceiling bounds that aggregate no matter how many viewers there are, or
 // how a client chooses to identify itself.
+//
+// SLIDING window, not a fixed one. The previous implementation reset a counter
+// at each wall-clock second boundary, which permits a burst of up to 2x the
+// cap across the boundary: 25 accepted reactions at t=999ms and 25 more at
+// t=1001ms — 50 in a 2ms span. The cap exists precisely because that aggregate
+// is composited as animation layers over live video on every screen in the
+// room, so the overshoot lands at exactly the moment the cost is highest. A
+// timestamp ring is used instead: every accepted reaction records its time, and
+// the check discards anything older than one second, so the invariant is
+// "never more than CAP accepted in any trailing 1s window".
 const REACTION_GLOBAL_CAP_PER_SEC = 25;
-let reactionGlobalWindowStart = Date.now();
-let reactionGlobalCount = 0;
+const reactionGlobalStamps = [];
 
 function broadcastChatEvent(eventType, data, eventId) {
     // The SSE id: line is what EventSource replays through Last-Event-ID on a
@@ -610,17 +695,39 @@ function handleChat(req, res, requestUrl) {
                 res.end(JSON.stringify({ error: 'You are sending messages too quickly. Please wait a moment.' }));
                 return;
             }
+            // The slot is RESERVED synchronously, before the body is even read.
+            // Charging it only after validation would leave the pre-check and
+            // the charge decoupled by an await: N concurrent requests would all
+            // read the same (empty) window, all pass, and all be accepted — the
+            // cap would bound nothing. Reserving up front keeps the bound.
+            //
+            // A request that is then REJECTED is refunded below. Charging it up
+            // front without a refund was the original defect: a request answered
+            // 400 (malformed JSON, empty text, oversize body) had still consumed
+            // quota, so a client could be silenced — and could itself throttle a
+            // legitimate viewer — just by sending bad requests.
             recent.push(now);
             chatRateLimits.set(clientIp, recent);
+            const reservedAt = now;
+            const refund = () => {
+                const stamps = chatRateLimits.get(clientIp);
+                if (!stamps) return;
+                const index = stamps.lastIndexOf(reservedAt);
+                if (index !== -1) stamps.splice(index, 1);
+                if (stamps.length === 0) chatRateLimits.delete(clientIp);
+                else chatRateLimits.set(clientIp, stamps);
+            };
 
             readJsonBody(req).then((data) => {
                 const rawText = typeof data.text === 'string' ? data.text.trim() : '';
                 if (!rawText) {
+                    refund();
                     res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
                     res.end(JSON.stringify({ error: 'Message text cannot be empty' }));
                     return;
                 }
                 if (rawText.length > MAX_MESSAGE_LENGTH) {
+                    refund();
                     res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
                     res.end(JSON.stringify({ error: `Message exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` }));
                     return;
@@ -665,6 +772,7 @@ function handleChat(req, res, requestUrl) {
                 }));
                 res.end(body);
             }).catch((err) => {
+                refund();
                 const status = err && err.payloadTooLarge ? 413 : 400;
                 res.writeHead(status, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
                 res.end(JSON.stringify({ error: err.message || 'Invalid request body' }));
@@ -694,24 +802,45 @@ function handleChat(req, res, requestUrl) {
                 return;
             }
             // Global aggregate ceiling, checked before the stamp is recorded so
-            // a throttled client is not also charged for the attempt.
-            if (nowMs - reactionGlobalWindowStart >= 1000) {
-                reactionGlobalWindowStart = nowMs;
-                reactionGlobalCount = 0;
+            // a throttled client is not also charged for the attempt. The
+            // window is SLIDING: expired stamps are dropped on every check, so
+            // the cap holds across a wall-clock second boundary instead of
+            // resetting at it and letting 2x through.
+            while (reactionGlobalStamps.length && nowMs - reactionGlobalStamps[0] >= 1000) {
+                reactionGlobalStamps.shift();
             }
-            if (reactionGlobalCount >= REACTION_GLOBAL_CAP_PER_SEC) {
+            if (reactionGlobalStamps.length >= REACTION_GLOBAL_CAP_PER_SEC) {
                 res.writeHead(429, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
                 res.end(JSON.stringify({ error: 'Reactions are moving fast right now — try again in a moment.' }));
                 return;
             }
-            reactionGlobalCount += 1;
+            // Both budgets are RESERVED synchronously, before the body is read —
+            // same reasoning as the chat handler. Charging only after validation
+            // would decouple the check from the charge across an await, so N
+            // concurrent reactions would all read the same window and all be
+            // accepted, and the ceiling would bound nothing. A request that is
+            // then answered 400 is REFUNDED, so a malformed body cannot spend
+            // the viewer's budget or the room's on-screen compositing budget.
+            reactionGlobalStamps.push(nowMs);
             reactionStamps.push(nowMs);
             reactionRateLimits.set(reactionIp, reactionStamps);
+            const refundReaction = () => {
+                const globalIndex = reactionGlobalStamps.lastIndexOf(nowMs);
+                if (globalIndex !== -1) reactionGlobalStamps.splice(globalIndex, 1);
+                const perIp = reactionRateLimits.get(reactionIp);
+                if (perIp) {
+                    const ipIndex = perIp.lastIndexOf(nowMs);
+                    if (ipIndex !== -1) perIp.splice(ipIndex, 1);
+                    if (perIp.length === 0) reactionRateLimits.delete(reactionIp);
+                    else reactionRateLimits.set(reactionIp, perIp);
+                }
+            };
 
             readJsonBody(req).then((data) => {
                 const emoji = typeof data.emoji === 'string' ? data.emoji.trim() : '';
                 const validEmojis = ['heart', 'fire', 'clap', 'laugh', 'thumbs'];
                 if (!validEmojis.includes(emoji)) {
+                    refundReaction();
                     res.writeHead(400, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
                     res.end(JSON.stringify({ error: 'Invalid emoji reaction' }));
                     return;
@@ -732,6 +861,7 @@ function handleChat(req, res, requestUrl) {
                 }));
                 res.end(body);
             }).catch((err) => {
+                refundReaction();
                 const status = err && err.payloadTooLarge ? 413 : 400;
                 res.writeHead(status, setCorsHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': CACHE_CONTROL }));
                 res.end(JSON.stringify({ error: err.message || 'Invalid request body' }));
@@ -920,9 +1050,31 @@ server.on('error', (error) => {
     if (error && error.code === 'EADDRINUSE') {
         console.error(`Port ${PORT} is already in use. Stop the other site server or set PORT to a free port before starting.`);
         process.exit(1);
+        return;
     }
+    // Every OTHER error used to be fatal too, which contradicts the
+    // long-lived-host policy stated at the uncaughtException handler below
+    // ("a single stray failure would otherwise kill the whole process
+    // mid-broadcast"). It is not only theoretical: an `http.Server` also
+    // emits 'error' when libuv reports an ACCEPT-side failure — EMFILE /
+    // ENFILE / ECONNABORTED on Windows, all routine under connection
+    // pressure — and `process.exit()` is a deliberate call, so it bypasses
+    // the uncaughtException net entirely. One accept failure from a burst of
+    // viewer connections therefore killed the host instantly, dropping every
+    // viewer's WHEP session, chat stream and status probe at once, when the
+    // correct response was to log it and keep accepting: libuv has already
+    // recovered by the time the event fires.
+    //
+    // Fatal errors that genuinely cannot be survived still exit: a listen
+    // failure other than EADDRINUSE (EACCES on a reserved port, EADDRNOTAVAIL)
+    // means nothing is ever going to be served.
+    const fatal = ['EACCES', 'EADDRNOTAVAIL', 'ENOTFOUND', 'EAI_AGAIN'];
     console.error('Rydius Stream host server error:', error);
-    process.exit(1);
+    if (fatal.includes(error && error.code)) {
+        console.error('This is a fatal listen failure; exiting so the launcher can report it.');
+        process.exit(1);
+    }
+    console.error('Continuing to serve — the listening socket survived.');
 });
 
 // Long-lived-host resilience: a single stray rejected promise (a socket write

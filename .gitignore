@@ -16,5 +16,8 @@ _e2e_*
 # Scratch dirs from manual audits — includes a real Chrome profile (Login Data,
 # Cookies, History, Preferences). Never commit.
 _audit_tmp/
+# Timestamped copies of the studio sources taken before a risky edit. Local
+# scratch only — the live files are the ones at the repo root.
+_studio_backup_*/
 JS_CHECKS_REBUILD_NOTE.md
 repo_checkout/

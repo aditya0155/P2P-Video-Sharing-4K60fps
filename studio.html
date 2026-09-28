@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#080812">
+    <!-- Same reason as index.html: this page sits behind the unlisted stream
+         URL and must never be indexed or linkable from a crawler. -->
+    <meta name="robots" content="noindex, noimageindex">
+    <title>Rydius Studio — Broadcast from this browser</title>
+    <meta name="description" content="Broadcast a screen, window or tab over WebRTC WHIP with no install.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link rel="stylesheet" href="/streaming/studio.css?v=2.26.1">
+</head>
+<body>
+    <div class="ambient-bg" aria-hidden="true">
+        <div class="ambient-orb ambient-orb-1"></div>
+        <div class="ambient-orb ambient-orb-2"></div>
+    </div>
+
+    <div class="studio-shell" id="studio-shell">
+        <header class="studio-header">
+            <div class="studio-header-left">
+                <a class="studio-back" id="back-to-watch" href="/streaming/" title="Back to the watch page" aria-label="Back to the watch page">
+                    <i class="fa-solid fa-arrow-left" aria-hidden="true"></i>
+                </a>
+                <div class="studio-title-group">
+                    <h1 class="studio-title">Rydius Studio</h1>
+                    <span class="studio-subtitle">Broadcast from this browser — no install</span>
+                </div>
+            </div>
+
+            <div class="studio-header-right">
+                <div class="studio-status" id="studio-status" role="status" aria-live="polite" data-state="idle">
+                    <span class="studio-status-dot"></span>
+                    <span class="studio-status-text" id="studio-status-text">Ready</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Experimental notice. Deliberately above the fold and NOT dismissible:
+             the failure it warns about is invisible to the host. A 12 fps capture
+             previews as a perfectly smooth local slideshow, so the broadcaster's own
+             eye confirms nothing is wrong - viewers are the only ones who can tell,
+             and only if they were told. A close button would just train people to
+             hide the one message that matters. -->
+        <section class="studio-notice" aria-labelledby="studio-notice-title">
+            <div class="studio-notice-head">
+                <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+                <h2 class="studio-notice-title" id="studio-notice-title">Experimental &mdash; expect a very low frame rate</h2>
+            </div>
+
+            <p class="studio-notice-body">
+                Broadcasting from this browser is <b>experimental and buggy</b>, and it very likely
+                gives you <b>very low FPS</b>. This page has to capture, encode and upload the video
+                on the same machine at the same time, and it silently drops frames whenever it
+                cannot keep up with all three. For a real broadcast, use <b>OBS Studio over
+                WHIP</b> instead &mdash; it is stable and holds full frame rate:
+            </p>
+
+            <ol class="studio-notice-steps">
+                <li>In OBS open <b>Settings &rarr; Stream</b> and set <b>Service</b> to <code>WHIP</code>.</li>
+                <li>Set <b>Server</b> to <code>http://127.0.0.1:8889/live/whip</code> and leave the <b>Bearer token</b> empty.</li>
+                <li>Under <b>Output &rarr; Streaming</b>: encoder <code>NVENC AV1</code> (or <code>NVENC H.264</code>), rate control <b>CBR</b>, keyframe interval <b>1 second</b>, <b>Max B-frames 0</b>, and disable <b>Look-ahead</b>.</li>
+                <li>Click <b>Start Streaming</b>. WHIP is also the only OBS path that carries sound natively (Opus), so viewers hear audio.</li>
+            </ol>
+
+            <p class="studio-notice-foot">
+                Both paths publish to the same <code>live</code> stream, so viewers cannot tell the
+                difference. The full settings list is on the
+                <a class="studio-notice-link" href="/streaming/">watch page</a>.
+            </p>
+        </section>
+
+        <main class="studio-main">
+            <section class="studio-panel studio-preview-panel" aria-label="Preview">
+                <div class="studio-preview-stage" id="preview-stage">
+                    <video id="studio-preview" autoplay playsinline muted aria-label="Local preview of what is being broadcast"></video>
+
+                    <div class="studio-preview-empty" id="preview-empty">
+                        <i class="fa-solid fa-desktop"></i>
+                        <p>No source selected</p>
+                        <span>Pick a screen, window or tab to begin.</span>
+                    </div>
+
+                    <div class="studio-meters" id="studio-meters" hidden>
+                        <div class="studio-meter">
+                            <span class="studio-meter-label">Bitrate</span>
+                            <span class="studio-meter-value" id="meter-bitrate">0 kbps</span>
+                        </div>
+                        <div class="studio-meter">
+                            <span class="studio-meter-label">FPS</span>
+                            <span class="studio-meter-value" id="meter-fps">0</span>
+                        </div>
+                        <div class="studio-meter">
+                            <span class="studio-meter-label">Resolution</span>
+                            <span class="studio-meter-value" id="meter-resolution">—</span>
+                        </div>
+                        <div class="studio-meter">
+                            <span class="studio-meter-label">Codec</span>
+                            <span class="studio-meter-value" id="meter-codec">—</span>
+                        </div>
+                        <div class="studio-meter">
+                            <span class="studio-meter-label">RTT</span>
+                            <span class="studio-meter-value" id="meter-rtt">— ms</span>
+                        </div>
+                        <div class="studio-meter">
+                            <span class="studio-meter-label">Keyframes</span>
+                            <span class="studio-meter-value" id="meter-keyframes">0</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="studio-transport">
+                    <button class="studio-btn studio-btn-primary" id="btn-start" type="button" disabled>
+                        <i class="fa-solid fa-circle-play"></i>
+                        <span id="btn-start-label">Start broadcasting</span>
+                    </button>
+                    <button class="studio-btn studio-btn-danger" id="btn-stop" type="button" hidden>
+                        <i class="fa-solid fa-stop"></i>
+                        <span>Stop</span>
+                    </button>
+                    <div class="studio-transport-note" id="transport-note">Choose a source to unlock broadcasting.</div>
+                </div>
+            </section>
+
+            <aside class="studio-panel studio-controls" aria-label="Broadcast settings">
+                <div class="studio-group">
+                    <h2 class="studio-group-title"><i class="fa-solid fa-desktop" aria-hidden="true"></i> Source</h2>
+
+                    <div class="studio-field">
+                        <span class="studio-label" id="source-mode-label">Share</span>
+                        <!-- Roving tabindex: a role="radiogroup" must be a single tab
+                             stop with the arrow keys moving within it. All three
+                             buttons used to be in the tab order, so Tab walked
+                             straight past a control that announces itself as a
+                             single choice. studio.js keeps tabIndex in sync with
+                             the .active class on every change. -->
+                        <div class="studio-segmented" role="radiogroup" aria-labelledby="source-mode-label">
+                            <button type="button" class="studio-seg active" id="mode-screen" role="radio" aria-checked="true" tabindex="0" data-mode="monitor">Screen</button>
+                            <button type="button" class="studio-seg" id="mode-window" role="radio" aria-checked="false" tabindex="-1" data-mode="window">Window</button>
+                            <button type="button" class="studio-seg" id="mode-tab" role="radio" aria-checked="false" tabindex="-1" data-mode="browser">Tab</button>
+                        </div>
+                    </div>
+
+                    <div class="studio-source-info" id="source-info" hidden>
+                        <i class="fa-solid fa-circle-check" id="source-info-icon"></i>
+                        <span id="source-info-text">—</span>
+                    </div>
+
+                    <button class="studio-btn studio-btn-secondary studio-btn-block" id="btn-pick-source" type="button" aria-describedby="source-hint">
+                        <i class="fa-solid fa-display" aria-hidden="true"></i>
+                        <span>Choose what to share</span>
+                    </button>
+                    <p class="studio-hint" id="source-hint">
+                        The browser picker opens next. Everything is captured locally — only the encoded
+                        stream leaves this machine.
+                    </p>
+                </div>
+
+                <div class="studio-group">
+                    <h2 class="studio-group-title"><i class="fa-solid fa-volume-high" aria-hidden="true"></i> Audio</h2>
+
+                    <div class="studio-audio-row">
+                        <label class="studio-check" for="chk-mic">
+                            <input type="checkbox" id="chk-mic" checked aria-describedby="audio-hint">
+                            <span class="studio-switch" aria-hidden="true"></span>
+                            <span>Microphone</span>
+                        </label>
+                        <div class="studio-slider-row" id="mic-gain-row">
+                            <input type="range" id="mic-gain" class="studio-slider" min="0" max="200" step="5" value="100" title="Microphone level" aria-label="Microphone level">
+                            <span class="studio-slider-value" id="mic-gain-value">100%</span>
+                        </div>
+                    </div>
+
+                    <div class="studio-audio-row">
+                        <label class="studio-check" for="chk-system-audio">
+                            <input type="checkbox" id="chk-system-audio" checked aria-describedby="audio-hint">
+                            <span class="studio-switch" aria-hidden="true"></span>
+                            <span id="system-audio-label">System / tab audio</span>
+                        </label>
+                        <div class="studio-slider-row" id="system-gain-row">
+                            <input type="range" id="system-gain" class="studio-slider" min="0" max="200" step="5" value="100" title="System audio level" aria-label="System audio level">
+                            <span class="studio-slider-value" id="system-gain-value">100%</span>
+                        </div>
+                    </div>
+
+                    <div class="studio-meter-bar-wrap">
+                        <!-- aria-hidden: studio.js rewrites the fill width every
+                             animation frame, so exposing it as a live value would
+                             flood assistive technology. The channel states are
+                             announced through the real inputs and #audio-hint. -->
+                        <div class="studio-meter-bar" aria-hidden="true"><div class="studio-meter-bar-fill" id="outgoing-level" style="width:0%"></div></div>
+                        <div class="studio-meter-scale" aria-hidden="true"><i></i><i></i><i></i></div>
+                        <span class="studio-meter-bar-label">Outgoing mix</span>
+                    </div>
+                    <!-- role=status because studio.js REPLACES this text whenever
+                         system-audio availability changes (syncAudioAvailability).
+                         Without it, a screen-reader user gets no signal that the
+                         stream has just silently gone video-only. -->
+                    <p class="studio-hint" id="audio-hint" role="status">
+                        System audio is offered by the picker itself. If it is not offered, the stream
+                        is published video-only.
+                    </p>
+                </div>
+
+                <div class="studio-group">
+                    <h2 class="studio-group-title"><i class="fa-solid fa-sliders" aria-hidden="true"></i> Encoder</h2>
+
+                    <div class="studio-field">
+                        <label class="studio-label" for="sel-codec">Codec</label>
+                        <select id="sel-codec" class="studio-select">
+                            <option value="h264" selected>H.264 (best compatibility)</option>
+                            <option value="av1">AV1 (lowest bandwidth)</option>
+                            <option value="vp9">VP9</option>
+                            <option value="vp8">VP8 (lowest CPU)</option>
+                        </select>
+                    </div>
+                    <p class="studio-hint" id="codec-hint">
+                        H.264 plays in every browser. AV1 saves the most upload; the host re-encodes the
+                        other codec automatically so no viewer is left out.
+                    </p>
+
+                    <div class="studio-field">
+                        <label class="studio-label" for="sel-resolution">Resolution</label>
+                        <select id="sel-resolution" class="studio-select">
+                            <option value="0">Match source</option>
+                            <option value="2160">3840 × 2160 (4K)</option>
+                            <option value="1440">2560 × 1440 (1440p)</option>
+                            <option value="1080" selected>1920 × 1080 (1080p)</option>
+                            <option value="720">1280 × 720 (720p)</option>
+                            <option value="480">854 × 480 (480p)</option>
+                        </select>
+                    </div>
+
+                    <div class="studio-field">
+                        <label class="studio-label" for="sel-framerate">Frame rate</label>
+                        <select id="sel-framerate" class="studio-select">
+                            <option value="60" selected>60 fps</option>
+                            <option value="30">30 fps</option>
+                            <option value="24">24 fps</option>
+                            <option value="15">15 fps</option>
+                        </select>
+                    </div>
+
+                    <div class="studio-field">
+                        <label class="studio-label" for="rng-bitrate">
+                            Video bitrate
+                            <span class="studio-label-value" id="bitrate-value">6000 kbps</span>
+                        </label>
+                        <input type="range" id="rng-bitrate" class="studio-slider" min="500" max="20000" step="250" value="6000" title="Video bitrate" aria-label="Video bitrate">
+                    </div>
+
+                    <div class="studio-field">
+                        <label class="studio-label" for="sel-audio-bitrate">Audio bitrate</label>
+                        <select id="sel-audio-bitrate" class="studio-select">
+                            <option value="64000">64 kbps</option>
+                            <option value="96000">96 kbps</option>
+                            <option value="128000" selected>128 kbps</option>
+                            <option value="192000">192 kbps</option>
+                        </select>
+                    </div>
+
+                    <div class="studio-field">
+                        <label class="studio-check" for="chk-cbr">
+                            <input type="checkbox" id="chk-cbr" checked>
+                            <span class="studio-switch" aria-hidden="true"></span>
+                            <span>Constant bitrate (CBR)</span>
+                        </label>
+                    </div>
+
+                    <p class="studio-hint" id="encoder-hint">
+                        Leave ~25% of your upload free. Changes apply live — no need to restart.
+                    </p>
+                </div>
+            </aside>
+        </main>
+
+        <div class="studio-toast" id="studio-toast" role="status" aria-live="polite" hidden>
+            <i class="fa-solid fa-circle-info" id="toast-icon"></i>
+            <span id="studio-toast-text"></span>
+            <button class="studio-toast-close" id="toast-close" type="button" aria-label="Dismiss">&times;</button>
+        </div>
+
+        <div class="studio-busy" id="studio-busy" hidden aria-hidden="true">
+            <div class="spinner-container">
+                <div class="spinner-ring spinner-ring-outer"></div>
+                <div class="spinner-ring spinner-ring-inner"></div>
+            </div>
+            <span class="studio-busy-text" id="studio-busy-text">Starting broadcast…</span>
+        </div>
+    </div>
+
+    <script src="/streaming/studio.js?v=2.26.1"></script>
+</body>
+</html>

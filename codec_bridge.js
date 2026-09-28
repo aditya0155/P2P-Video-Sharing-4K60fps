@@ -106,7 +106,26 @@ const GIVE_UP_BACKOFF_MS = (() => {
 })();
 // Wall clock of the last run long enough (>=300s) to count as a real broadcast.
 // A crash loop that never reaches that must eventually trip the breaker.
-let lastHealthyRunAt = 0;
+//
+// `null`, not 0, and the elapsed time is measured from the process's own start
+// when no healthy run has happened yet. The previous `0` initial value was
+// falsy, so the check below took its `: Infinity` branch and
+// `Infinity > 15 * 60 * 1000` is unconditionally true — the 15-minute health
+// window was never measured from any baseline at all, and the breaker fired on
+// the VERY FIRST ffmpeg exit, `failures` still 0. That nullified the entire
+// retry design: every exit shorter than 300s — an OBS auto-reconnect, a host
+// stall, a 35s crash cycle, all of which the code around it was explicitly
+// written to survive — logged "giving up after 0 failed attempts", slept the
+// 60s backoff with no transcoder running, and exited. Under
+// runOnAvailableRestart that re-launches the hook, which republishes with
+// overridePublisher and KICKS the healthy publisher, dropping the RTMP
+// connection and tearing down every WHEP session on the path. The restart loop
+// then repeated until MediaMTX's hook budget was gone and the renditions stayed
+// dead for the rest of the broadcast.
+const HEALTHY_RUN_SECONDS = 300;
+const NO_HEALTHY_RUN_GIVE_UP_MS = 15 * 60 * 1000;
+const bridgeStartedAt = Date.now();
+let lastHealthyRunAt = null;
 // A transcoder that has produced no rendition video this long is hung — most
 // commonly an OBS WHIP AV1 source whose fragmented keyframes never reassemble
 // on the RTSP leg (verified live: the pre-keyframe drop loop never syncs).
@@ -470,7 +489,23 @@ const GPU_DECODE_BLOCK_MS = 24 * 60 * 60 * 1000;
 
 function readGpuDecodeState() {
     try {
-        return JSON.parse(fs.readFileSync(GPU_DECODE_STATE_FILE, 'utf8'));
+        const parsed = JSON.parse(fs.readFileSync(GPU_DECODE_STATE_FILE, 'utf8'));
+        // JSON.parse SUCCEEDS for `null`, `"x"`, `42` and `[1]` — only a
+        // syntactically invalid file lands in the catch. Returning such a value
+        // was a live crash: the callers assign a property on the result
+        // (`state[decoder] = ...`), which under this file's 'use strict' throws
+        // `TypeError: Cannot set properties of null` on null and on a primitive
+        // string/number. rememberGpuDecodeFailure is called from inside the
+        // retry loop with no try around it, so that rejected the whole main()
+        // and landed in the top-level `fatal:` handler — and because the bad
+        // file is never repaired, every later bridge start repeated it. A
+        // persistent wedge, not a one-off. Anything that is not a plain object
+        // is treated as "no usable state".
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            logError('GPU decode state file is not a JSON object; ignoring it.');
+            return {};
+        }
+        return parsed;
     } catch (err) {
         return {};
     }
@@ -928,7 +963,7 @@ async function main() {
         // whole room hard-stops and rejoins roughly every 37 seconds for the
         // entire broadcast. A real, long, uninterrupted run is the only proof
         // that deserves forgiveness at the circuit-breaker level.
-        if (runSeconds >= 300) {
+        if (runSeconds >= HEALTHY_RUN_SECONDS) {
             lastHealthyRunAt = Date.now();
         }
 
@@ -1012,13 +1047,18 @@ async function main() {
         // tripped, or the bridge has been crash-cycling without ever producing
         // a genuinely long run — which the strike counter cannot see, because a
         // 35s crash cycle keeps clearing it.
-        const noHealthyRunFor = lastHealthyRunAt
-            ? Date.now() - lastHealthyRunAt
-            : Infinity;
+        //
+        // The baseline for "no healthy run for" is the process start until the
+        // first >=300s run happens. Using `Infinity` until then made the
+        // comparison always true, so the breaker fired on the first exit of the
+        // process; the real intent is "15 minutes of wall clock during which no
+        // run ever lasted long enough to prove the configuration works".
+        const healthyBaseline = lastHealthyRunAt === null ? bridgeStartedAt : lastHealthyRunAt;
+        const noHealthyRunFor = Date.now() - healthyBaseline;
         if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES
-            || noHealthyRunFor > 15 * 60 * 1000) {
+            || noHealthyRunFor > NO_HEALTHY_RUN_GIVE_UP_MS) {
             logError(`giving up after ${failures} failed attempts`
-                + (noHealthyRunFor === Infinity ? '' : ` (no healthy run for ${Math.round(noHealthyRunFor / 1000)}s)`));
+                + ` (no healthy run for ${Math.round(noHealthyRunFor / 1000)}s)`);
             if (plan.sourceCodec === 'AV1') {
                 logError(`known limitation: an OBS WHIP AV1 source whose keyframes never reassemble on `
                     + `the RTSP leg cannot be bridged — AV1-capable viewers still play the native `

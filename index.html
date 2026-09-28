@@ -28,7 +28,7 @@
     <!-- FontAwesome Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <!-- Custom CSS -->
-<link rel="stylesheet" href="/streaming/style.css?v=2.24.0">
+<link rel="stylesheet" href="/streaming/style.css?v=2.25.1">
 </head>
 <body>
     <!-- Ambient Background -->
@@ -55,6 +55,15 @@
                     <i class="fa-solid fa-wand-magic-sparkles"></i>
                     <span id="perf-toggle-label">Reduce effects</span>
                 </button>
+
+                <!-- Broadcast Studio: the no-install screen-share broadcaster.
+                     Kept as a real link (not a script-built click) so it opens
+                     in a new tab, works with middle-click, and is visible to
+                     a keyboard user as part of the page's normal tab order. -->
+                <a class="studio-link-btn" id="open-studio-btn" href="/streaming/studio?v=2.25.1" target="_blank" rel="noopener" title="Broadcast a screen, window or tab from this browser (opens in a new tab)" aria-label="Open the broadcast studio in a new tab">
+                    <i class="fa-solid fa-tower-broadcast"></i>
+                    <span>Broadcast</span>
+                </a>
 
                 <!-- Status Badge -->
                 <div class="status-badge offline" id="status-badge" role="status" aria-live="polite">
@@ -143,7 +152,7 @@
                         <div class="hud-audio-container">
                             <div class="hud-chart-label">Audio Playout Level</div>
                             <div class="hud-audio-bar">
-                                <div class="hud-audio-level" id="hud-audio-level" style="width: 0%"></div>
+                                <div class="hud-audio-level" id="hud-audio-level"></div>
                             </div>
                         </div>
 
@@ -214,8 +223,8 @@
                             </div>
                             <div class="controls-right">
                                 <!-- Adaptive Latency Mode Switcher (JS syncs icon/title to the loaded mode) -->
-                                <button class="control-btn" id="latency-mode-btn" title="Latency Buffer: Balanced (180ms)" aria-label="Change latency buffer">
-                                    <i class="fa-solid fa-gauge-high"></i>
+                                <button class="control-btn" id="latency-mode-btn" title="Latency Buffer: Cinema (1s)" aria-label="Change latency buffer">
+                                    <i class="fa-solid fa-film"></i>
                                 </button>
 
                                 <!-- Picture in Picture -->
@@ -395,6 +404,6 @@
     </div>
 
     <!-- Custom JavaScript -->
-<script src="/streaming/app.js?v=2.24.0"></script>
+<script src="/streaming/app.js?v=2.25.1"></script>
 </body>
 </html>
