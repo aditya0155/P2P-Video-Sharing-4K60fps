@@ -532,14 +532,32 @@ Object.assign(cases, {
             'B-frames break WebRTC decoders (README rule)');
 
         const aacPlan = bridge.decideBridge(['MPEG-4 Audio', 'H264']);
-        assertEqual(aacPlan.audioArgs,
-            ['-c:a', 'libopus', '-b:a', '160k', '-af', 'aresample=async=1'],
+        const aacArgs = aacPlan.audioArgs.join(' ');
+        assertEqual(aacPlan.audioArgs.slice(0, 4), ['-c:a', 'libopus', '-b:a', '160k'],
             'AAC source audio must be re-encoded to Opus for WebRTC readers');
+        // WebRTC's Opus clock is 48000Hz by definition (RFC 7587), so the
+        // encoder must be pinned to it rather than left to resample a 44.1kHz
+        // source — which is exactly what YouTube's own stereo guidance
+        // recommends, so this is the common case, not an edge case. `-ac 2`
+        // matches the stereo layout WebRTC negotiates.
+        assert(aacArgs.includes('-ar 48000'),
+            'the Opus rescue must be pinned to the 48kHz WebRTC clock');
+        assertEqual(aacPlan.audioArgs[aacPlan.audioArgs.indexOf('-ar') + 1], '48000',
+            'the Opus sample rate must be exactly 48000');
+        assert(aacArgs.includes('-ac 2'), 'the Opus rescue must match WebRTC stereo');
+        // The default `audio` application permits encoder lookahead — audio
+        // latency the video path deliberately refuses to accept. `lowdelay`
+        // plus a 20ms frame is the WebRTC convention and bounds the jitter
+        // buffer's granularity.
+        assert(aacArgs.includes('-application lowdelay'),
+            'live audio must not pay the default application lookahead');
+        assertEqual(aacPlan.audioArgs[aacPlan.audioArgs.indexOf('-frame_duration') + 1], '20',
+            'the Opus frame size must match the 20ms WebRTC convention');
         // Drift correction on the rescue audio: without it a source clock that
         // runs slightly fast makes Opus timestamps walk ahead of video, and the
         // browser's A/V sync layer then nudges playbackRate forever — a
         // permanent micro-correction that reads as jank rather than desync.
-        assert(aacPlan.audioArgs.join(' ').includes('aresample=async=1'),
+        assert(aacArgs.includes('aresample=async=1'),
             'the Opus rescue must resample asynchronously to stop A/V timestamp drift');
         // ... but it must NOT re-base the audio onto the video head. Measured
         // with the bundled ffmpeg on a source whose audio starts 279ms after its
@@ -550,8 +568,40 @@ Object.assign(cases, {
         // track's first packet, so every rendition gets a permanent lip-sync
         // error equal to the source's own A/V offset — which viewers report as
         // the video being "janky" when it is purely an audio offset.
-        assert(!aacPlan.audioArgs.join(' ').includes('first_pts'),
+        assert(!aacArgs.includes('first_pts'),
             'the Opus rescue must not re-base audio with first_pts: it destroys the source A/V offset');
+
+        // Both encoder blocks must be bitrate-honest and frame-honest.
+        for (const [label, plan] of [['h264', av1Plan], ['av1', h264Plan]]) {
+            const args = plan.videoArgs;
+            const j = (flag) => args[args.indexOf(flag) + 1];
+            // Adaptive quantization is OFF by default in ffmpeg's NVENC wrapper
+            // (verified: `-spatial_aq <boolean> ... (default false)`), so without
+            // this the encoder spreads bits uniformly instead of by regional
+            // complexity. Measured A/B on the bundled encoder (1080p60, 6000k,
+            // 12s, -g 30): total +0.15%, average 6.01->6.02 Mbps, 100ms peak
+            // 8.96->8.64 Mbps. Bitrate-neutral, and the peak it lowers is what
+            // overflows MediaMTX's per-reader write queue on keyframes.
+            assertEqual(j('-spatial-aq'), '1', `${label}: spatial AQ must be enabled`);
+            assertEqual(j('-aq-strength'), '8', `${label}: AQ strength must be explicit`);
+            // ffmpeg's default -fps_mode is 'auto', which may duplicate or drop
+            // frames to hold a constant rate. On a live transcode of a live
+            // source that manufactures frame-count discontinuities — exactly the
+            // hitch this project exists to prevent.
+            assertEqual(j('-fps_mode'), 'passthrough',
+                `${label}: one output frame per input frame`);
+            // -g counts FRAMES, so the designed 0.5s interval must come from
+            // the probe, not from a hard-coded count. '60' was 1.0s at 60fps
+            // and 2.5s at 24fps — double to five times the intent, silently.
+            assert(args.includes('-g'), `${label}: a keyframe interval must be declared`);
+            // The GOP must be the probed frame count, or the 0.5s designed
+            // interval derived from it. A bare `!args.includes('60')` guard was
+            // useless here: `includes` is an exact element match and the array
+            // holds '6000k', so the check was always true and short-circuited the
+            // half of the || that does the real work.
+            assertEqual(args[args.indexOf('-g') + 1], '30',
+                `${label}: GOP fallback must be the 0.5s designed interval, not a hard-coded 60`);
+        }
 
         assertEqual(bridge.decideBridge(['Opus']), null, 'audio-only source must not bridge');
         assertEqual(bridge.decideBridge(null), null, 'missing tracks must not bridge');
@@ -579,7 +629,19 @@ Object.assign(cases, {
         assert(av1Plan.videoArgs.join(' ').includes('-tune ull'),
             'NVENC must run ultra-low-latency tune (no lookahead)');
         const gIdx = av1Plan.videoArgs.indexOf('-g');
-        assertEqual(av1Plan.videoArgs[gIdx + 1], '60', '1s keyframe interval at 60fps');
+        // The designed interval is DEFAULT_GOP_SECONDS = 0.5s, so at the
+        // assumed 60fps that is 30 frames. This assertion used to pin '60',
+        // which is 1.0s at 60fps — the `env.gopFrames || '60'` fallback
+        // silently contradicting the constant two lines above it in the same
+        // file. 1.0s keyframes double the worst-case freeze after a lost
+        // keyframe, which is the single largest lever on perceived stutter.
+        assertEqual(av1Plan.videoArgs[gIdx + 1], '30',
+            '0.5s keyframe interval at 60fps, matching DEFAULT_GOP_SECONDS');
+        // ... and an explicit env.gopFrames must still win, so the probe result
+        // is never overridden by the fallback.
+        const probed = bridge.decideBridge(['AV1', 'Opus'], { gopFrames: '12' });
+        assertEqual(probed.videoArgs[probed.videoArgs.indexOf('-g') + 1], '12',
+            'a probed frame rate must override the assumed-rate fallback');
         assert(av1Plan.videoArgs.join(' ').includes('-forced-idr 1'),
             'keyframes must be forced as IDR frames for fast decoder lock-on');
 
@@ -967,6 +1029,149 @@ Object.assign(cases, {
         assertEqual(fn(150, 100), 450, 'a rising floor applies immediately');
         assertEqual(fn(20, 200), 175, 'a calming floor decays one 25ms step per tick');
         assertEqual(fn(0, 50), 25, 'decay reaches zero stepwise, never jumps');
+    },
+    // jitterBufferTarget is a HINT, not a command: the spec gives the UA a min
+    // and max target "reflecting what the user agent is able or willing to
+    // provide", so the number written is not evidence of the number in force.
+    // jitterBufferTargetDelay is the standardized read-back, defined in exactly
+    // the same cumulative terms as jitterBufferDelay, so the SAME windowed
+    // delta formula applies to it.
+    'granted-target-readback'() {
+        const { fn } = compileFunction('windowedGrantedTargetMs', {});
+        // 3 samples emitted over a window that accumulated 0.9s of target =>
+        // a 300ms average granted target.
+        assertEqual(fn(1.2, 303, 0.3, 300), 300,
+            'granted target is the windowed delta/delta, in ms');
+        // A counter that moved backwards (session restart, re-baseline) is not
+        // a measurement: the delta would be negative and the average garbage.
+        assertEqual(fn(0.2, 303, 0.9, 300), null,
+            'a counter that went backwards is not a measurement');
+        assertEqual(fn(1.2, 303, 0.3, 303), null,
+            'a window that emitted nothing is not a measurement');
+        assertEqual(fn(1.2, 300, 0.3, 300), null,
+            'the very first tick has no baseline and must not report');
+        assertEqual(fn(1.2, 0, 0, 0), null,
+            'a session that has emitted nothing reports nothing');
+    },
+    // The requested-vs-granted gap is the signal that a write is inert. It is a
+    // DIAGNOSTIC only and must never feed the control law, so a surprising
+    // reading cannot oscillate the buffer.
+    'granted-target-gap'() {
+        const { fn } = compileFunction('grantedTargetGapMs', {});
+        assertEqual(fn(350, 350), 0, 'an honoured target has no gap');
+        assertEqual(fn(120, 350), -230,
+            'a UA clamping below the request shows as a negative gap');
+        assertEqual(fn(800, 350), 450,
+            'a UA holding more than requested shows as a positive gap');
+        assertEqual(fn(null, 350), null, 'no read-back reported -> no claim');
+        assertEqual(fn(350, null), null, 'no request to compare against');
+        assertEqual(fn(NaN, 350), null, 'a NaN read-back is not a measurement');
+        assertEqual(fn(-1, 350), null, 'a negative delay is nonsense, not a gap');
+        assertEqual(fn(999999, 0), 4000, 'the gap is clamped for reporting');
+        assertEqual(fn(0, 999999), -4000, 'the negative gap is clamped too');
+    },
+    // The setter's documented range is [0, 4000]; out-of-range throws a
+    // RangeError. Nothing enforced that before, so a future bump to any cap
+    // above 4000 would throw on every write and silently disable buffer
+    // control while the HUD kept advertising a target.
+    'jitter-target-clamp'() {
+        const { fn } = compileFunction('clampJitterBufferTargetMs', {
+            JITTER_TARGET_MAX_MS: 4000, JITTER_TARGET_MIN_MS: 0,
+        });
+        assertEqual(fn(180), 180, 'an in-range target is untouched');
+        assertEqual(fn(0), 0, 'zero is legal');
+        assertEqual(fn(4000), 4000, 'the maximum is legal');
+        assertEqual(fn(4001), 4000, 'above the maximum is clamped down');
+        assertEqual(fn(99999), 4000, 'a wildly high cap cannot throw a RangeError');
+        assertEqual(fn(-5), 0, 'a negative target is clamped to zero');
+        assertEqual(fn(NaN), null, 'a non-finite target is not a write');
+        assertEqual(fn(undefined), null, 'an undefined target is not a write');
+    },
+    // playbackRate reads 1.0 for a MediaStream, so the ONLY instrument for
+    // "the video speeds up / slows down" is d(mediaTime)/d(wall) from rVFC. A
+    // buffer surplus gets spent by running fast, which is that exact symptom.
+    'effective-playback-rate'() {
+        const { fn } = compileFunction('effectivePlaybackRate', {
+            PLAYBACK_RATE_SMOOTHING: 0.15,
+        });
+        assertEqual(fn(0.0167, 0.0167, null), 1,
+            'a perfectly paced element measures exactly 1.0');
+        const fast = fn(0.05, 0.0167, null);
+        assert(fast > 2.9 && fast < 3.1,
+            'media time advancing 3x wall time measures ~3.0 (the "speeds up" case)');
+        let rate = 1;
+        rate = fn(0.0167, 0.0167, rate);
+        assertEqual(rate, 1, 'steady 1.0 input holds 1.0');
+        // The EMA must stop one outlying frame pair from dominating. A 6x pair
+        // (a frame delivered in a burst after a stall) is the worst case: it
+        // must move the smoothed rate a long way short of 6, or a single stall
+        // would be reported as the stream "running at 6x".
+        const spiked = fn(0.1, 0.0167, rate);
+        assert(spiked > 1, 'a fast frame must still move the rate up');
+        assert(spiked < 2,
+            `one burst frame cannot dominate the average (got ${spiked}, raw was ~6)`);
+        // And it must recover: subsequent on-pace frames pull it back to 1.
+        let recovering = spiked;
+        for (let i = 0; i < 40; i++) recovering = fn(0.0167, 0.0167, recovering);
+        assert(Math.abs(recovering - 1) < 0.01,
+            `the rate must converge back to 1.0 after the burst (got ${recovering})`);
+        // Unmeasurable windows keep the previous reading rather than poisoning
+        // it with NaN or zero.
+        assertEqual(fn(0.02, 0, 1), 1, 'a zero wall interval keeps the last rate');
+        assertEqual(fn(NaN, 0.0167, 1), 1, 'a bad mediaTime keeps the last rate');
+        assertEqual(fn(0.0167, 0.0167, 0), 1,
+            'a zero previous rate is treated as no previous rate');
+        assertEqual(fn(0.0167, 0.0167, null), 1, 'a null previous rate seeds cleanly');
+    },
+    // Audio clock drift in ppm, from totalSamplesDuration vs wall time. A few
+    // hundred ppm walks tens of ms per minute and the browser then corrects
+    // continuously, which reads as jank rather than as desync.
+    'audio-clock-drift'() {
+        const { fn } = compileFunction('audioClockDriftPpm', {});
+        // ppm is a ratio of two floats, so these are compared with a tolerance
+        // rather than for exact equality: 10.01/10 evaluates to 999.99999999...,
+        // and demanding an exact 1000 here would be asserting on IEEE754 rather
+        // than on the formula.
+        const near = (actual, expected, tol, label) => {
+            assert(actual !== null && Math.abs(actual - expected) <= tol,
+                `${label}\n  expected: ~${expected}\n  actual:   ${actual}`);
+        };
+        near(fn(10, 10), 0, 1e-6, 'audio time matching wall time is 0ppm');
+        near(fn(10.01, 10), 1000, 1e-3, 'audio running 1000ppm fast reads +1000');
+        near(fn(9.99, 10), -1000, 1e-3, 'audio running 1000ppm slow reads -1000');
+        // 30ms of skew over a minute is ~500ppm: audible as drift across a
+        // session, and the value this exists to catch.
+        near(fn(60.03, 60), 500, 1, '30ms of skew over a minute is ~500ppm');
+        assertEqual(fn(10, 0), null, 'a zero wall interval is not a measurement');
+        assertEqual(fn(0, 10), null, 'no audio time elapsed is not a measurement');
+        assertEqual(fn(NaN, 10), null, 'a NaN counter is not a measurement');
+        assertEqual(fn(10, NaN), null, 'a NaN wall clock is not a measurement');
+    },
+    // The spec defines a freeze as a rendered-frame gap of at least
+    // max(3 * avg_frame_duration_ms, avg_frame_duration_ms + 150). The point of
+    // the formula is that the bound is NOT one constant: across real frame
+    // rates it moves from ~158ms at 120fps to ~192ms at 24fps, and the 3x term
+    // only takes over below ~13.3fps. A single constant is either too tight at
+    // low frame rates (firing constantly) or too loose at high ones (missing
+    // real freezes).
+    'spec-freeze-threshold'() {
+        const { fn } = compileFunction('specFreezeThresholdMs', {});
+        const near = (actual, expected, label) => {
+            assert(actual !== null && Math.abs(actual - expected) < 0.01,
+                `${label}\n  expected: ~${expected}\n  actual:   ${actual}`);
+        };
+        near(fn(1000 / 120), 158.3333, '120fps: avg+150 dominates (158.3ms)');
+        near(fn(1000 / 60), 166.6667, '60fps: avg+150 dominates (166.7ms)');
+        near(fn(1000 / 50), 170, '50fps: avg+150 dominates (170ms)');
+        near(fn(1000 / 30), 183.3333, '30fps: avg+150 dominates (183.3ms)');
+        near(fn(1000 / 24), 191.6667, '24fps: avg+150 dominates (191.7ms)');
+        // Below ~13.3fps the 3x term overtakes the +150 term.
+        near(fn(1000 / 10), 300, '10fps: the 3x term takes over (300ms)');
+        assert(fn(1000 / 24) !== fn(1000 / 60),
+            'the threshold must vary with frame rate, not be a constant');
+        assertEqual(fn(0), null, 'a zero frame duration is not measurable');
+        assertEqual(fn(NaN), null, 'a NaN frame duration is not measurable');
+        assertEqual(fn(-5), null, 'a negative frame duration is not measurable');
     },
     // The accommodation must be drop-gated: the measured jitter-buffer delay
     // always tracks the jitterBufferTarget hint Chrome was given, so a
