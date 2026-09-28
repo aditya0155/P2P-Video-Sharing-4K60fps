@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from http.client import HTTPConnection
@@ -74,17 +75,48 @@ def start_node_server(node, env_overrides):
     )
 
 
-def wait_until_ready(test_case, process, base_url, timeout=8):
+class SiteStartupError(Exception):
+    """server.js exited before it answered; ``output`` is everything it printed."""
+
+    def __init__(self, message, output=""):
+        super().__init__(message)
+        self.output = output or ""
+
+
+def wait_until_ready(test_case, process, base_url, timeout=15):
+    """Block until the site server answers /streaming/.
+
+    Raises SiteStartupError - carrying the child's own stdout/stderr - if the
+    process dies first, and fails the test if it stays up but never answers.
+    Surfacing that output is the whole point: every way this server can fail at
+    startup says why on the way out ("Port N is already in use", "PORT must be
+    a valid TCP port"), and discarding it collapses all of them into one opaque
+    "exited before becoming ready" that reads like a product bug. That is how a
+    port collision came to be reported against the static-file allowlist.
+
+    The per-attempt budget is 2s rather than a fraction of a second because a
+    cold server.js answers its first request in ~0.52s (median of 25 boots on
+    this host, max 1.05s) while every later request takes 3-25ms. A 0.5s
+    attempt budget therefore sat directly on top of the median, so the probe
+    discarded its first attempt on most boots and only ever succeeded on a
+    retry - and under load, when the cold request runs long, the retries were
+    the only thing keeping the test alive.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if process.poll() is not None:
-            test_case.fail("Node site server exited before becoming ready")
+            raise SiteStartupError(
+                "Node site server exited before becoming ready (exit code {}).".format(
+                    process.returncode),
+                stop_process(process),
+            )
         try:
-            with urlopen(base_url + "/streaming/", timeout=0.5):
-                return
+            with urlopen(base_url + "/streaming/", timeout=2) as response:
+                response.read()
+            return
         except (URLError, OSError):
             time.sleep(0.1)
-    test_case.fail("Node site server did not become ready")
+    test_case.fail("Node site server did not become ready at {}".format(base_url))
 
 
 def stop_process(process):
@@ -125,6 +157,56 @@ def http_request(port, method, path, body=None, headers=None):
         connection.close()
 
 
+def read_response_until_terminal(port, path, timeout=6):
+    """Classify how a response ends, keeping "hung forever" distinguishable.
+
+    http_request() cannot express the interesting outcome: a proxy that leaves a
+    half-sent response open just blocks until the socket timeout, which reads
+    the same as a proxy that is merely slow. This returns one of
+
+      "end"       -- the server closed after sending every promised byte
+      "truncated" -- the server closed with the promised Content-Length unsatisfied
+      "reset"     -- the connection was torn down mid-response
+      "timeout"   -- nothing terminal happened within `timeout` seconds
+
+    so a test can assert the specific guarantee ("cut loose") rather than the
+ absence of a crash.
+    """
+    connection = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        connection.sendall(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n".format(
+                path, port
+            ).encode("ascii")
+        )
+        received = b""
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return "timeout", received
+            connection.settimeout(remaining)
+            try:
+                chunk = connection.recv(4096)
+            except socket.timeout:
+                return "timeout", received
+            except OSError:
+                return "reset", received
+            if not chunk:
+                break
+            received += chunk
+
+        head, _, body = received.partition(b"\r\n\r\n")
+        promised = 0
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                promised = int(value.strip() or b"0")
+        return ("end" if len(body) >= promised else "truncated"), received
+    finally:
+        connection.close()
+
+
 def run_js_check(test_case, case_name):
     """Run one js_checks.js case and fail with its diagnostics on error."""
     node = shutil.which("node")
@@ -153,6 +235,19 @@ class _QuietHTTPServer(HTTPServer):
         if isinstance(error, (ConnectionResetError, BrokenPipeError, TimeoutError)):
             return
         super().handle_error(request, client_address)
+
+
+class _DiesMidBody:
+    """Sentinel body for StubMediaMTX routes: promise bytes, send some, then die.
+
+    A plain route can only ever produce a well-formed response, so without this
+    the "upstream fails after its headers are already on the wire" path -- the
+    one shape a WHEP POST or a status probe can actually hit -- is unreachable
+    from a test.
+    """
+
+
+DIES_MID_BODY = _DiesMidBody()
 
 
 class StubMediaMTX:
@@ -189,6 +284,28 @@ class StubMediaMTX:
                     status, extra_headers, payload = 200, {}, b"stub-ok"
                 else:
                     status, extra_headers, payload = route(stub)
+                if payload is DIES_MID_BODY:
+                    # Send headers promising far more than follows, flush a
+                    # little of the body, then kill the connection. The pause
+                    # lets the proxy forward those bytes to the client before
+                    # the fault, so a test can assert the client really did
+                    # receive a partial response and was then cut loose --
+                    # rather than failing before any body existed.
+                    self.send_response(status)
+                    for key, value in extra_headers.items():
+                        self.send_header(key, value)
+                    self.send_header("Content-Length", "4096")
+                    self.end_headers()
+                    self.wfile.write(b"v=0\r\n")
+                    self.wfile.flush()
+                    time.sleep(0.2)
+                    self.close_connection = True
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    self.connection.close()
+                    return
                 self.send_response(status)
                 for key, value in extra_headers.items():
                     self.send_header(key, value)
@@ -588,8 +705,19 @@ class _SiteUnderTest(unittest.TestCase):
         for stub in self._stubs:
             stub.stop()
 
+    # find_free_port() closes its probe socket before returning the number, so
+    # the port is free at the moment it is drawn and unreserved by the time
+    # server.js binds it a moment later. Anything else on the box can take it in
+    # that window - a second run of this suite, or an outbound connection that
+    # happens to be assigned the same number - and server.js then exits 1 with
+    # "Port N is already in use". That is a collision in the harness, not a
+    # defect in the code under test, so it earns a fresh port rather than a red
+    # test. Anything else the child reports is a real failure and is surfaced
+    # with the child's own words attached.
+    BOOT_ATTEMPTS = 5
+
     def start_site(self, signaling_routes=None, api_routes=None, extra_env=None):
-        overrides = {"PORT": find_free_port()}
+        overrides = {}
         if signaling_routes is None:
             overrides["MEDIAMTX_PORT"] = find_free_port()
         else:
@@ -605,10 +733,26 @@ class _SiteUnderTest(unittest.TestCase):
         if extra_env:
             overrides.update(extra_env)
 
-        self.port = overrides["PORT"]
-        self.base_url = "http://127.0.0.1:{}".format(self.port)
-        self.server_process = start_node_server(self.node, overrides)
-        wait_until_ready(self, self.server_process, self.base_url)
+        # A caller may pin PORT deliberately; a pinned port that is taken is a
+        # genuine failure, not a race worth retrying.
+        pinned_port = overrides.get("PORT")
+        attempts = 1 if pinned_port is not None else self.BOOT_ATTEMPTS
+        startup_error = None
+        for _ in range(attempts):
+            if pinned_port is None:
+                overrides["PORT"] = find_free_port()
+            self.port = overrides["PORT"]
+            self.base_url = "http://127.0.0.1:{}".format(self.port)
+            self.server_process = start_node_server(self.node, overrides)
+            try:
+                wait_until_ready(self, self.server_process, self.base_url)
+                return
+            except SiteStartupError as error:
+                startup_error = error
+                if "already in use" not in error.output.lower():
+                    break
+        self.fail("{}\nServer output:\n{}".format(
+            startup_error, (startup_error.output or "<none>").strip()))
 
 
 class JsLogicChecks(unittest.TestCase):
@@ -667,6 +811,39 @@ class JsLogicChecks(unittest.TestCase):
     def test_jitter_buffer_floor_tracks_measured_jitter(self):
         run_js_check(self, "jitter-buffer-floor")
 
+    def test_granted_playout_target_is_read_back(self):
+        """jitterBufferTarget is a hint with a UA-chosen min/max, so the value
+        written is not evidence of the value in force. See
+        ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "granted-target-readback")
+
+    def test_granted_target_gap_is_bounded_and_pure(self):
+        """A diagnostic, deliberately not a control input. See
+        ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "granted-target-gap")
+
+    def test_jitter_target_write_is_clamped_to_the_legal_range(self):
+        """The setter's range is [0, 4000] and outside it throws a RangeError.
+        See ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "jitter-target-clamp")
+
+    def test_effective_playback_rate_is_measured_and_smoothed(self):
+        """playbackRate reads 1.0 for a MediaStream, so it cannot see the
+        "speeds up / slows down" symptom. See ViewerSmoothnessRegressionChecks
+        for the full rationale."""
+        run_js_check(self, "effective-playback-rate")
+
+    def test_audio_clock_drift_is_measured_in_ppm(self):
+        """Audio time vs wall time. The app previously read no audio stats at
+        all. See ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "audio-clock-drift")
+
+    def test_spec_freeze_threshold_scales_with_frame_rate(self):
+        """The spec's freeze bound is frame-rate dependent. See
+        ViewerSmoothnessRegressionChecks for the full rationale."""
+        run_js_check(self, "spec-freeze-threshold")
+
+
     def test_abr_switching_state_machine(self):
         run_js_check(self, "abr-switching-state-machine")
 
@@ -684,6 +861,18 @@ class JsLogicChecks(unittest.TestCase):
 
     def test_unmute_overlay_follows_the_mute_state(self):
         run_js_check(self, "unmute-overlay-follows-mute-state")
+
+    def test_abr_seam_survives_the_teardown_it_is_armed_across(self):
+        """Runs the real switchRendition + cleanupConnection and watches the flag.
+
+        `switchSeamPending` was armed and then cleared one line later by
+        cleanupConnection(true), in the same synchronous block and before the
+        first await -- so the ontrack seam branch was dead code AND the 12s
+        safety net it was supposed to cancel was orphaned, firing on its own
+        into a hard reconnect 12s after every successful switch. The
+        string-only check below cannot see that, because the clear lives in a
+        different function's body."""
+        run_js_check(self, "seam_survives_the_teardown_it_is_armed_across")
 
 
 class StreamApiProxyChecks(_SiteUnderTest):
@@ -703,6 +892,10 @@ class StreamApiProxyChecks(_SiteUnderTest):
         ),
         ("GET", "/rel-redirect"): lambda stub: (302, {"Location": "/live/other"}, b""),
         ("GET", "/ext-redirect"): lambda stub: (302, {"Location": "https://example.invalid/elsewhere"}, b""),
+        # MediaMTX that answers, then dies before the body is finished.
+        ("GET", "/live/truncated"): lambda stub: (
+            200, {"Content-Type": "application/sdp"}, DIES_MID_BODY,
+        ),
     })
 
     API_ROUTES = property(lambda self: {
@@ -808,6 +1001,33 @@ class StreamApiProxyChecks(_SiteUnderTest):
         self.assertIn("Location", headers.get("Access-Control-Expose-Headers", ""))
         self.assertEqual(self.signaling.requests, [], "preflight must not reach MediaMTX")
         self.assertEqual(self.api.requests, [], "preflight must not reach MediaMTX")
+
+    def test_upstream_that_dies_mid_body_is_cut_loose_instead_of_hanging(self):
+        # A response that dies AFTER its headers is reported on Node's *response*
+        # object, never on the request, and pipe() does not forward source errors
+        # to the destination -- so the proxy used to simply leave the client's
+        # socket open forever. Measured against an upstream that destroys the
+        # socket mid-body, the client saw no end, no abort and no error in 40s,
+        # and the 30s request timeout never fired either, because it only arms
+        # while there is still no response. That is precisely the freeze the
+        # timeout's own comment says it exists to prevent: a status probe that
+        # hangs leaves the player's reconnect loop with no error to retry on.
+        outcome, received = read_response_until_terminal(self.port, "/stream-api/live/truncated")
+
+        self.assertIn(b"v=0", received,
+                      "the client must actually have received the partial body, otherwise this "
+                      "test is not exercising a mid-body death at all")
+        self.assertNotEqual(
+            outcome, "timeout",
+            "the proxy left the client's socket open after the upstream died mid-body; "
+            "the client will hang until the browser gives up",
+        )
+        self.assertIn(outcome, ("truncated", "reset"),
+                      "the partial response must be cut, not left dangling: got {!r}".format(outcome))
+
+        # Cutting the socket must not wedge the proxy for the next viewer.
+        status, _, _ = http_request(self.port, "GET", "/stream-api/live/whep")
+        self.assertEqual(status, 404, "the proxy must still serve normally after a cut response")
 
     def test_turn_endpoint_serves_cloudflare_stun_without_turn_config(self):
         # Without CF_TURN_KEY_* the endpoint must still answer 200 with the
@@ -1105,6 +1325,105 @@ class StaticServerHardeningChecks(_SiteUnderTest):
         self.assertEqual(status, 404)
 
 
+class SiteStartupDiagnosticsChecks(_SiteUnderTest):
+    """A server that dies at startup must say why, in its own words.
+
+    A cold `server.js` answered its first request in ~0.52s (median of 25
+    boots here, max 1.05s) while later requests took 3-25ms, and the readiness
+    probe gave each attempt 0.5s. The probe therefore threw its first attempt
+    away on most boots, and when the process died during startup it reported
+    only "exited before becoming ready" - discarding the very output that
+    explains the death. That is how a port collision in the harness got
+    reported as a static-file allowlist failure, pointing at server.js's
+    allowlist instead of at the harness's port choice.
+    """
+
+    def test_a_taken_port_is_retried_and_then_reported_with_the_childs_words(self):
+        main = sys.modules[__name__]
+        taken = find_free_port()
+        # A plain listening socket, exactly like find_free_port()'s probe but
+        # never closed. SO_REUSEADDR is deliberately NOT set: on Windows that
+        # would let server.js bind the same port anyway, so the collision this
+        # test needs would never happen.
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", taken))
+        blocker.listen(5)
+        # Accept and immediately drop, so a readiness probe aimed at the taken
+        # port fails in milliseconds instead of sitting out the full per-attempt
+        # timeout five times over.
+        stop_blocker = threading.Event()
+
+        def drain():
+            blocker.settimeout(0.2)
+            while not stop_blocker.is_set():
+                try:
+                    conn, _addr = blocker.accept()
+                except (socket.timeout, OSError):
+                    continue
+                conn.close()
+
+        drainer = threading.Thread(target=drain, daemon=True)
+        drainer.start()
+
+        original_port = main.find_free_port
+        original_start = main.start_node_server
+        spawns = []
+
+        def counting_start(node, env_overrides):
+            spawns.append(env_overrides.get("PORT"))
+            return original_start(node, env_overrides)
+
+        main.find_free_port = lambda: taken
+        main.start_node_server = counting_start
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                self.start_site()
+        finally:
+            main.find_free_port = original_port
+            main.start_node_server = original_start
+            stop_blocker.set()
+            drainer.join(timeout=2)
+            blocker.close()
+
+        message = str(caught.exception)
+        self.assertIn("already in use", message,
+                      "the child's own reason for exiting must reach the report")
+        self.assertEqual(len(spawns), self.BOOT_ATTEMPTS,
+                         "a port collision must be retried with a fresh port, "
+                         "not reported as a product failure")
+
+    def test_the_readiness_probe_outlasts_a_cold_first_response(self):
+        # A server whose first answer takes longer than the old 0.5s attempt
+        # budget must still be recognised as ready, or every slow boot is
+        # reported as a server that never came up.
+        class SlowHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                time.sleep(1.2)
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format_string, *args):
+                pass
+
+        class _Alive:
+            def poll(self):
+                return None
+
+        slow = HTTPServer(("127.0.0.1", 0), SlowHandler)
+        Thread(target=slow.serve_forever, daemon=True).start()
+        try:
+            # Raises on failure; returning at all is the assertion.
+            wait_until_ready(self, _Alive(), "http://127.0.0.1:%d" % slow.server_port)
+        finally:
+            slow.shutdown()
+            slow.server_close()
+
+
 class StartupConfigurationChecks(unittest.TestCase):
     """A bad PORT must abort at boot instead of silently binding something else."""
 
@@ -1195,6 +1514,33 @@ class CrossFileConsistencyChecks(unittest.TestCase):
         self.assertIn("Test-LocalTcpPort {}".format(ports["webrtc"]), self.launcher)
         self.assertIn("http://127.0.0.1:{}/v3/paths/list".format(ports["api"]), self.launcher)
 
+    def test_every_mediamtx_config_disables_moq(self):
+        """MoQ binds fixed WILDCARD ports, so any config that omits it leaks.
+
+        The bundled MediaMTX ships MoQ on by default (:8892 TCP+UDP and :8893
+        UDP, wildcard on every interface). mediamtx.yml sets `moq: no`, but a
+        config that lists only the keys it cares about inherits the default -
+        which is exactly how the suite's sandboxed instance came to hold 8892
+        and collide with anything else on the machine. Pin the flag everywhere a
+        config is authored, including the literals the tests generate.
+        """
+        with self.subTest(config="mediamtx.yml"):
+            self.assertRegex(self.config, r"(?m)^moq:\s*no\s*$",
+                             "mediamtx.yml must disable MoQ (:8892/:8893 on the wildcard)")
+
+        source = read_text(Path(__file__).resolve().parent / "run_tests.py")
+        blocks = re.findall(r'"logLevel: warn\\n"[\s\S]{0,4000}?"paths:\\n"', source)
+        self.assertTrue(blocks, "expected at least one generated MediaMTX config in the suite")
+        for index, block in enumerate(blocks):
+            with self.subTest(generated_config=index):
+                self.assertIn('"moq: no\\n"', block,
+                              "a generated MediaMTX config leaves MoQ enabled and inherits "
+                              "fixed wildcard ports :8892/:8893")
+
+        e2e = read_text(ROOT / "e2e_bridge_check.py")
+        self.assertNotIn("MTX_MOQ", e2e,
+                         "the e2e sandbox must not re-enable MoQ through the environment")
+
     def test_html_assets_are_all_in_the_static_allowlist(self):
         references = re.findall(r"(?:href|src)=\"(/streaming/[^\"]+)\"", self.html)
         self.assertTrue(references, "expected at least one local asset reference in index.html")
@@ -1260,6 +1606,19 @@ class MediaMTXControlApiContractChecks(unittest.TestCase):
             "hls: no\n"
             "rtmp: no\n"
             "srt: no\n"
+            # MoQ (Media over QUIC) is ON by default in the bundled binary and
+            # binds FIXED, NON-LOOPBACK addresses (:8892 TCP/UDP and :8893 UDP,
+            # wildcard on every interface) that this config never declares. The
+            # three ports above are drawn with find_free_port(), so they cannot
+            # collide, but these inherited ones can: any other process, another
+            # test run, or a second sandbox on the box holding 8892 made
+            # MediaMTX exit at startup with
+            #   listen tcp :8892: bind: Only one usage of each socket address ...
+            # which surfaced as a real, reproducible suite failure rather than
+            # an environment quirk. It is also the only listener the test binds
+            # on 0.0.0.0 instead of loopback. The production mediamtx.yml already
+            # disables it (moq: no); the test config must say the same.
+            "moq: no\n"
             "webrtc: yes\n"
             "webrtcAddress: 127.0.0.1:{webrtc}\n"
             "webrtcLocalUDPAddress: 127.0.0.1:{media}\n"
@@ -1311,6 +1670,100 @@ class MediaMTXControlApiContractChecks(unittest.TestCase):
                 body="v=0\r\n", headers={"Content-Type": "application/sdp"},
             )
             self.assertEqual(status, 404)
+        finally:
+            stop_process(process)
+            config_path.unlink(missing_ok=True)
+
+    def test_sandboxed_mediamtx_binds_nothing_on_a_wildcard_address(self):
+        """The generated config must not inherit a fixed, non-loopback listener.
+
+        The bundled MediaMTX enables MoQ by default, binding :8892 (TCP+UDP) and
+        :8893 (UDP) on the wildcard address. Those ports are not drawn by
+        find_free_port(), so they are the one thing in this sandbox that can
+        collide with another process - and when they do, MediaMTX exits at
+        startup and the failure is reported as a broken control-API contract
+        rather than a port clash. It is also the only socket the tests open to
+        the whole network instead of loopback. Asserted here against the real
+        binary so the inherited default cannot come back unnoticed.
+        """
+        if not MEDIAMTX_PATH.is_file():
+            self.skipTest("MediaMTX binary is not installed")
+        if os.name != "nt":
+            self.skipTest("listener inspection is Windows-specific")
+
+        api_port = find_free_port()
+        webrtc_port = find_free_port()
+        media_port = find_free_port()
+        config = (
+            "logLevel: warn\n"
+            "logDestinations: [stdout]\n"
+            "api: yes\n"
+            "apiAddress: 127.0.0.1:{api}\n"
+            "rtsp: no\n"
+            "hls: no\n"
+            "rtmp: no\n"
+            "srt: no\n"
+            "moq: no\n"
+            "webrtc: yes\n"
+            "webrtcAddress: 127.0.0.1:{webrtc}\n"
+            "webrtcLocalUDPAddress: 127.0.0.1:{media}\n"
+            "webrtcLocalTCPAddress: 127.0.0.1:{media}\n"
+            "webrtcIPsFromInterfaces: no\n"
+            "webrtcAdditionalHosts: [127.0.0.1]\n"
+            "paths:\n"
+            "  live:\n"
+            "    overridePublisher: yes\n"
+        ).format(api=api_port, webrtc=webrtc_port, media=media_port)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False, encoding="ascii") as handle:
+            handle.write(config)
+            config_path = Path(handle.name)
+
+        process = None
+        try:
+            process = subprocess.Popen(
+                [str(MEDIAMTX_PATH), str(config_path)],
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            payload = None
+            deadline = time.time() + 15
+            while time.time() < deadline and payload is None:
+                if process.poll() is not None:
+                    self.fail("MediaMTX exited during startup:\n{}".format(
+                        (process.communicate()[0] or b"").decode("utf-8", "replace")))
+                try:
+                    with urlopen("http://127.0.0.1:{}/v3/paths/list".format(api_port), timeout=1) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                except (URLError, OSError, ValueError):
+                    time.sleep(0.2)
+            self.assertIsNotNone(payload, "MediaMTX control API never answered on port {}".format(api_port))
+
+            # Every socket this process owns must be loopback-scoped. A wildcard
+            # (0.0.0.0 / ::) listener here is exactly the inherited MoQ default.
+            # Built by concatenation, not .format(): the script is full of
+            # PowerShell braces that .format() would try to interpret.
+            script = (
+                "$p = " + str(process.pid) + "; "
+                "$bad = @(); "
+                "Get-NetTCPConnection -State Listen -OwningProcess $p -ErrorAction SilentlyContinue "
+                "| ForEach-Object { if ($_.LocalAddress -ne '127.0.0.1') "
+                "{ $bad += ('tcp ' + $_.LocalAddress + ':' + $_.LocalPort) } }; "
+                "Get-NetUDPEndpoint -OwningProcess $p -ErrorAction SilentlyContinue "
+                "| ForEach-Object { if ($_.LocalAddress -ne '127.0.0.1') "
+                "{ $bad += ('udp ' + $_.LocalAddress + ':' + $_.LocalPort) } }; "
+                "$bad -join ','"
+            )
+            listing = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True, text=True, timeout=60,
+            )
+            offenders = [item for item in listing.stdout.strip().split(",") if item]
+            self.assertEqual(
+                offenders, [],
+                "the sandboxed MediaMTX opened non-loopback sockets: {}".format(offenders),
+            )
         finally:
             stop_process(process)
             config_path.unlink(missing_ok=True)
@@ -1638,6 +2091,15 @@ class ReceiverLagFixChecks(unittest.TestCase):
 
     def test_hidden_tab_return_recovers_playout_delay(self):
         run_js_check(self, "catch-up-arms-on-visibility-return")
+
+    def test_live_edge_catch_up_rate_law(self):
+        run_js_check(self, "catchup-rate-drains-without-a-teardown")
+
+    def test_seam_switch_actually_lands(self):
+        run_js_check(self, "seam-switch-actually-lands")
+
+    def test_catchup_guard_ignores_a_healthy_refilling_buffer(self):
+        run_js_check(self, "catchup-self-verification-ignores-a-refilling-buffer")
 
     def test_receiver_anti_drop_hardening_is_present(self):
         # Latency is explicitly traded for smoothness in this project: the
@@ -2083,9 +2545,18 @@ class StreamingHardeningChecks(unittest.TestCase):
             "const {compileFunction,quietConsole}=require('./js_checks.js');"
             "const NOW=100000;"
             "const sb={performance:{now:()=>NOW},beginStatsLoop(){},hudRoute:{innerText:'x'},"
-            "console:quietConsole(),lastRenditionSwitchAt:NOW};"
+            "console:quietConsole(),lastRenditionSwitchAt:NOW,"
+            # startTelemetry resets the live-edge catch-up rate. playbackRate is a
+            # property of the media ELEMENT, not of the peer connection, so it
+            # survives every teardown; a new session must start at 1.0x. Stubbed
+            # here to prove the call is actually reachable from a real session.
+            "player:{playbackRate:1.06},resetLiveEdgeCatchUp:()=>{"
+            "  if(sb.player.playbackRate!==1.06){throw new Error('unexpected rate');}"
+            "  sb.player.playbackRate=1;}};"
             "const {fn,sandbox}=compileFunction('startTelemetry',sb);"
             "fn();"
+            "if(sandbox.player.playbackRate!==1){"
+            "throw new Error('a new session inherited a stale playbackRate of '+sandbox.player.playbackRate);}"
             "if(sandbox.lastRenditionSwitchAt!==NOW){"
             "throw new Error('startTelemetry reset the ABR cooldown anchor to '+sandbox.lastRenditionSwitchAt);}"
             "if(!(NOW-sandbox.lastRenditionSwitchAt<=60000)){"
@@ -2327,6 +2798,129 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.config = read_text(CONFIG_PATH)
         self.bridge = read_text(BRIDGE_PATH)
         self.launcher = read_text(LAUNCHER_PATH)
+
+    def test_playout_target_uses_only_the_standardized_api(self):
+        """`playoutDelayHint` is not a real API and must not be written.
+
+        It is in no W3C Recommendation, no engine IDL (Blink or Gecko) and no
+        WPT test — it belonged to an abandoned getPlayoutDelay()/
+        setTargetDelay() family. The old fallback branch could never be taken
+        and, worse, advertised a compatibility path that does not exist: a
+        maintainer reading it would believe non-Chromium receivers were
+        covered. `jitterBufferTarget` is the only standardized control, and it
+        is in milliseconds.
+        """
+        code = self._strip_comments(self.app, "js")
+        self.assertNotIn("playoutDelayHint", code,
+                         "playoutDelayHint does not exist in any browser; do not write it")
+        self.assertIn("jitterBufferTarget", code,
+                      "the standardized playout-delay control must still be used")
+        self.assertIn("clampJitterBufferTargetMs(currentBufferTargetMs())", code,
+                      "the write must clamp to the settler's legal range first")
+
+    def test_app_reads_media_time_from_rvfc(self):
+        """The rVFC callback must consume metadata.mediaTime, not just presentedFrames.
+
+        `presentedFrames` counts what reached the compositor; `mediaTime` is
+        the only field that says how FAST it is being consumed. Without it the
+        single most user-reported symptom in this class of bug is structurally
+        invisible to the app.
+        """
+        self.assertIn("metadata.mediaTime", self.app,
+                      "the rVFC callback must read mediaTime to measure playback rate")
+        self.assertIn("effectivePlaybackRate(", self.app,
+                      "the measured rate must go through the smoothing helper")
+
+    def test_stats_loop_reads_the_audio_report(self):
+        """The audio inbound-rtp report arrives in the same getStats() walk.
+
+        Filtering on kind === 'video' only threw it away for free. It carries
+        totalSamplesDuration (the audio clock), concealmentEvents (audible
+        gaps), and insertedSamplesForDeceleration — the UA stretching audio to
+        reach the video target, which the code comments reason about at length
+        but could not previously observe.
+        """
+        self.assertIn("report.kind === 'audio'", self.app,
+                      "the audio report must be captured from the same stats walk")
+        self.assertIn("measureAudioStats(", self.app,
+                      "the audio report must actually be consumed")
+        self.assertIn("concealmentEvents", self.app,
+                      "audio concealment (audible gaps) must be counted")
+        self.assertIn("insertedSamplesForDeceleration", self.app,
+                      "UA audio stretching must be observable, not just theorised about")
+
+    def test_audio_measurement_is_gated_on_audio_actually_being_pulled(self):
+        """Chromium only advances the audio jitter buffer once audio is pulled.
+
+        Before the WebAudio tap is attached, totalSamplesDuration is frozen
+        while wall time keeps moving, which would read as an enormous
+        audio-clock drift. This is the same class of guard the video
+        controllers already apply via document.hidden and player.paused.
+        """
+        self.assertIn("function audioIsPulled(", self.app,
+                      "audio measurement must be gated on audio being pulled")
+        body = self.app[self.app.index("function audioIsPulled("):]
+        body = body[:body.index("\n    }")]
+        self.assertIn("player.paused", body,
+                      "a paused viewer does not pull audio")
+        self.assertIn("audioSourceNode", body,
+                      "audio is not pulled until the WebAudio tap exists")
+
+    def test_granted_target_readback_is_never_a_control_input(self):
+        """The read-back observes the controller; it must not drive it.
+
+        If the granted-target gap fed the control law it would close a second,
+        faster loop around the very controller it is meant to audit, and a
+        transient read would move the buffer. The gap is computed into its own
+        state and surfaced in the HUD and the diagnostic export instead.
+        """
+        code = self._strip_comments(self.app, "js")
+        self.assertIn("grantedTargetDeltaMs = grantedTargetGapMs(", code,
+                      "the gap must be recorded, not returned into the control law")
+        supervisor = code[code.index("function superviseAdaptiveBuffer("):]
+        supervisor = supervisor[:supervisor.index("function updateBufferHud(")]
+        self.assertNotIn("grantedTargetDeltaMs", supervisor,
+                         "the buffer supervisor must not steer on the read-back")
+        self.assertNotIn("grantedTargetMs", supervisor,
+                         "the buffer supervisor must not steer on the read-back")
+
+    def test_separate_baselines_for_target_and_minimum_delay(self):
+        """jitterBufferTargetDelay and jitterBufferMinimumDelay are distinct series.
+
+        Both are cumulative and both are averaged against jitterBufferEmittedCount,
+        but differencing one against the other's baseline produces a garbage
+        average that can be enormous or negative. The project has already been
+        bitten exactly this way once (a cumulative average hiding fresh drift),
+        so the baselines are separate by construction.
+        """
+        self.assertIn("let lastJitterTargetTotal = 0;", self.app)
+        self.assertIn("let lastJitterMinTotal = 0;", self.app,
+                      "the minimum-delay series needs its own baseline")
+        self.assertIn("lastJitterMinTotal", self.app,
+                      "the minimum-delay read must use the minimum-delay baseline")
+
+    def test_per_session_measurement_state_is_reset(self):
+        """Cumulative counters are per session, not per app load.
+
+        Differencing a carried-over counter against a zero baseline yields one
+        enormous first-tick reading. For the audio clock that would look like a
+        huge drift, and for the granted target it would look like the UA
+        instantly applied a multi-second buffer.
+
+        Scoped to the startTelemetry() body and to the 8-space indent on
+        purpose. A bare `f"{state} = "` search is satisfied by the 4-space
+        `let` DECLARATION as well as by the reset, so it passes even with the
+        entire reset block deleted — a guard that cannot fail.
+        """
+        body = self.app[self.app.index("function startTelemetry("):]
+        body = body[:body.index("\n    function ")]
+        for state in ("lastJitterTargetTotal", "lastJitterMinTotal", "grantedTargetMs",
+                      "audioStatsReport", "lastAudioSamplesDuration", "audioDriftPpm",
+                      "lastMediaTimeSec", "playbackRate"):
+            # 8 spaces = the per-session reset inside startTelemetry(), not the
+            # 4-space declaration.
+            self.assertIn(f"\n        {state} = ", body,
+                          f"{state} must be reset when a new session starts")
 
     @staticmethod
     def _strip_comments(text, kind):
@@ -3216,6 +3810,184 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertIn("switchSeamPending = false", body,
                       "teardown must clear the pending flag so a later session is not hijacked")
 
+    def test_seam_is_armed_after_the_teardown_that_clears_it(self):
+        """The regression this pins is subtler than the one above, and the test
+        above could not see it.
+
+        `switchRendition` armed the seam and THEN called
+        `cleanupConnection(true)`. But cleanupConnection owns the seam's
+        lifetime — it cancels the safety net and clears the flag on every
+        teardown path (it must: Stage 2 and every graceful ICE teardown go
+        through it) — so that call destroyed the flag one statement after it
+        was set, and the seam stayed dead.
+
+        The text scan in test_seam_pending_is_actually_left_set passed
+        throughout, because the clearing statement lives in a DIFFERENT
+        function. Only the ORDER of the two calls proves anything, so that is
+        what is asserted here."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "switchRendition")
+        self.assertIsNotNone(body, "switchRendition not found")
+        arm = body.find("switchSeamPending = true;")
+        teardown = body.find("cleanupConnection(true)")
+        self.assertGreater(arm, 0, "the seam is never armed")
+        self.assertGreater(teardown, 0, "switchRendition must still tear the old session down")
+        self.assertLess(teardown, arm,
+                        "cleanupConnection clears switchSeamPending, so the seam must be "
+                        "armed AFTER it or the seam is dead code again")
+
+    def test_seam_safety_net_can_actually_reconnect(self):
+        """The 12s seam safety net could not recover, which turned it into the
+        thing it was written to prevent.
+
+        On a healthy switch it fired anyway (its only success-path cancel lives
+        inside the unreachable seam branch). When it did fire it blanked the
+        element and called cleanupConnection(), but cleanupConnection only
+        releases resources — it never clears isConnected/isConnecting, and
+        handleConnected() had set isConnected = true for the replacement
+        session. connectStream() therefore hit its own duplicate guard and
+        returned without doing anything.
+
+        The resulting state was `player.srcObject === null`,
+        `peerConnection === null`, `isConnected === true` — and every recovery
+        path is gated off by exactly that combination: the freeze watchdog needs
+        a peerConnection AND an unpaused element, the stats loop needs a
+        connected peerConnection, rVFC needs frames, and the status poll skips
+        while isConnected. The viewer was left with a permanent black screen
+        that only a manual reload could clear.
+
+        The fix is to clear the flags before reconnecting, so the net
+        genuinely reconnects instead of winding the session down."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "switchRendition")
+        self.assertIsNotNone(body, "switchRendition not found")
+        net = body.find("switchSeamTimer = setTimeout(")
+        self.assertGreater(net, 0, "the seam safety net is not armed")
+        window = body[net:net + 900]
+        self.assertIn("connectStream()", window, "the net must attempt a reconnect")
+        clear_connected = window.find("isConnected = false;")
+        clear_connecting = window.find("isConnecting = false;")
+        self.assertGreater(clear_connected, 0,
+                           "the net must clear isConnected before reconnecting, or "
+                           "connectStream() no-ops and leaves a permanent black screen")
+        self.assertGreater(clear_connecting, 0,
+                           "the net must clear isConnecting before reconnecting")
+        self.assertLess(clear_connected, window.find("connectStream()"),
+                        "the flags must be cleared BEFORE connectStream(), not after")
+        self.assertLess(clear_connecting, window.find("connectStream()"),
+                        "the flags must be cleared BEFORE connectStream(), not after")
+
+    def test_seam_safety_net_is_cancelled_on_every_teardown_path(self):
+        """The net's cancel used to sit INSIDE the `if (keepPicture)`
+        early-return, so a full teardown (Stage 3 of freeze recovery,
+        handleDisconnected) left the orphan armed. The page painted offline and
+        then, 12 seconds later, the orphan fired and reconnected the stream on
+        its own — the page flipping offline -> connecting -> live by itself,
+        which is precisely what that early return was written to prevent.
+
+        Both statements must therefore sit BEFORE the keepPicture branch."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "cleanupConnection")
+        self.assertIsNotNone(body, "cleanupConnection not found")
+        self.assertIn("switchSeamTimer", body, "teardown must cancel the seam safety net")
+        self.assertIn("switchSeamPending = false", body,
+                      "teardown must clear the pending flag so a later session is not hijacked")
+        branch = body.find("if (keepPicture)")
+        self.assertGreater(branch, 0, "the keepPicture early-return is gone")
+        timer = body.find("clearTimeout(switchSeamTimer)")
+        flag = body.find("switchSeamPending = false")
+        self.assertLess(timer, branch,
+                        "the safety-net cancel must run on the full-teardown path too, "
+                        "not only inside the keepPicture early-return")
+        self.assertLess(flag, branch,
+                        "the pending flag must be cleared on the full-teardown path too")
+
+    def test_live_edge_catch_up_replaces_the_black_screen_rejoin(self):
+        """Drift was answered with exactly one thing: tear the WHEP session
+        down and rebuild it. That costs a 2-4s HARD BLACK SCREEN plus a full
+        ICE + WHEP renegotiation to recover what is purely accumulated
+        latency — and the dominant source of it is an ordinary Alt-Tab, which
+        the project's own measurements put at 1.7-2.8s of delay.
+
+        Every production low-latency player instead speeds the media element up
+        to drain the jitter buffer and returns to 1.0x, which costs no black
+        frame and no renegotiation. The player had no playbackRate control at
+        all (its own comment at the latency-mode table described a "stepwise
+        catch-up" that did not exist), so this is the single highest-value
+        addition available on the receiver side."""
+        app = read_text(APP_PATH)
+        self.assertIn("function catchUpPlaybackRate(", app, "catch-up rate law missing")
+        self.assertIn("function updateLiveEdgeCatchUp()", app, "catch-up controller missing")
+        self.assertIn("player.playbackRate = wanted;", app,
+                      "the controller must actually drive playbackRate")
+        body = self._js_function_body(self._strip_comments(app, "js"), "superviseAdaptiveBuffer")
+        self.assertIn("updateLiveEdgeCatchUp()", body,
+                      "the stats supervisor must drive live-edge catch-up")
+        # It must run BEFORE the teardown branch, otherwise the rejoin fires on
+        # the very first drifted tick and catch-up never gets a chance to help.
+        catch_up = body.find("updateLiveEdgeCatchUp()")
+        rejoin = body.find("rejoinCapMs")
+        self.assertGreater(catch_up, 0, "catch-up must be invoked by the supervisor")
+        self.assertLess(catch_up, rejoin,
+                        "catch-up must be attempted BEFORE the hard-rejoin branch")
+        # The hard path must still exist as an escalation.
+        self.assertIn("switchRendition(activeStreamPath", body,
+                      "the hard rejoin must remain as the escalation when catch-up stalls")
+
+    def test_live_edge_catch_up_is_bounded_and_self_verifying(self):
+        """Two failure modes make catch-up worse than not having it, and both
+        are guarded:
+
+        1. An unbounded rate. `playbackRate` is not a nudge, it is a direct
+           multiplier, so a formula that scales with the raw delay turns a 5s
+           drift into a fast-forward. It is capped.
+        2. A mechanism that does not work. Some engines accept the write and
+           ignore it; a link too congested for 8% to matter looks identical.
+           Either way the viewer would sit at a permanently elevated rate with
+           the real problem untreated, so the controller PROVES the drain and
+           disables itself if the delay does not fall."""
+        app = read_text(APP_PATH)
+        self.assertIn("const CATCHUP_MAX_RATE = 1.08;", app,
+                      "the catch-up rate must be capped, and the cap is shared with "
+                      "the self-verification so the two cannot diverge")
+        self.assertIn("catchUpProvenUseless", app,
+                      "a catch-up that fails to drain must disable itself")
+        body = self._js_function_body(self._strip_comments(app, "js"), "updateLiveEdgeCatchUp")
+        self.assertIn("catchUpProvenUseless = true", body,
+                      "self-verification must exist inside the controller")
+        self.assertIn("catchUpProbeDelayMs", body,
+                      "the controller must remember the delay it started from")
+        # The proof needs a real window and a real comparison, not a flag flip.
+        self.assertIn("catchUpProbeAt > 5000", body,
+                      "self-verification needs a settling window before judging the drain")
+        # ...and it must only judge a SATURATED rate. Judged at any rate above
+        # 1.0, the early seconds of the 1%-per-tick ramp are judged on a delay
+        # that is still falling, and a healthy refilling buffer gets the
+        # working mechanism permanently disabled.
+        self.assertIn("catchUpRate >= CATCHUP_MAX_RATE", body,
+                      "the drain may only be judged once the rate is saturated; judging a "
+                      "slow ramp disables catch-up on healthy links")
+        sup = self._js_function_body(self._strip_comments(app, "js"), "superviseAdaptiveBuffer")
+        self.assertIn("catchUpProvenUseless", sup,
+                      "the supervisor must honour a proven-useless verdict")
+        self.assertIn("catchingUp", sup, "the supervisor must know catch-up is engaged")
+
+    def test_catch_up_rate_is_reset_for_every_new_session(self):
+        """`playbackRate` is a property of the media ELEMENT, not of the peer
+        connection, so it survives every teardown in this file. A session that
+        ended while catching up would otherwise hand the next session an
+        inherited fast rate the viewer cannot explain or undo. It must be reset
+        when a new session starts, and when the tab is backgrounded (where
+        presentation is suspended and there is nothing to drain)."""
+        app = read_text(APP_PATH)
+        self.assertIn("function resetLiveEdgeCatchUp()", app, "the reset helper is missing")
+        self.assertIn("player.playbackRate = 1;", app, "the reset must restore 1.0x")
+        self.assertGreaterEqual(app.count("resetLiveEdgeCatchUp();"), 2,
+                                "a new session and the tab-hide path must both reset the rate")
+        body = self._js_function_body(self._strip_comments(app, "js"), "startTelemetry")
+        self.assertIn("resetLiveEdgeCatchUp()", body,
+                      "every new session must start at 1.0x")
+
     def test_gop_env_is_bounded(self):
         """`BRIDGE_GOP` was passed to ffmpeg with only a /^\\d+$/ test, so '0'
         and 999999999 both reached the encoder. Measured with the bundled
@@ -3283,10 +4055,78 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertRegex(code, r"if \(runSeconds >= HEALTHY_RUN_SECONDS\) \{\s*\n\s*lastHealthyRunAt = Date\.now\(\);",
                          "the strike-clearing 30s reset must not be what marks the bridge healthy")
         check = code.find("if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES")
-        self.assertGreater(check, 0, "the give-up check was not found")
-        window = code[check:check + 500]
-        self.assertIn("noHealthyRunFor", window,
-                      "the breaker must also trip when the bridge never produces a long run")
+        if check > 0:
+            # Inline form: the second arm must sit in the same condition.
+            window = code[check:check + 400]
+            self.assertIn("noHealthyRunFor", window,
+                          "the breaker must also trip when the bridge never produces a long run")
+        else:
+            # Extracted form: the same guarantee now lives in a callable
+            # shouldGiveUp(), which test_bridge_retry_budget_is_reachable
+            # executes directly.
+            self.assertIn("function shouldGiveUp(", code,
+                          "the give-up check must be a single testable function")
+            self.assertIn("NO_HEALTHY_RUN_LIMIT_MS", code,
+                          "the no-healthy-run window must still exist and be named")
+            self.assertIn("shouldGiveUp(failures, lastHealthyRunAt",
+                          code[code.find("shouldGiveUp(failures"):][:120],
+                          "the retry loop must actually consult the breaker")
+
+    def test_bridge_retry_budget_is_reachable(self):
+        """The breaker tripped on the FIRST ffmpeg exit, not the tenth.
+
+        `lastHealthyRunAt` was seeded with 0 and the give-up site read it as
+        `lastHealthyRunAt ? now - lastHealthyRunAt : Infinity`, so the
+        "no healthy run yet" case became `Infinity > 900000` = true and the
+        bridge gave up after a single attempt. That made the
+        MAX_CONSECUTIVE_FFMPEG_FAILURES = 10 retry budget, the
+        `gpuFastFailures >= 2` NVDEC -> CPU fallback, and the 400ms/2s backoff
+        ladder unreachable: any one ffmpeg exit (a stall-watchdog kill, an OBS
+        reconnect) slept the full GIVE_UP_BACKOFF_MS and exited 1 with the
+        renditions dead instead of restarting.
+
+        This executes the real exported shouldGiveUp() over the whole failure
+        budget and over the 15-minute no-healthy-run window.
+        """
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise the bridge breaker")
+        script = """
+        const b = require('./codec_bridge.js');
+        if (typeof b.shouldGiveUp !== 'function') throw new Error('shouldGiveUp is not exported');
+        const T0 = 1750000000000;
+        const cap = b.MAX_CONSECUTIVE_FFMPEG_FAILURES;
+        // The full consecutive-failure budget must be usable.
+        for (let f = 1; f < cap; f++) {
+            if (b.shouldGiveUp(f, T0, T0 + f * 1000)) {
+                throw new Error('gave up after ' + f + ' failure(s); budget is ' + cap);
+            }
+        }
+        if (!b.shouldGiveUp(cap, T0, T0 + cap * 1000)) {
+            throw new Error('the consecutive-failure cap never fires');
+        }
+        // The second arm must still work: crash-cycling with few failures must
+        // still trip once the no-healthy-run window has elapsed...
+        if (!b.shouldGiveUp(3, T0, T0 + b.NO_HEALTHY_RUN_LIMIT_MS + 1000)) {
+            throw new Error('a crash cycle that never reaches 300s must eventually trip the breaker');
+        }
+        // ...but not before it.
+        if (b.shouldGiveUp(3, T0, T0 + b.NO_HEALTHY_RUN_LIMIT_MS - 60000)) {
+            throw new Error('the breaker fired inside its own window');
+        }
+        // The exact regression: a falsy stamp means "no long run yet", which
+        // must NOT be read as an infinitely long gap.
+        if (b.shouldGiveUp(1, 0, T0 + 1000)) {
+            throw new Error('a falsy lastHealthyRunAt must not trip the breaker on the first exit');
+        }
+        // And a real wall clock measured from the bridge start behaves the same.
+        if (b.shouldGiveUp(1, T0, T0 + 5000)) {
+            throw new Error('the first exit inside the window must be retried');
+        }
+        console.log('breaker budget OK');
+        """
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_give_up_breaker_is_not_armed_at_process_start(self):
         """The give-up breaker had `lastHealthyRunAt = 0`, which is falsy, so the
@@ -3306,28 +4146,53 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         was gone and the renditions stayed dead for the rest of the broadcast.
 
         So: the baseline must exist and must be a real timestamp, and the
-        Infinity fallback must be gone."""
+        Infinity fallback must be gone.
+
+        This guard is deliberately IMPLEMENTATION-AGNOSTIC. Two branches fixed
+        the identical bug two different ways — seeding `lastHealthyRunAt` with
+        the process start, or keeping an explicit "no long run yet" sentinel and
+        falling back to the process start at the give-up site — and a test that
+        pinned one spelling failed the moment the other was merged in, even
+        though both are correct. It asserts the PROPERTY (a falsy/absent stamp
+        can never be read as an infinite gap) and accepts either spelling.
+        The arithmetic counterpart is executed against the real decision
+        function by `test_bridge_retry_budget_is_reachable`, which is a
+        stronger check than a regex over the source text.
+        """
         code = self._strip_comments(self.bridge, "js")
         self.assertNotIn("let lastHealthyRunAt = 0;", code,
                          "0 is falsy, so the check falls through to its Infinity branch "
                          "and the breaker fires on the first ffmpeg exit")
-        self.assertRegex(code, r"let lastHealthyRunAt = null;",
-                         "the 'no healthy run yet' state must be an explicit sentinel")
-        self.assertRegex(code, r"const bridgeStartedAt = Date\.now\(\);",
-                         "a real baseline timestamp is required for the health window")
-        self.assertIn(
-            "lastHealthyRunAt === null ? bridgeStartedAt : lastHealthyRunAt", code,
-            "the health window must be measured from the process start until the "
-            "first genuinely long run, not from Infinity",
+        self.assertNotIn(": Infinity", code,
+                         "a no-healthy-run window measured from Infinity is "
+                         "unconditionally expired, so the breaker is armed at birth")
+        # A real baseline must exist: either the stamp is seeded from this
+        # process's own start, or "no long run yet" is an explicit sentinel.
+        self.assertTrue(
+            re.search(r"lastHealthyRunAt\s*=\s*(?:BRIDGE_STARTED_AT|bridgeStartedAt)", code)
+            or re.search(r"let lastHealthyRunAt\s*=\s*null;", code),
+            "the health window needs a real baseline: seed the stamp from the "
+            "process start, or mark 'no long run yet' with an explicit sentinel",
         )
-        # The real arithmetic, so a future edit cannot reintroduce the tautology.
-        give_up_ms = int(re.search(r"const NO_HEALTHY_RUN_GIVE_UP_MS\s*=\s*(\d+)", code).group(1))
-        first_exit_elapsed = 0  # a bridge that started now and just saw its first exit
-        self.assertFalse(
-            first_exit_elapsed > give_up_ms,
-            "a first exit must never satisfy the give-up condition on elapsed time "
-            "alone; only MAX_CONSECUTIVE_FFMPEG_FAILURES may trip it that early",
+        # And the give-up site must actually reach that baseline rather than
+        # treating a falsy stamp as an infinite gap: either it falls back to the
+        # start-time constant, or the decision function owns the fallback.
+        self.assertTrue(
+            re.search(r"lastHealthyRunAt\s*\|\|\s*(?:BRIDGE_STARTED_AT|bridgeStartedAt)", code)
+            or re.search(r"lastHealthyRunAt\s*===\s*null\s*\?\s*(?:BRIDGE_STARTED_AT|bridgeStartedAt)", code)
+            or "function shouldGiveUp(" in code,
+            "before the first long run the window must be measured from this "
+            "process's own start, not from a sentinel that trips the breaker",
         )
+        # The window must be a real number of minutes rather than a bare literal
+        # that could be tightened to nothing by a later edit.
+        grace = re.search(
+            r"NO_HEALTHY_RUN_(?:GRACE|LIMIT|GIVE_UP)_MS\s*=\s*(\d+)\s*\*\s*60\s*\*\s*1000", code)
+        self.assertIsNotNone(grace, "the no-healthy-run window should be expressed in minutes")
+        self.assertGreaterEqual(int(grace.group(1)) * 60, 300,
+                                "the no-healthy-run window must exceed the 300s health "
+                                "threshold it is measured against, or a bridge merely "
+                                "between two long runs trips on itself")
 
     def test_gpu_decode_state_file_cannot_wedge_the_bridge(self):
         """`readGpuDecodeState` returned whatever JSON.parse produced, and
@@ -3419,6 +4284,214 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         css = self._strip_comments(self.css, "css")
         self.assertNotIn("background-attachment", css,
                          "a no-op fixed background attachment is a trap, not a setting")
+
+    # -- fourth pass: the seam orphan, the bridge breaker, the TURN race ----
+
+    def test_seam_timer_is_cleared_on_every_teardown_path(self):
+        """The seam's 12s safety net was disarmed only inside the keepPicture
+        branch, which is the one call where nothing goes offline.
+
+        Only switchRendition() passes keepPicture=true. The callers the hazard
+        was written for — handleDisconnected() and the freeze watchdog's
+        Stage 3 — pass nothing, so the orphan stayed armed precisely when it
+        was dangerous: a switch whose replacement failed fast painted offline
+        and then had the orphan reconnect 12s later on its own; on a healthy
+        live session the orphan nulled srcObject (black + no audio) and then
+        called connectStream(), which no-ops while isConnected is still true;
+        and it forced viewerPausedByChoice=false, resuming a viewer who had
+        deliberately paused.
+
+        The old assertion only proved the tokens exist SOMEWHERE in the
+        function, which the keepPicture branch satisfied, so it could not catch
+        this. The clear must now be positioned before the branch."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "cleanupConnection")
+        self.assertIsNotNone(body, "cleanupConnection not found")
+        clear_at = body.find("clearTimeout(switchSeamTimer)")
+        self.assertGreater(clear_at, 0, "teardown must cancel the seam safety net")
+        branch_at = body.find("if (keepPicture)")
+        self.assertGreater(branch_at, 0, "the keepPicture branch not found")
+        self.assertLess(clear_at, branch_at,
+                        "the seam timer must be cleared BEFORE the keepPicture "
+                        "branch, or every non-keepPicture teardown leaves the "
+                        "12s orphan armed")
+        # The pending flag has to move with the timer, or the next session's
+        # first ontrack takes the seam branch on a teardown nobody asked for.
+        pending_at = body.find("switchSeamPending = false")
+        self.assertGreater(pending_at, 0, "teardown must clear the pending flag")
+        self.assertLess(pending_at, branch_at,
+                        "switchSeamPending must be cleared on every path too")
+
+    def test_bridge_give_up_needs_a_real_healthy_run_not_never(self):
+        """`noHealthyRunFor` fell back to Infinity when the bridge had not yet
+        produced a >=300s run, and `Infinity > 15 * 60 * 1000` is true — so the
+        breaker fired on the FIRST ffmpeg exit of every fresh process, whatever
+        the actual failure count.
+
+        This is MediaMTX's runOnAvailable hook with runOnAvailableRestart, and
+        a publisher drop closes every WHEP reader on the path, so one transient
+        cold-start ffmpeg error took the whole rendition tier down, then slept
+        GIVE_UP_BACKOFF_MS (60s) and exited. It also made three documented
+        safeguards unreachable: the 10-strike cap, the NVDEC->CPU fallback
+        (which needs a second iteration), and the in-process retry."""
+        code = self._strip_comments(self.bridge, "js")
+        self.assertNotIn(": Infinity", code,
+                         "the no-healthy-run window must be measured from a real "
+                         "timestamp, never from a sentinel that trips the breaker")
+        # The window must fall back to THIS process's own start. That fallback is
+        # implemented as the exported shouldGiveUp() (covered behaviourally by
+        # test_bridge_retry_budget_is_reachable, which executes it), so assert the
+        # BEHAVIOUR here rather than one particular identifier spelling: either
+        # the call site falls back to a start-time constant, or the function
+        # itself is what receives it.
+        self.assertTrue(
+            re.search(r"lastHealthyRunAt\s*\|\|\s*(BRIDGE_STARTED_AT|bridgeStartedAt)", code)
+            or "function shouldGiveUp(" in code,
+            "before the first long run the window must be measured from "
+            "this process's own start")
+        # The grace must exceed the health threshold it protects against, or a
+        # bridge merely sitting between two long runs trips on itself. The named
+        # constant may be spelled either way between the two branches.
+        grace = re.search(r"NO_HEALTHY_RUN_(?:GRACE|LIMIT)_MS\s*=\s*(\d+)\s*\*\s*60\s*\*\s*1000", code)
+        self.assertIsNotNone(grace, "the grace window should be expressed in minutes")
+        self.assertGreaterEqual(int(grace.group(1)) * 60, 300,
+                                "the no-healthy-run grace must exceed the 300s "
+                                "health threshold it is measured against")
+
+    def test_client_ice_fetch_outlives_the_server_turn_mint(self):
+        """The browser aborted the ICE-config fetch after 2.5s while
+        server.js mints Cloudflare credentials with AbortSignal.timeout(4000),
+        and it only mints on a cache miss — the first viewer, or the first after
+        the half-life renewal. So a cold cache always lost: the fetch threw
+        AbortError, the cache was set to null, and the handshake continued with
+        host candidates only. For precisely the viewers who need the relay
+        (remote/mobile networks that cannot be punched through) that is the
+        difference between connecting and never connecting."""
+        app = self._strip_comments(self.app, "js")
+        fetch_fn = self._js_function_body(app, "fetchIceServers")
+        self.assertIsNotNone(fetch_fn, "fetchIceServers not found")
+        client_cap = re.search(r"setTimeout\(\(\)\s*=>\s*controller\.abort\(\),\s*(\d+)\)", fetch_fn)
+        self.assertIsNotNone(client_cap, "the ICE fetch abort cap was not found")
+        client_ms = int(client_cap.group(1))
+
+        server = self._strip_comments(self.server, "js")
+        mint = re.search(r"AbortSignal\.timeout\((\d+)\)", server)
+        self.assertIsNotNone(mint, "the server TURN mint timeout was not found")
+        server_ms = int(mint.group(1))
+
+        self.assertGreater(client_ms, server_ms,
+                           f"the client ICE cap ({client_ms}ms) must outlast the "
+                           f"server's TURN mint budget ({server_ms}ms), or a cold "
+                           f"cache aborts a request the server is still serving")
+
+        # And the connect watchdog must still cover the whole legitimate stack,
+        # or raising the ICE cap just moves the failure into the watchdog.
+        connect = self._js_function_body(app, "connectStream")
+        self.assertIsNotNone(connect, "connectStream not found")
+        watchdog = re.search(r"connectTimeout = setTimeout\(.*?,\s*(\d+)\);", connect, re.DOTALL)
+        gather = re.search(r"gatherTimeout = setTimeout\([^,]+,\s*(\d+)\)", connect)
+        post = re.search(r"whepPostTimeout = setTimeout\([^,]+,\s*(\d+)\)", connect)
+        self.assertIsNotNone(watchdog, "the connect watchdog was not found")
+        self.assertIsNotNone(gather, "the ICE gather cap was not found")
+        self.assertIsNotNone(post, "the WHEP POST cap was not found")
+        self.assertGreater(int(watchdog.group(1)),
+                           client_ms + int(gather.group(1)) + int(post.group(1)),
+                           "the connect watchdog must exceed ICE fetch + gather + "
+                           "WHEP POST, or it fires before a slow viewer can finish")
+
+    def test_reaction_bumps_do_not_force_synchronous_layout(self):
+        """Each reaction restarted its animations with
+        `classList.remove(c); void el.offsetWidth; classList.add(c)`, which
+        forces Blink to run UpdateStyleAndLayout inside the frame. This runs
+        for EVERY reaction from EVERY viewer (aggregate capped at 25/s), and
+        the count element's bump followed a textContent write that changes the
+        element's intrinsic width — dirtying the flex chain up to
+        `.reaction-section`, which carries a backdrop-filter. Three barriers
+        per reaction is up to 75/s of main-thread work on the decode thread,
+        landing exactly when the decoder is closest to its limit."""
+        code = self._strip_comments(self.app, "js")
+        pop = self._js_function_body(code, "triggerButtonPop")
+        self.assertIsNotNone(pop, "triggerButtonPop not found")
+        self.assertNotIn("offsetWidth", pop,
+                         "restarting the reaction pop must not force a layout")
+        self.assertIn("restartCssAnimation", pop,
+                      "the pop must go through the reflow-free helper")
+
+        start = code.find("chatSource.addEventListener('reaction'")
+        self.assertGreater(start, 0, "the reaction SSE handler was not found")
+        handler = code[start:]
+        nxt = handler.find("chatSource.addEventListener(", 10)
+        if nxt > 0:
+            handler = handler[:nxt]
+        self.assertNotIn("offsetWidth", handler,
+                         "the reaction handler must not force a layout per event")
+
+        helper = self._js_function_body(code, "restartCssAnimation")
+        self.assertIsNotNone(helper, "restartCssAnimation not found")
+        self.assertNotIn("offsetWidth", helper,
+                         "the restart helper must not force a layout")
+        self.assertIn("getAnimations", helper,
+                      "the restart must address the running animation instead of "
+                      "flushing layout")
+        # REPLAY, not just "no forced layout". Cancelling a CSS animation does
+        # not restart it: the class stays applied, so the computed animation-name
+        # never changes and the engine never re-creates it. Verified in Chrome
+        # against this exact stylesheet — cancel+add animated the FIRST reaction
+        # only, and the button's `forwards` fill made cancel() actively kill a
+        # finished animation. Seeking currentTime back to 0 is what replays it,
+        # and both animations need a fill-mode so a finished one still exists in
+        # getAnimations() to be seeked.
+        self.assertNotIn(".cancel()", helper,
+                         "cancel() removes the animation without replaying it; "
+                         "seek currentTime to 0 instead")
+        self.assertIn("currentTime = 0", helper,
+                      "the restart must seek the animation back to its start")
+        # The animation name is not always the class name (btn-popping vs
+        # emoji-btn-pop), so it has to be passed explicitly rather than derived.
+        self.assertIn("'btn-popping', 'emoji-btn-pop'", code,
+                      "the button's keyframes name must be passed explicitly")
+
+        # count-bump has to be a real keyframe animation: a static class cannot
+        # be replayed by re-adding it, and needs a timer to be removed.
+        css = self._strip_comments(self.css, "css")
+        self.assertRegex(css, r"@keyframes\s+count-bump",
+                         "count-bump must be a keyframe animation so it can be "
+                         "replayed and left applied without a removal timer")
+        rule = self._css_rule(css, ".emoji-count.count-bump")
+        self.assertIsNotNone(rule, ".emoji-count.count-bump rule not found")
+        self.assertIn("animation", rule,
+                      "the bump must be driven by the animation, not static styles")
+        self.assertNotIn("!important", rule,
+                         "the old static !important styles are what made this "
+                         "unreplayable; they belong in the keyframes now")
+        # A fill-mode is REQUIRED, not cosmetic: without it the finished
+        # animation is dropped from getAnimations(), so there is nothing left to
+        # seek on the second reaction onward and the bump plays exactly once.
+        self.assertRegex(rule, r"animation:[^;]*\bforwards\b",
+                         "count-bump needs fill-mode:forwards so a finished "
+                         "animation still exists in getAnimations() to be replayed")
+        pop_rule = self._css_rule(css, ".emoji-btn.btn-popping")
+        self.assertIsNotNone(pop_rule, ".emoji-btn.btn-popping rule not found")
+        self.assertRegex(pop_rule, r"animation:[^;]*\bforwards\b",
+                         "the button pop needs fill-mode:forwards for the same reason")
+        # A filled animation outranks every normal author declaration, so a 100%
+        # frame that restates `transform: scale(1)` would win over `.emoji-btn:hover`
+        # and `:active` for the rest of the page's life — the buttons would lose
+        # their hover lift and press feedback after the viewer's first reaction.
+        # Measured in Chrome: computed transform stayed matrix(1,0,0,1,0,0) on
+        # every reaction afterwards. The 100% frame must therefore declare no
+        # transform at all, letting the cascade decide the resting state.
+        keyframes = re.search(r"@keyframes\s+emoji-btn-pop\s*\{(.*?)\n\}", css, re.DOTALL)
+        self.assertIsNotNone(keyframes, "the emoji-btn-pop keyframes were not found")
+        final = re.search(r"100%\s*\{([^}]*)\}", keyframes.group(1))
+        self.assertIsNotNone(final, "the pop keyframes have no 100% frame")
+        self.assertNotIn("transform", final.group(1),
+                         "the 100% frame must not declare a transform: a filled "
+                         "animation outranks :hover/:active and would pin the "
+                         "button to its resting transform permanently")
+        # No removal timer should be left behind for the bump.
+        self.assertNotIn("classList.remove('count-bump')", code,
+                         "the bump ends at its natural state, so it needs no timer")
 
 
 class StudioOverlayVisibilityChecks(unittest.TestCase):

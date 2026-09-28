@@ -43,11 +43,12 @@
         </header>
 
         <!-- Experimental notice. Deliberately above the fold and NOT dismissible:
-             the failure it warns about is invisible to the host. A 12 fps capture
-             previews as a perfectly smooth local slideshow, so the broadcaster's own
-             eye confirms nothing is wrong - viewers are the only ones who can tell,
-             and only if they were told. A close button would just train people to
-             hide the one message that matters. -->
+             the failure it warns about is invisible in the LOCAL PREVIEW, which
+             plays the raw capture track (studio.js) and not the encoded stream.
+             So the preview stays perfectly smooth while the broadcast degrades -
+             the meters are the only honest feedback, which is why the notice
+             points at them. A close button would just train people to hide the
+             one message that matters. -->
         <section class="studio-notice" aria-labelledby="studio-notice-title">
             <div class="studio-notice-head">
                 <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
@@ -57,9 +58,11 @@
             <p class="studio-notice-body">
                 Broadcasting from this browser is <b>experimental and buggy</b>, and it very likely
                 gives you <b>very low FPS</b>. This page has to capture, encode and upload the video
-                on the same machine at the same time, and it silently drops frames whenever it
-                cannot keep up with all three. For a real broadcast, use <b>OBS Studio over
-                WHIP</b> instead &mdash; it is stable and holds full frame rate:
+                on the same machine at the same time. The preview above plays the raw screen capture,
+                <b>not</b> the encoded stream, so it keeps looking smooth while the real broadcast
+                is struggling &mdash; watch the <b>FPS</b> and <b>Resolution</b> meters, not the preview.
+                For a real broadcast, use <b>OBS Studio over WHIP</b> instead &mdash; it is stable and
+                holds full frame rate:
             </p>
 
             <ol class="studio-notice-steps">
@@ -70,9 +73,9 @@
             </ol>
 
             <p class="studio-notice-foot">
-                Both paths publish to the same <code>live</code> stream, so viewers cannot tell the
-                difference. The full settings list is on the
-                <a class="studio-notice-link" href="/streaming/">watch page</a>.
+                Both paths publish to the same <code>live</code> stream, so a viewer sees one stream
+                either way &mdash; but the browser path is far likelier to stutter. The full settings
+                list is on the <a class="studio-notice-link" href="/streaming/">watch page</a>.
             </p>
         </section>
 

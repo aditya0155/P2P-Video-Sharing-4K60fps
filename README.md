@@ -1,5 +1,9 @@
 # Rydius Stream: laptop host
 
+![Rydius Stream viewer page at stream.rydius.in](screenshots/viewer-live.png)
+
+*A viewer watching a live stream at `https://stream.rydius.in` — WebRTC playback, the live-chat sidebar, quick reactions, and per-client stream stats.*
+
 This setup runs OBS and MediaMTX on the same Windows laptop. The page and WebRTC signaling are served locally and published at **https://stream.rydius.in** through a Cloudflare Tunnel, so viewers just open a link — no Tailscale install, no account. Video for viewers that cannot reach the laptop directly relays through Cloudflare TURN. OBS video enters through loopback, so it does not use the hotspot upload until viewers connect. Tailscale Serve remains as a verified fallback.
 
 ## One-time setup
@@ -107,6 +111,45 @@ A dedicated pass looked only for things that make a viewer's picture not smooth,
 - Webfonts use `display=optional`. The Google Fonts sheet is cross-origin and therefore render-blocking, so with the default `swap` the fonts arrive *after* the handshake has started playback and the swap re-metrics every header/chat/HUD string — a full relayout in the first seconds of a live stream.
 - The cursor-hide helper wrote the **root** element's inline style on every qualifying mousemove, while writing the same value it had already written (outside fullscreen `hide` is always false). It now skips the no-op write.
 
+## Fourth-pass audit — the seam was dead code, and drift cost a black screen
+
+The third pass fixed a rendition switch that blacked out for 2–4 s. That fix regressed on the very next change, in a way the existing tests could not see, and the result was worse than the bug it replaced.
+
+### Every rendition switch ended in a permanent black screen
+`switchRendition` armed the seam and *then* called `cleanupConnection(true)`:
+
+```js
+switchSeamPending = true;
+cleanupConnection(true);      // <- and this sets switchSeamPending = false
+```
+
+`cleanupConnection` **owns** the seam's lifetime — it cancels the 12 s safety net and clears the flag on every teardown path, and it must, because Stage 2 and every graceful ICE teardown run through it. So that call destroyed the flag one statement after it was set, and `if (switchSeamPending && …)` in `ontrack` was **provably unreachable on every switch**. The comment beside the code claimed the flag "stays TRUE here"; the code said otherwise. The teardown now runs first and the seam is armed after it.
+
+The consequence cascaded. The 12 s net's only success-path cancel lived *inside* that unreachable branch, so **the net fired on every switch, including perfectly healthy ones**, and when it fired it could not recover:
+
+```js
+if (player.srcObject) { player.pause(); player.srcObject = null; }
+cleanupConnection();
+connectStream();              // <- returns immediately
+```
+
+`cleanupConnection` only releases resources; it never touches `isConnected`/`isConnecting`, and `handleConnected()` had set `isConnected = true` for the replacement session. So `connectStream()` hit its own duplicate guard and did nothing. The page was left with `player.srcObject === null`, `peerConnection === null`, `isConnected === true` — and **every** recovery path is gated off by exactly that combination: the freeze watchdog needs a peer connection *and* an unpaused element, the stats loop needs a connected peer connection, rVFC needs frames, and the status poll skips while `isConnected`. A black screen only a manual reload could clear. The net now clears the flags before reconnecting, so it is a recovery rather than a self-wound-down session.
+
+Separately, that cancel sat *inside* the `if (keepPicture)` early-return, so a **full** teardown (Stage 3, `handleDisconnected`) left the orphan armed: the page painted offline and then, 12 s later, reconnected itself — offline → connecting → live, by itself. Both statements moved above the branch, because the net belongs to the *session*, not to the `keepPicture` choice.
+
+The test that was supposed to catch this could not: it scanned the text between `switchSeamPending = true;` and the first `await` for a clearing statement, and the clearing statement lives in a *different function*. Only the **order of the two calls** proves anything, so that is what is now asserted.
+
+### Drift was answered with a full session teardown
+The latency-mode table's own comment described "the stepwise catch-up drains it back at 150 ms/s". **That code did not exist** — `playbackRate` appeared nowhere in `app.js`. Drift had exactly one response: tear the WHEP session down and rebuild it. That is a 2–4 s hard black screen plus a full ICE + WHEP renegotiation to recover what is purely accumulated latency, and the dominant source of that latency is an ordinary Alt-Tab, which this project's own measurements put at **1.7–2.8 s**.
+
+Every production low-latency player (Twitch, YouTube Live, Meet) instead speeds the media element up so the jitter buffer drains itself, then returns to 1.0×. That is now implemented, and it changes the common case completely:
+
+- `catchUpPlaybackRate()` ramps `playbackRate` toward **1.08×**, 1 % per stats tick in either direction. A step change is audible as a click and a raw per-tick formula would step on every noisy reading; the ramp avoids both. At 1.08× the drain is ~80 ms/s, so **1.5 s of drift is gone in 26 s with no black frame and no renegotiation** (measured in `js_checks.js catchup-rate-drains-without-a-teardown`).
+- The gain has a deliberate **5 % floor**. A pure proportional law tends to zero as the delay approaches the dead band: simulated against the real function, a floorless curve sat at 1.01× from 330 ms down to 180 ms — 20 ms/s, a 15-second crawl to close 150 ms, and *formally never converging*, because each tick's excess is smaller than the last. The floor is what makes it terminate.
+- The hard rejoin is **kept**, as the escalation for when the drain genuinely cannot keep up, so the safety net is unchanged — it is just no longer the first thing that happens.
+- The controller **proves it works before trusting it**. If the delay has not fallen 5 s after catch-up engaged — an engine that accepts the write and ignores it, or a link too congested for 8 % to matter — it disables itself permanently for the session rather than leaving the viewer watching a permanently fast stream while the real problem goes untreated.
+- `playbackRate` is a property of the **media element**, not of the peer connection, so it survives every teardown in the file. It is reset when a new session starts and when the tab is backgrounded (where presentation is suspended and there is nothing to drain).
+
 ## Second-pass audit — bugs the first pass introduced, and more
 
 A second, deeper pass ran four parallel audits over areas the first one never touched (SDP/ICE handshake, audio, long-session stability, bridge ingest) and re-verified everything the first pass shipped. It found four regressions **in the first pass's own fixes**, all now fixed and all pinned by tests:
@@ -210,3 +253,239 @@ The third pass capped the audio receiver's `jitterBufferTarget` at 400 ms so vid
 - The `display=swap` webfont revert was re-examined and stands: the revert comment's reasoning is correct (the stylesheet is render-blocking regardless of `display`; `optional` would lose the brand fonts entirely on the saturated hotspot uplink). Fonts arrive during page load, before playback starts; they are not a mid-session smoothness factor.
 
 Pinned by tests: `run_tests.py test_latency_mode_defaults_to_cinema_and_persists`, `js_checks.js latency-mode-cycle-matches-mode-table`.
+
+## Fourth-pass audit — closing the receiver measurement loop
+
+The first three passes made the *control* side of the receiver careful (delta-based
+measurement, hysteresis, dwell, a drop-gated accommodation, a video-only playout write).
+What none of them could do was **observe the result of its own writes**. Five signals
+that decide whether a viewer sees lag, drift, dropped audio or a "speeded-up" picture
+were either never read or read under the wrong name. Every spec claim below was checked
+against the W3C WebRTC-PC and WebRTC-Stats Recommendations rather than from memory;
+the audit notes, the spec quotes and the sources are in `_research/`.
+
+### The write is a hint, and nothing ever read back what it produced
+
+`RTCRtpReceiver.jitterBufferTarget` is the only standardized playout-delay control
+(WebRTC-PC: `attribute DOMHighResTimeStamp? jitterBufferTarget`, milliseconds, and
+"If target is negative or larger than 4000 milliseconds, then throw a RangeError"). The
+spec is also explicit that the UA holds a minimum and maximum target "reflecting what
+the user agent is able or willing to provide", that the value is "a target", and that
+the resulting change in delay is observed **gradually**. A write is therefore not a
+measurement. The app wrote a target up to 2200 ms and then regulated every downstream
+decision against that *request*.
+
+`jitterBufferTargetDelay` is the standardized read-back, defined in exactly the same
+cumulative terms as `jitterBufferDelay` — "increased by the target jitter buffer delay
+every time a sample is emitted... to get the average target delay, divide by
+`jitterBufferEmittedCount`" — so the same windowed-delta formula applies.
+`jitterBufferMinimumDelay` is the UA's own floor and is explicitly "not affected by
+external mechanisms that increase the jitter buffer target delay, such as
+`jitterBufferTarget`".
+
+Why it mattered: a UA that silently clamped a 350 ms request to 120 ms was
+**indistinguishable from one that honoured it**. The drop-gated accommodation then saw
+the resulting late frames, concluded the network was stressed, and kept raising —
+against a target that never landed. Both readings now go to the HUD (`180 ms → 120`)
+and to the diagnostic export, and the suite pins that the supervisor never steers on
+them, so the read-back cannot become a second feedback loop around the controller it
+audits.
+
+### The audio half of A/V sync was completely unobserved
+
+Every stats consumer filtered on `kind === 'video'`, so the audio report was discarded
+even though it arrives in the same `getStats()` walk. That left unmeasured: the audio
+clock (`totalSamplesDuration`), concealment (`concealedSamples`, `concealmentEvents` —
+audible gaps), and `insertedSamplesForDeceleration`, which is the UA stretching audio to
+reach the video target — the exact mechanism the existing comments reason about at
+length but could not see. Audio drift is now measured in **ppm** against wall time; a
+few hundred ppm walks tens of milliseconds per minute and the browser then
+micro-corrects continuously, which reads as jank while every video stat is clean.
+
+`totalSamplesDuration` is a *receive*-side measure ("all samples that have been
+received"), so the reading absorbs drift in the source's clock as well as the
+receiver's, and it is not a signal for "is audio being rendered". The measurement is
+gated on element state and the WebAudio tap instead (`audioIsPulled()`), because what
+freezes when a track is not rendered is the audio **jitter buffer** and its emitted
+counters — mixing the two in one measurement produces a reading that looks like an
+enormous clock drift and is really just "nothing has been played yet".
+
+### "The video speeds up / slows down" was structurally unobservable
+
+`player.playbackRate` reads `1.0` for a `MediaStream` and cannot see this. The
+mechanism is real and lives in this app's own control path: per the spec, a lowered
+`jitterBufferTarget` is reached by **discarding** buffered frames, and a buffer surplus
+is spent rather than sitting still. `rVFC`'s `metadata.mediaTime` was never read — the
+callback used only `presentedFrames`. It now computes a smoothed
+`d(mediaTime)/d(wall)`: the rate of **presented** media per unit wall time. A rate
+persistently above 1 means the element is spending surplus, which is the visible
+hitch-then-jump.
+
+It is a presented-rate measure, not a playback-rate reading: rVFC fires per frame sent
+to the compositor, so a source that is itself dropping frames reports a *lower* ratio
+while still running at exactly 1.0×. That is why it is reported alongside the presented
+
+### Encoder: three verified defects
+
+Checked against the bundled ffmpeg (`ffmpeg -h encoder=h264_nvenc`) rather than assumed:
+
+- **`-spatial-aq` defaults to `false`.** The pipeline has been spreading bits uniformly
+  instead of by regional complexity. A/B measured on the bundled encoder, 1920x1080@60
+  testsrc2, 6000k, 12 s, `-g 30`: total 8804 KB → 8817 KB (+0.15%), average
+  6.01 → 6.02 Mbps, **100 ms peak 8.96 → 8.64 Mbps**, max IDR 36.8 → 39.8 KB. It is
+  bitrate-neutral and it *lowers* the peak, which is the figure that overflows
+  MediaMTX's per-reader write queue on keyframes.
+- **`env.gopFrames || '60'` contradicted `DEFAULT_GOP_SECONDS`.** 60 frames is 1.0 s at
+  60 fps, 2.5 s at 24 fps and 5 s at 12 fps — two to ten times the designed 0.5 s
+  interval — silently, in exactly the case where the probe could not answer. It now
+  falls back through the same arithmetic the probe itself uses, so the two cannot drift
+  apart. (The suite pinned `'60'` as correct; that assertion was pinning the
+  contradiction and was corrected to `30`, with a second case proving an explicit
+  `env.gopFrames` still wins.)
+- **No `-fps_mode passthrough`.** ffmpeg's default `auto` "chooses between cfr and vfr
+  depending on muxer capabilities", so with a constant-rate-capable muxer it resolves
+  to cfr, whose documented behaviour duplicates and drops frames to hit an exact
+  constant rate. Either branch rewrites frame timing, manufacturing frame-count
+  discontinuities. This is the encoder-side twin of the 24 fps measurement above.
+
+Opus is now pinned to the WebRTC clock: `-ar 48000 -ac 2 -application lowdelay
+-frame_duration 20`. RFC 7587 fixes `audio/opus` at 48 kHz, and the default `audio`
+application permits encoder lookahead — audio latency the video path deliberately
+refuses to accept.
+
+### What was checked and deliberately left alone
+
+- **`-preset p4` is a no-op** (verified: it is the NVENC default). Changing it to `p1`
+  trades real quality for encode speed, the wrong trade for a project whose stated goal
+  is smoothness. Left in place as an explicit pin.
+- **`tune=ull` is not what removes lookahead.** `rc-lookahead` already defaults to 0
+  (verified). The conclusion is right and the cause is mis-attributed, but the
+  behaviour is correct, so nothing was changed on the strength of a comment edit.
+- **The drift "catch-up" is a reconnect, not a ramp.** Reducing surplus by *lowering*
+  the target discards frames, and the staged reconnect avoids that but costs 2–4 s of
+  black. Both are worse than the surplus. Left as-is and documented rather than
+  "fixed" into something that trades one artefact for another.
+
+### Open, and not done
+
+- The browser probe in `_probe/` is scaffolding, not a shipped tool. It was written to
+  get ground-truth viewer stats out of a real headless-Chrome WHEP session and could
+  not be completed on this host: headless Chrome needs ~10 s to open its debug port
+  here, and it could not load the loopback page origin, so the WHEP POST failed with a
+  bare "Failed to fetch". The numbers in this section therefore come from
+  `ffprobe`/`ffmpeg` against the running MediaMTX, not from a browser. Re-running the
+  probe against a live broadcast is the obvious next step and would confirm or refute
+  the read-back and presented-rate instruments on real `getStats()` output rather than
+  on unit fixtures.
+- `start_host.ps1` raises only MediaMTX to `AboveNormal`. The bridge's ffmpeg (NVDEC +
+  NVENC + mux) and `server.js` stay at Normal, even though a preempted encoder thread
+  makes every viewer hitch at once — the same reasoning the file already applies to
+  MediaMTX.
+
+frame count rather than acted on alone.
+
+### The freeze bound is frame-rate dependent and was a single constant
+
+The stats spec defines a freeze as a rendered-frame gap of at least
+`Max(3 * avg_frame_duration_ms, avg_frame_duration_ms + 150)`. In the 10–120 fps range a
+real broadcast uses, the `+150` term dominates: the bound is 166.7 ms at 60 fps,
+183.3 ms at 30 fps and 191.7 ms at 24 fps, and the 3× term only takes over below
+~13.3 fps — so one constant is wrong everywhere. (This host's own live source measured
+1080p at a true 24 fps CFR — 41.71 ms PTS deltas — while the container advertised
+48 fps, so the two are not always close.) `specFreezeThresholdMs()` now derives the
+bound from the measured frame rate.
+
+**It is reported, not acted on.** `triggerFreezeRecovery()` costs 2–4 s of black, worse
+than the freeze it would "fix", so a short freeze should widen the buffer rather than
+tear the session down. The staged recovery keeps its existing threshold for a genuine
+*decoder* stall (bytes flowing, nothing decoding).
+
+
+### `playoutDelayHint` was written, and it does not exist
+
+`applyPlayoutDelay` carried a fallback writing `receiver.playoutDelayHint =
+targetMs / 1000`. That property is not in the WebRTC-PC Recommendation, not in MDN's
+`RTCRtpReceiver` member list, and appears in no W3C WebRTC specification or extension.
+The branch could never be taken — and its presence advertised a compatibility path that
+does not exist, so a maintainer reading it would have believed non-Chromium receivers
+were covered. Removed; `jitterBufferTarget` is the only control and it is in
+milliseconds.
+
+Related: nothing enforced the setter's documented `[0, 4000]` range, and an
+out-of-range write throws a `RangeError` that the existing `catch` reported as "this
+browser has no such API". The accommodation cap (2200) sits under 4000 today, so this
+was a latent trap rather than a live bug — but a future constant bump, or summing the
+base terms instead of `max()`ing them, would have thrown on *every* write and silently
+disabled buffer control while the HUD kept advertising a target. Now clamped at the
+call site.
+
+- Audio gain is now **ramped, not stepped** (`setValueAtTime` moves gain within one 128-sample render quantum, so mute/unmute was a full-scale 0 dBFS click and a volume drag was 60–200 clicks/second of zipper noise).
+
+## Fourth-pass audit — inherited defaults in the test sandbox
+
+### The suite opened a wildcard listener, and could die on a port clash
+`mediamtx.yml` sets `moq: no`, but the config the suite generates for its sandboxed MediaMTX listed only the keys it cared about (api/webrtc/rtsp/rtmp/srt/hls) and let the rest fall back to the bundled binary's defaults. MoQ is **on** by default there, and its addresses are not loopback: `moqHTTP2Address: :8892`, `moqHTTP3Address: :8892`, `moqQUICAddress: :8893`.
+
+Two consequences, both verified by running the real binary on that exact config:
+- **The tests bound the wildcard address.** While the sandbox was up it held `0.0.0.0`/`::` on 8892 (TCP + UDP) and 8893 (UDP) — the only sockets in the suite not scoped to `127.0.0.1`, on a machine whose whole point is a shared hotspot LAN.
+- **The suite could fail for a reason that had nothing to do with the code.** Those three ports are fixed, unlike the three the test draws with `find_free_port()`, so anything else on the box holding 8892 made MediaMTX exit at startup. The suite surfaced that as `test_paths_api_and_whep_match_what_the_player_expects` FAIL with `listen tcp :8892: bind: Only one usage of each socket address ...` — a control-API *contract* failure manufactured by a port collision, pointing at `app.js` instead of at the sandbox. It reproduced on a clean checkout and passed on a re-run, i.e. a coin flip dressed up as a test.
+
+Both generated configs now set `moq: no`. Two tests pin it: `test_sandboxed_mediamtx_binds_nothing_on_a_wildcard_address` boots the real binary and asserts via `Get-NetTCPConnection`/`Get-NetUDPEndpoint` that it owns **no** non-loopback socket (reverting the fix reports exactly `tcp :::8892`, `udp :::8892`, `udp :::8893`), and `test_every_mediamtx_config_disables_moq` pins the flag in `mediamtx.yml` and in every config literal the suite generates.
+
+The general lesson, and the reason the second test exists: a config that only lists the keys it cares about is not a sandbox, it is an inheritance chain through whatever the binary ships as default. The production `mediamtx.yml` is the same shape and is safe **only** because it happens to spell out `moq: no`; that is now asserted rather than assumed.
+## Fifth-pass audit — guards that fired on the wrong side, and 20 tests that never ran
+
+Four defects, all found by reading for *guards whose condition is satisfied when it should not be* (the theme the third pass established), plus a fault in the harness that hid two of them.
+
+### ~20 tests were dead code, so the suite was green for the wrong reason
+A stray `if __name__ == "__main__":` sat **in the middle** of `ViewerSmoothnessRegressionChecks`, ending the class body. Everything defined after it — 20 methods including the ABR-seam, chat-autoscroll, cursor-write and switch-cooldown guards — was parsed as a module-level `if` block, so `unittest` never collected them. `Ran 42 tests` was reported as `OK` while a fifth of the class did not exist as far as the runner was concerned.
+
+Both fixes below live in exactly that dead zone: the seam's safety net was "asserted" cancelled by a test that never ran. Moving the block to the end of the file takes the class to **62 collected tests** and immediately surfaced three genuine failures, two of which were the assertion style described at the end of this section.
+
+### The ABR seam's 12s safety net was disarmed only where it was harmless
+`cleanupConnection` cleared `switchSeamTimer` **inside** its `keepPicture` branch — and `keepPicture=true` is passed by exactly one caller, `switchRendition`, which is the only teardown where nothing goes offline. The callers the hazard was written for (`handleDisconnected`, and the freeze watchdog's Stage 3) pass nothing, so the orphan stayed armed precisely when it was dangerous:
+- a rendition switch whose replacement failed fast painted **offline**, then had the orphan reconnect 12 s later on its own — the page flipping offline → connecting → live with no user action;
+- on a healthy live session the orphan ran `player.srcObject = null` (black, audio dead) and then called `connectStream()`, which **no-ops** because `isConnected` is still true — a dead connection neither watchdog can see;
+- it also forced `viewerPausedByChoice = false`, resuming a viewer who had deliberately paused, with audio.
+
+The clear is now unconditional, before the branch. The old test only proved the tokens appeared *somewhere* in the function — which the `keepPicture` branch satisfied — so it could not have caught this; the new one asserts the clear is positioned **before** the branch.
+
+Making that clear unconditional exposed a second, older instance of the same class of bug, and the seam had been dead in a different way. `switchRendition` armed `switchSeamPending = true` and then called `cleanupConnection(true)` on the very next line, which cleared it again in the same synchronous block. The flag was therefore always false by the time `ontrack` fired, the seam branch was skipped, and control fell through to the generic session-id branch — **which does not cancel the safety net**. So the 12 s timer stayed armed and fired on *every successful switch*, nulling `srcObject` and forcing a reconnect. It went unnoticed because the fallthrough branch happens to rebuild the stream too, so the picture survived. The arm now happens **after** the teardown.
+
+`test_seam_pending_is_actually_left_set` had been scanning only the text between the arm and the first `await`, which cannot see a clear in a different function — a false negative that passed against code where the seam was dead. It now asserts the teardown call precedes the arm.
+
+### The bridge's circuit breaker fired on the first ffmpeg failure of every process
+`noHealthyRunFor` fell back to `Infinity` when the bridge had not yet produced a ≥300 s run, and `Infinity > 15 * 60 * 1000` is **true**. So the give-up branch fired on the first exit of any fresh process, whatever the real failure count.
+
+That is a room-wide outage, not a bridge-local one: this is MediaMTX's `runOnAvailable` hook with `runOnAvailableRestart`, and a publisher drop closes every WHEP reader on the path. One transient cold-start ffmpeg error — RTSP setup racing the new publisher, the first keyframe missing the 20 s startup watchdog, NVENC contention with OBS on the same GPU — took the whole rendition tier down, then slept `GIVE_UP_BACKOFF_MS` (60 s) and exited. It also made three documented safeguards unreachable: the 10-strike cap, the NVDEC→CPU fallback (which needs a second iteration), and the in-process retry.
+
+The window is now measured from the process's own start, via a named `NO_HEALTHY_RUN_GRACE_MS` so the grace cannot drift below the 300 s health mark it is measured against.
+
+### The browser gave up on the TURN fetch before the server finished serving it
+The ICE-config fetch aborted at **2500 ms**; `server.js` mints Cloudflare credentials with `AbortSignal.timeout(4000)` and only mints on a cache miss — the first viewer, or the first after the half-life renewal. A cold cache therefore **always** lost: the fetch threw `AbortError`, the cache was set to null, and the handshake continued with host candidates only. For precisely the viewers who need the relay, that is the difference between connecting and never connecting. The client cap is now 6 s, and the connect watchdog moved 22 s → 26 s so it still exceeds ICE fetch + gather + POST.
+
+### Reactions forced up to 75 synchronous layouts per second
+Every reaction from every viewer (aggregate capped at 25/s) restarted its animations with `classList.remove(c); void el.offsetWidth; classList.add(c)`, which forces Blink to run `UpdateStyleAndLayout` inside the frame. The count bump was the expensive one: it followed a text write that changes the element's intrinsic width, dirtying the flex chain up to `.reaction-section`, which carries a `backdrop-filter`. The barriers land exactly when the decoder is closest to its limit — "the stream stutters when people react".
+
+`restartCssAnimation` now seeks the running animation's `currentTime` back to 0 and calls `play()`, which needs no reflow. Two properties turned out to be load-bearing rather than cosmetic, both established by driving the real production functions in headless Chrome against this stylesheet:
+
+- **It must seek, not cancel.** `cancel()` does not replay. The class stays applied, so the computed `animation-name` never changes and the engine never re-creates the animation. Measured over four reactions spaced beyond the 320 ms: `cancel()` animated the **first one only**; seeking animated all four. Worse, the button's `forwards` fill means a *finished* animation is still returned by `getAnimations()`, so `cancel()` actively killed it.
+- **Both animations need `fill-mode: forwards`.** Without one, a finished animation is dropped from `getAnimations()` entirely, leaving nothing to seek, so the bump would play exactly once per session.
+
+`count-bump` also had to become a real `@keyframes` animation — a static class cannot be replayed by re-adding it, and previously needed a `setTimeout` to be removed. The animation name is passed explicitly because the button's class (`btn-popping`) and its keyframes (`emoji-btn-pop`) are not the same string.
+
+### Two assertions that could only fail
+Resurrecting the dead tests exposed two that contradicted the very comments they protect. The webfont test banned the literal `display=optional`, which the HTML comment explaining its removal quotes verbatim; the write-queue test banned `3.3s at 6 Mbps`, which the corrected comment cites to explain what changed. Both now check the live markup/config only — the first by stripping HTML comments, the second by requiring any surviving mention of the stale figure to be marked as the corrected claim.
+
+`_js_function_body` also gained an optional `async` prefix. It anchored on `function name(`, so a lookup for an async function returned `None` and the caller's `assertIsNotNone` reported "not found" for a function that was present and correct.
+
+### The harness threw away the evidence, and raced for its ports
+
+Found while verifying the round above, and the same shape as the fourth pass's finding from the other side: that one fixed the suite *inheriting* a wildcard listener, this one fixes the suite *discarding the child's output*. `wait_until_ready()` reported only `Node site server exited before becoming ready` and threw away the very stdout/stderr that explains the death, so a startup failure of any kind surfaced as an opaque message against whichever test happened to be running — `test_host_source_files_are_never_served` failed that way on a full run and passed in isolation, with the cause visible nowhere. Startup failures now raise `SiteStartupError` carrying the child's output, and `start_site()` retries a fresh port when the child reports the port was taken.
+
+Two supporting facts, both measured rather than assumed:
+
+- **`find_free_port()` is a time-of-check/time-of-use race.** It binds a probe socket, reads the number and closes it, so the port is free when drawn and *unreserved* by the time `server.js` binds it a moment later. Anything else on the box can take it in that window — and since these are ephemeral-range ports, the host's own outbound connections draw from the same range — after which `server.js` exits 1 with `Port N is already in use`. A collision in the harness is not a defect in the code under test, so it earns a fresh port (up to `BOOT_ATTEMPTS`); a caller that pins `PORT` deliberately still gets a hard failure.
+- **The readiness probe's per-attempt budget sat on top of the median cold start.** A cold `server.js` answers its first request in ~0.52 s (median of 25 boots on this host, max 1.05 s) while every later request takes 3–25 ms, and each attempt was allowed **0.5 s** — so the probe discarded its first attempt on most boots and only ever succeeded on a retry. The attempt budget is now 2 s inside a 15 s overall deadline.
+
+Pinned by `test_a_taken_port_is_retried_and_then_reported_with_the_childs_words` (a real listening socket holds the port; the suite must retry it *and* surface `already in use`) and `test_the_readiness_probe_outlasts_a_cold_first_response` (a server that takes 1.2 s to answer must still be recognised as ready). The blocker in the first test deliberately does **not** set `SO_REUSEADDR`: on Windows that would let `server.js` bind the same port anyway, so the collision would never occur and the test would pass for the wrong reason. It also accepts-and-drops in a thread, so each retry fails in milliseconds instead of sitting out the full per-attempt timeout five times over.

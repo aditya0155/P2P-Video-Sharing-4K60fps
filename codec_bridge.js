@@ -107,25 +107,69 @@ const GIVE_UP_BACKOFF_MS = (() => {
 // Wall clock of the last run long enough (>=300s) to count as a real broadcast.
 // A crash loop that never reaches that must eventually trip the breaker.
 //
-// `null`, not 0, and the elapsed time is measured from the process's own start
-// when no healthy run has happened yet. The previous `0` initial value was
-// falsy, so the check below took its `: Infinity` branch and
-// `Infinity > 15 * 60 * 1000` is unconditionally true — the 15-minute health
-// window was never measured from any baseline at all, and the breaker fired on
-// the VERY FIRST ffmpeg exit, `failures` still 0. That nullified the entire
-// retry design: every exit shorter than 300s — an OBS auto-reconnect, a host
-// stall, a 35s crash cycle, all of which the code around it was explicitly
-// written to survive — logged "giving up after 0 failed attempts", slept the
-// 60s backoff with no transcoder running, and exited. Under
-// runOnAvailableRestart that re-launches the hook, which republishes with
-// overridePublisher and KICKS the healthy publisher, dropping the RTMP
-// connection and tearing down every WHEP session on the path. The restart loop
-// then repeated until MediaMTX's hook budget was gone and the renditions stayed
-// dead for the rest of the broadcast.
+// It is seeded with the PROCESS START TIME, not 0. The give-up site treats a
+// falsy value as "no healthy run yet" and substitutes Infinity:
+//
+//     const noHealthyRunFor = lastHealthyRunAt
+//         ? Date.now() - lastHealthyRunAt
+//         : Infinity;
+//     if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES
+//         || noHealthyRunFor > 15 * 60 * 1000) { ...give up... }
+//
+// With a 0 seed, `Infinity > 900000` is true, so that second arm fired on the
+// VERY FIRST ffmpeg exit and the bridge gave up after a single attempt. That
+// made three things unreachable: the MAX_CONSECUTIVE_FFMPEG_FAILURES = 10 retry
+// budget (it could never get past 1), the `gpuFastFailures >= 2` NVDEC -> CPU
+// fallback (it needs two failures), and the 400ms/2s backoff ladder the exit
+// site's own comment describes. Any single ffmpeg exit -- a stall-watchdog
+// kill, an OBS reconnect, a transient RTSP error -- slept the full
+// GIVE_UP_BACKOFF_MS and exited 1 with the renditions dead, instead of
+// restarting. Seeding with the start time measures the 15 minutes from process
+// start, which is what "no healthy run for 15 minutes" is supposed to mean.
+//
+// The blast radius was a room-wide outage, because this runs as MediaMTX's
+// runOnAvailable hook under runOnAvailableRestart: one transient cold-start
+// ffmpeg error (RTSP setup racing the new publisher, the first keyframe not
+// reassembling inside the 20s startup watchdog, NVENC contention with OBS on
+// the same GPU) dropped both RTMP publishers, and a publisher drop closes EVERY
+// WHEP reader session on the path. The bridge then slept GIVE_UP_BACKOFF_MS and
+// exited, so the rendition tier stayed down ~60s at a time instead of retrying
+// in 400ms.
+// How long a single ffmpeg run must last before it counts as proof that this
+// pipeline configuration actually works. It is the yardstick the give-up
+// window below is measured against, so the two must not drift apart: the limit
+// has to be far larger than the threshold or a bridge that is merely between
+// two long runs trips its own breaker on healthy operation.
 const HEALTHY_RUN_SECONDS = 300;
-const NO_HEALTHY_RUN_GIVE_UP_MS = 15 * 60 * 1000;
-const bridgeStartedAt = Date.now();
-let lastHealthyRunAt = null;
+const BRIDGE_STARTED_AT = Date.now();
+let lastHealthyRunAt = BRIDGE_STARTED_AT;
+// How long the bridge may go WITHOUT producing a run long enough to count as a
+// real broadcast before the breaker trips on its own.
+// Must exceed the 300s health threshold itself, or a bridge that is merely
+// between two long runs could trip on its own healthy operation.
+const NO_HEALTHY_RUN_LIMIT_MS = 15 * 60 * 1000;
+
+/*
+ * The circuit breaker, as ONE function so it can be executed by a test.
+ *
+ * Two independent reasons to stop: the consecutive-failure cap, or the bridge
+ * crash-cycling without ever producing a genuinely long run (which the strike
+ * counter cannot see, because a 35s crash cycle keeps clearing it).
+ *
+ * The `lastHealthyRunAt` argument is a WALL CLOCK, never a sentinel. It used to
+ * be read as `lastHealthyRunAt ? now - lastHealthyRunAt : Infinity`, so seeding
+ * it with 0 made the second arm true on the very first ffmpeg exit -- the
+ * bridge gave up after ONE attempt and the MAX_CONSECUTIVE_FFMPEG_FAILURES = 10
+ * budget, the `gpuFastFailures >= 2` NVDEC -> CPU fallback and the whole
+ * 400ms/2s backoff ladder became unreachable. A falsy timestamp now simply
+ * means "no run long enough has happened yet, so that arm is simply not
+ * satisfied", and the elapsed window is measured from the bridge's own start.
+ */
+function shouldGiveUp(failures, lastHealthyRunAtStamp, now = Date.now()) {
+    const sinceHealthyRun = lastHealthyRunAtStamp ? now - lastHealthyRunAtStamp : 0;
+    return failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES
+        || sinceHealthyRun > NO_HEALTHY_RUN_LIMIT_MS;
+}
 // A transcoder that has produced no rendition video this long is hung — most
 // commonly an OBS WHIP AV1 source whose fragmented keyframes never reassemble
 // on the RTSP leg (verified live: the pre-keyframe drop loop never syncs).
@@ -219,6 +263,24 @@ function gopSeconds() {
     return DEFAULT_GOP_SECONDS;
 }
 
+/*
+ * The GOP to use when the source frame rate is unknown.
+ *
+ * `-g` counts FRAMES, so the designed keyframe interval (DEFAULT_GOP_SECONDS,
+ * 0.5s) can only be honoured once the real rate is known. This is the same
+ * arithmetic probeGopFrames() already uses for its own last-resort fallback,
+ * pulled out so the two cannot drift apart.
+ *
+ * It replaces a hard-coded '60' in the encoder arg arrays. 60 frames is 1.0s
+ * at 60fps, 2.5s at 24fps and 5s at 12fps — two to ten times the designed
+ * interval — and it contradicted DEFAULT_GOP_SECONDS silently, in exactly the
+ * case where the probe could not answer. A viewer waiting up to 2.5s for the
+ * next keyframe after a loss reads that as a freeze.
+ */
+function assumedGopFrames() {
+    return String(Math.min(300, Math.max(1, Math.round(60 * gopSeconds()))));
+}
+
 function probeGopFrames() {
     if (process.env.BRIDGE_GOP) {
         const forced = String(process.env.BRIDGE_GOP).trim();
@@ -310,16 +372,57 @@ function decideBridge(tracks, env = {}) {
         // own on every rendition — which viewers report as the video being
         // "janky" when it is purely an audio offset.
         : ['-c:a', 'libopus', '-b:a', env.audioBitrate || AUDIO_BITRATE,
+            // WebRTC's Opus clock is 48000Hz by definition (RFC 7587
+            // "audio/opus" is always 48000/2), so anything else is resampled
+            // inside the encoder. Pinning it explicitly keeps the sample rate
+            // the browser's jitter buffer and AudioContext both assume, and
+            // `-ac 2` matches the stereo layout WebRTC negotiates.
+            '-ar', '48000', '-ac', '2',
+            // `lowdelay` is the right application for a live stream: the
+            // default `audio` permits the encoder lookahead that the VIDEO
+            // path deliberately refuses, which is audio latency the project
+            // has explicitly traded away everywhere else. A 20ms frame is the
+            // WebRTC convention and bounds the jitter buffer's granularity.
+            '-application', 'lowdelay', '-frame_duration', '20',
             '-af', 'aresample=async=1'];
 
     if (upper.includes('AV1')) {
         // Source is AV1: legacy browsers need an H264 fallback.
         const h264Rate = env.h264Bitrate || H264_BITRATE;
+        // `-g` counts FRAMES, so the designed 0.5s keyframe interval can only
+        // be expressed as a frame count once the source's real rate is known.
+        // The production caller always passes env.gopFrames from
+        // probeGopFrames(); this is the value to use when it does not.
+        //
+        // It used to be a hard-coded '60', which silently contradicts
+        // DEFAULT_GOP_SECONDS: 60 frames is 1.0s at 60fps, 2.5s at 24fps, and
+        // 5s at 12fps — two to ten times the designed interval, with nothing
+        // logged, exactly in the case where the probe could not answer. The
+        // probe has bounded, logged fallbacks of its own and is exported, so
+        // asking it is both honest and non-blocking here.
+        const gop = env.gopFrames || assumedGopFrames();
         return {
             sourceCodec: 'AV1',
             target: 'live-h264',
             videoArgs: [
                 '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'ull',
+                // Adaptive quantization is OFF by default in ffmpeg's NVENC
+                // wrapper (verified against the bundled n8.1:
+                // `-spatial_aq <boolean> ... (default false)`), so bits were
+                // being spread uniformly instead of by regional complexity. A/B
+                // measured on the bundled encoder, 1920x1080@60 testsrc2 at
+                // 6000k, 12s, -g 30 (worst case for I-frame size):
+                //
+                //   total  8804KB -> 8817KB  (+0.15%, flat)
+                //   avg     6.01 -> 6.02 Mbps (the -b:v target still governs)
+                //   100ms peak 8.96 -> 8.64 Mbps (LOWER)
+                //   max IDR  36.8 -> 39.8 KB
+                //
+                // So it is bitrate-neutral, and the peak it slightly reduces is
+                // the figure that matters: peaks overflow MediaMTX's per-reader
+                // write queue on keyframes and freeze receivers. -aq-strength 8
+                // is ffmpeg's own default for the scale (1 low - 15 aggressive).
+                '-spatial-aq', '1', '-aq-strength', '8',
                 '-b:v', h264Rate,
                 // -maxrate/-bufsize pin a 1s VBV window to the target rate:
                 // bare -b:v measured 2.4x-target 100ms bursts and +8% average
@@ -329,7 +432,29 @@ function decideBridge(tracks, env = {}) {
                 // hard-bounded (measured 1.4x, same as strict -rc cbr).
                 '-maxrate', h264Rate,
                 '-bufsize', h264Rate,
-                '-bf', '0', '-g', env.gopFrames || '60', '-forced-idr', '1',
+                // -g counts FRAMES, so the designed 0.5s interval is a frame
+                // count that depends on the source rate. `gopFrames()` derives
+                // it from a probe; this fallback previously hard-coded '60',
+                // which is 1.0s at 60fps and 2.5s at 24fps — double to five
+                // Probed frame count. The old `env.gopFrames || '60'` fallback
+                // silently contradicted DEFAULT_GOP_SECONDS — 60 frames is
+                // 1.0s at 60fps and 2.5s at 24fps — with nothing logged, in
+                // exactly the case where the probe could not answer.
+                '-bf', '0', '-g', gop, '-forced-idr', '1',
+                // ffmpeg's default -fps_mode is 'auto', which per the ffmpeg
+                // docs "chooses between cfr and vfr depending on muxer
+                // capabilities" — so with a constant-rate-capable muxer it
+                // silently resolves to cfr, whose documented behaviour is that
+                // "frames will be duplicated and dropped to achieve exactly the
+                // requested constant frame rate". Either branch rewrites the
+                // frame timing, which manufactures exactly the frame-count
+                // discontinuity this project exists to prevent: the browser's
+                // jitter buffer sees a source that does not match its own
+                // advertised frame rate. 'passthrough' passes each frame with
+                // its demuxer timestamp to the muxer — no duplication, no
+                // dropping, no timestamp rewriting — so a VFR source stays VFR
+                // end to end.
+                '-fps_mode', 'passthrough',
             ],
             audioArgs,
             // AV1 viewers playing the native path of an AAC source would get
@@ -376,11 +501,17 @@ function decideBridge(tracks, env = {}) {
 function buildAv1VideoArgs(env = {}, av1Rate = AV1_BITRATE) {
     return [
         '-c:v', 'av1_nvenc', '-preset', 'p4', '-tune', 'ull',
+        // Same AQ block and the same measurement as the H264 branch above.
+        '-spatial-aq', '1', '-aq-strength', '8',
         '-b:v', av1Rate,
         // Same burst cap as the H264 branch — see the comment there.
         '-maxrate', av1Rate,
         '-bufsize', av1Rate,
-        '-bf', '0', '-g', env.gopFrames || '60', '-forced-idr', '1',
+        // Probed frame count, not the old hard-coded 60-frame fallback — see
+        // the H264 branch for why the fallback has to stay rate-aware.
+        '-bf', '0', '-g', env.gopFrames || assumedGopFrames(), '-forced-idr', '1',
+        // One output frame per input frame; see the H264 branch.
+        '-fps_mode', 'passthrough',
     ];
 }
 
@@ -1047,16 +1178,8 @@ async function main() {
         // tripped, or the bridge has been crash-cycling without ever producing
         // a genuinely long run — which the strike counter cannot see, because a
         // 35s crash cycle keeps clearing it.
-        //
-        // The baseline for "no healthy run for" is the process start until the
-        // first >=300s run happens. Using `Infinity` until then made the
-        // comparison always true, so the breaker fired on the first exit of the
-        // process; the real intent is "15 minutes of wall clock during which no
-        // run ever lasted long enough to prove the configuration works".
-        const healthyBaseline = lastHealthyRunAt === null ? bridgeStartedAt : lastHealthyRunAt;
-        const noHealthyRunFor = Date.now() - healthyBaseline;
-        if (failures >= MAX_CONSECUTIVE_FFMPEG_FAILURES
-            || noHealthyRunFor > NO_HEALTHY_RUN_GIVE_UP_MS) {
+        if (shouldGiveUp(failures, lastHealthyRunAt, Date.now())) {
+            const noHealthyRunFor = Date.now() - (lastHealthyRunAt || BRIDGE_STARTED_AT);
             logError(`giving up after ${failures} failed attempts`
                 + ` (no healthy run for ${Math.round(noHealthyRunFor / 1000)}s)`);
             if (plan.sourceCodec === 'AV1') {
@@ -1083,7 +1206,7 @@ async function main() {
     process.exit(0);
 }
 
-module.exports = { decideBridge, buildFfmpegArgs, pickDecoderArgs, probeGopFrames, planTargets, VIDEO_CODECS };
+module.exports = { decideBridge, buildFfmpegArgs, pickDecoderArgs, probeGopFrames, planTargets, shouldGiveUp, MAX_CONSECUTIVE_FFMPEG_FAILURES, NO_HEALTHY_RUN_LIMIT_MS, VIDEO_CODECS };
 
 if (require.main === module) {
     main().catch((err) => {
