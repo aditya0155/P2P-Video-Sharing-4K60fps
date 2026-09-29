@@ -1173,6 +1173,280 @@ Object.assign(cases, {
         assertEqual(fn(NaN), null, 'a NaN frame duration is not measurable');
         assertEqual(fn(-5), null, 'a negative frame duration is not measurable');
     },
+    // Presentation evenness — the detector for the "0% loss but not smooth"
+    // report. It has to satisfy two opposing requirements at once: it must stay
+    // SILENT on a steady stream (a false positive widens the buffer of every
+    // healthy viewer) and it must FIRE on a genuinely uneven one (a false
+    // negative is the bug it exists to fix).
+    'presentation-evenness-detects-uneven-cadence'() {
+        const { fn } = compileFunction('frameGapUnevenness', {});
+        const { fn: note } = compileFunction('noteFramePresentation', {});
+        const WINDOW = 90;
+
+        // Build a realistic window the way rVFC would: feed gaps one at a time
+        // through the same windowing the player uses.
+        const feed = (gaps) => {
+            let w = [];
+            for (const g of gaps) w = note(g, w);
+            return fn(w);
+        };
+        const steady = (ms) => feed(new Array(200).fill(ms));
+        const alternating = (a, b) => feed(new Array(200).fill(0).map((_, i) => (i % 2 ? b : a)));
+        const wobble = (ms, amp) => feed(new Array(200).fill(0)
+            .map((_, i) => ms + (i % 3 === 0 ? amp : (i % 3 === 1 ? -amp : 0))));
+
+        // MUST NOT FIRE — these are all healthy viewers, and a false positive
+        // widens the buffer of every one of them once per session.
+        assert(steady(16.7) < 0.05, `a steady 60fps stream must read as even, got ${steady(16.7)}`);
+        assert(steady(33.3) < 0.05, `a steady 30fps stream must read as even, got ${steady(33.3)}`);
+        assert(wobble(16.7, 2.5) < 0.35,
+            `ordinary +/-2.5ms vsync wobble must not be called uneven, got ${wobble(16.7, 2.5)}`);
+        // A single dropped frame is a blip. The reported symptom is explicitly
+        // CONTINUOUS, so an isolated hitch must not trip the detector.
+        const oneOutlier = new Array(200).fill(33.3);
+        oneOutlier[100] = 90;
+        assert(feed(oneOutlier) < 0.35,
+            `a single dropped frame must not be called continuous unevenness, got ${feed(oneOutlier)}`);
+
+        // THE OUTLIER CASE THAT MATTERS. A lone 700ms hitch (a keyframe wait or a
+        // GC pause) at 30fps: mean-absolute-deviation is dominated by outlier
+        // MAGNITUDE, so without a plausibility bound this produced a hot reading
+        // for three consecutive samples — exactly the 3-tick streak — and the
+        // one-shot widen was spent on a blip. Measured on a steady 30fps stream,
+        // 33fps of frame time is ~33ms, so 700ms is >20x the cadence and is a
+        // stall (the freeze watchdog's domain), not unevenness.
+        for (const hitch of [700, 400, 250]) {
+            const withHitch = new Array(200).fill(33.3);
+            withHitch[100] = hitch;
+            assert(feed(withHitch) < 0.35,
+                `a single ${hitch}ms hitch must not be called continuous unevenness, `
+                + `got ${feed(withHitch)}`);
+        }
+
+        // MUST FIRE — continuously uneven cadence, with zero packet loss.
+        const rough30 = alternating(16, 48);
+        const rough60 = alternating(10, 24);
+        assert(rough30 > 0.35, `a 3:1 alternating cadence must read as uneven, got ${rough30}`);
+        assert(rough60 > 0.35, `a 2.4:1 alternating cadence must read as uneven, got ${rough60}`);
+
+        // Cadence-independent: the same SHAPE of irregularity must score the same
+        // at any frame rate, or a 30fps viewer is judged by a 60fps threshold.
+        assert(Math.abs(rough30 - rough60) < 0.2,
+            `unevenness must be cadence-independent, 30fps=${rough30} 60fps=${rough60}`);
+
+        // The window must actually slide: a stream that is rough and then settles
+        // must stop reading as uneven, or a single bad minute marks the session.
+        let w = [];
+        for (const g of new Array(200).fill(0).map((_, i) => (i % 2 ? 48 : 16))) w = note(g, w);
+        const whileRough = fn(w);
+        for (let i = 0; i < 200; i++) w = note(16.7, w);
+        const afterSettling = fn(w);
+        assert(whileRough > 0.35 && afterSettling < 0.35,
+            `the window must slide: rough=${whileRough} afterSettling=${afterSettling}`);
+
+        // Degenerate inputs must not produce a number that could arm the detector.
+        assertEqual(fn(null), null, 'a non-array must not produce a reading');
+        assertEqual(fn([]), null, 'an empty window must not produce a reading');
+        assertEqual(fn([16, 16]), null, 'fewer than 4 samples must not produce a reading');
+        assertEqual(fn([16, 16, NaN, -1, 0, 16]), null,
+            'a window of unusable samples must not produce a reading');
+        // noteFramePresentation must ignore junk rather than poison the window.
+        assertEqual(note(NaN, [1, 2, 3]), [1, 2, 3], 'a NaN gap must be ignored');
+        assertEqual(note(0, [1, 2, 3]), [1, 2, 3], 'a zero gap must be ignored');
+        assertEqual(note(-5, [1, 2, 3]), [1, 2, 3], 'a negative gap must be ignored');
+        // The window is bounded: it must not grow without limit over a long session.
+        let big = [];
+        for (let i = 0; i < 100000; i++) big = note(16.7, big);
+        assertEqual(big.length, WINDOW, `the gap window must stay bounded at ${WINDOW}, got ${big.length}`);
+    },
+    // The catch-up gate exists because the rate law is deliberately left as-is:
+    // its dead band is SYMMETRIC and avgPlayoutDelayMs is a windowed mean over
+    // emitted frames, so on a real link it crosses that band between consecutive
+    // 1s windows (119ms one tick, 121ms the next). Simulated end to end, the
+    // ungated controller wrote playbackRate once per second forever with zero
+    // packet loss and zero drops in the stats. The gate is what makes it settle.
+    'catch-up-gate-stops-the-per-second-rewrite'() {
+        const { fn: law } = compileFunction('catchUpPlaybackRate', {});
+        const ENGAGE_BAND_MS = 180;
+        const ENGAGE_CLEAR_MS = 120;
+        const ENGAGE_TICKS = 2;
+        const ENGAGE_DWELL_MS = 2000;
+        const TICK_MS = 1000;
+
+        // This models the SHIPPED gate in updateLiveEdgeCatchUp. An earlier version
+        // of this test re-implemented the gate, and the re-implementation put the
+        // engage-streak update OUTSIDE the `wanted !== rate` branch while the real
+        // code had it INSIDE — so the test passed against an algorithm the file
+        // does not contain, and the shipped controller was still doing 59
+        // playbackRate writes per 120s and stranding the element at 1.01.
+        //
+        // The ordering below is the point of the test: the streak is counted
+        // before the branch, exactly as it must be in app.js. If that ever moves
+        // back inside the branch in app.js, this model no longer describes it —
+        // so the structural check below is the real guard, and this model is the
+        // behavioural specification of what the corrected order must produce.
+        const initialState = () => ({ rate: 1, above: 0, lastWrite: -Infinity, writes: 0 });
+        const simulate = (delays, target, state = initialState(), tickOffset = 0) => {
+            delays.forEach((delay, i) => {
+                const now = (tickOffset + i) * TICK_MS;
+                const wanted = law(delay, target, state.rate, 1.08);
+                const engaged = wanted > state.rate;
+                const excess = delay - target;
+                // Streak FIRST, then the write branch. This ordering is load-bearing.
+                // The DEAD GAP is load-bearing too: the law's own dead band is 120ms,
+                // and engaging at that same boundary means acting on the law's own
+                // indecision. Measured against the real law, engaging at 120 (with or
+                // without a 60ms reset hysteresis) writes 59 times in 120s and leaves
+                // the element flipping 1.00 <-> 1.01 forever. The gap is 120..180.
+                if (excess > ENGAGE_BAND_MS) state.above += 1;
+                else if (excess < ENGAGE_CLEAR_MS) state.above = 0;
+                if (wanted !== state.rate) {
+                    const streakOk = !engaged || state.above >= ENGAGE_TICKS;
+                    const dwellOk = !engaged || (now - state.lastWrite) >= ENGAGE_DWELL_MS;
+                    if (streakOk && dwellOk) {
+                        state.rate = wanted;
+                        state.lastWrite = now;
+                        state.writes += 1;
+                    }
+                }
+            });
+            return state;
+        };
+
+        // STRUCTURAL: the shipped source must count the streak outside the branch.
+        // A behavioural model of an algorithm the code does not implement is worse
+        // than no test, so this assertion is what actually pins the fix.
+        const body = APP_SOURCE.slice(APP_SOURCE.indexOf('function updateLiveEdgeCatchUp('),
+            APP_SOURCE.indexOf('function resetLiveEdgeCatchUp('));
+        const streakAt = body.indexOf('catchUpAboveBandTicks += 1');
+        const branchAt = body.indexOf('if (wanted !== catchUpRate)');
+        assert(streakAt > 0 && branchAt > 0,
+            'could not locate the engage streak and the write branch in updateLiveEdgeCatchUp');
+        assert(streakAt < branchAt,
+            'the engage streak must be counted BEFORE the `wanted !== catchUpRate` branch; '
+            + 'inside it, a down-tick clears the streak and the gate can never engage');
+
+        // ...and the engage threshold must clear the rate law's own 120ms dead band
+        // with room to spare. Engaging AT the law's boundary means acting on the
+        // law's own indecision, and the behavioural assertions above are what
+        // caught it: 59 writes per 120s and a permanent 1.00<->1.01 flip.
+        const lawBody = compileFunction('catchUpPlaybackRate', {}).src
+            || APP_SOURCE.slice(APP_SOURCE.indexOf('function catchUpPlaybackRate('),
+                APP_SOURCE.indexOf('function updateLiveEdgeCatchUp('));
+        const deadBand = /DEAD_BAND_MS\s*=\s*(\d+)/.exec(lawBody);
+        assert(deadBand !== null, 'could not read the rate law dead band');
+        const engage = /ENGAGE_BAND_MS\s*=\s*(\d+)/.exec(body);
+        const clear = /ENGAGE_CLEAR_MS\s*=\s*(\d+)/.exec(body);
+        assert(engage !== null && clear !== null,
+            'updateLiveEdgeCatchUp must define both ENGAGE_BAND_MS and ENGAGE_CLEAR_MS');
+        const lawBand = Number(deadBand[1]);
+        assert(Number(engage[1]) > lawBand,
+            `ENGAGE_BAND_MS (${engage[1]}) must sit ABOVE the rate law's DEAD_BAND_MS `
+            + `(${lawBand}); engaging at the law's own boundary reproduces the 0.5 Hz `
+            + 'playbackRate rewrite this gate exists to prevent');
+        assert(Number(clear[1]) < Number(engage[1]),
+            'ENGAGE_CLEAR_MS must sit BELOW ENGAGE_BAND_MS, or the "dead gap" is a '
+            + 'single line and a delay oscillating across it resets the streak forever');
+        // The gap must be wide enough to absorb the window-to-window swing of a
+        // windowed mean, and it sits entirely ABOVE the law's own dead band: a
+        // genuinely settled delay (inside the law's 120ms) is then also below
+        // ENGAGE_CLEAR_MS, so it clears the streak and catch-up disengages, while a
+        // delay oscillating just above the law's band cannot keep re-arming it.
+        assert(Number(engage[1]) - Number(clear[1]) >= 40,
+            `the dead gap is too narrow to absorb window-to-window jitter `
+            + `(${clear[1]}..${engage[1]})`);
+        assert(Number(clear[1]) >= lawBand,
+            `ENGAGE_CLEAR_MS (${clear[1]}) must sit ABOVE the rate law's DEAD_BAND_MS `
+            + `(${lawBand}), so a delay oscillating just inside the law's own dead band `
+            + 'cannot keep re-arming the engage streak');
+
+        // THE REGRESSION: a delay dithering either side of the band edge. The old
+        // controller wrote on essentially every one of these 120 ticks.
+        const dither = [];
+        for (let i = 0; i < 120; i++) dither.push(300 + (i % 2 === 0 ? 119 : 121));
+        const dithered = simulate(dither, 300);
+        assert(dithered.writes <= 2,
+            `a delay dithering across the band edge must settle, saw ${dithered.writes} `
+            + 'playbackRate writes in 120s');
+        assertEqual(dithered.rate, 1,
+            `a dithering delay must settle back at 1.0x, got ${dithered.rate}`);
+        // The gate must NOT have disabled the mechanism it protects. ONE continuous
+        // simulation with state carried across ticks, exactly as the controller
+        // runs: calling simulate() per tick would reset the rate, the streak and the
+        // dwell each tick, which is not what happens at runtime.
+        //
+        // Traced against the real law, the gate engages at 1.01 after 2 ticks, ramps
+        // to the 1.08 cap, drains 1.5s of drift, then ramps back down and settles at
+        // 1.0x. Both directions are asserted, because a gate that stopped the
+        // oscillation by never engaging would pass a "must not write" test alone.
+        let delay = 1680;    // 180ms target + 1.5s of accumulated drift
+        let peak = 1;
+        let ticks = 0;
+        const live = initialState();
+        while (delay > 180 && ticks < 120) {
+            simulate([delay], 180, live, ticks);
+            peak = Math.max(peak, live.rate);
+            delay -= (live.rate - 1) * 1000;
+            ticks += 1;
+        }
+        assert(peak > 1.05,
+            `a genuinely drifted session must ramp catch-up up, peak was ${peak}`);
+        // The law stops ramping down inside its own 120ms dead band, so the delay
+        // settles at target + dead band rather than exactly at the target. That is
+        // correct and intended: the surplus below the dead band is the cushion.
+        assert(delay <= 180 + 120 + 1,
+            `catch-up must drain the drift into the dead band, ended at ${Math.round(delay)}ms `
+            + `after ${ticks}s`);
+
+        // Once the drift is gone the rate must come back to rest rather than
+        // parking above 1.0x — a permanent fast picture is the exact defect the
+        // original catch-up bug produced. The delay is at the target (excess 0),
+        // which is inside the law's dead band, so every tick asks to ramp down and
+        // the release is ungated.
+        for (let i = 0; i < 20 && live.rate > 1; i++) {
+            simulate([180], 180, live, ticks + i);
+        }
+        assertEqual(live.rate, 1,
+            `once the drift is gone the rate must return to 1.0x, got ${live.rate}`);
+
+        // A gate that stops the oscillation by NEVER ENGAGING would pass every
+        // assertion above, because "writes <= 2" and "rate settles at 1.0" are also
+        // what a permanently-disabled controller produces. This is the case that
+        // tells the two apart.
+        //
+        // The dither case above is NOT this case: at 119/121 the law is asking to
+        // come back down on half those ticks, so silence is correct there. Here the
+        // excess is 400ms — well clear of the 240ms engage band and far beyond
+        // anything the law would call "settled" — so silence means the gate is
+        // broken. This is the shape a hidden tab leaves (1.5-3s), so it is the case
+        // that actually matters to a viewer.
+        const heldAbove = initialState();
+        for (let i = 0; i < 12; i++) simulate([700], 300, heldAbove, i);
+        assert(heldAbove.rate > 1,
+            `a delay held 400ms over target MUST engage catch-up; rate stayed `
+            + `${heldAbove.rate} — the gate is suppressing a real drift`);
+
+        // The dead gap must not be a black hole. An earlier revision set the
+        // engage threshold at 240ms, which silently stranded EVERY drift between
+        // 121ms and 240ms: the law calls that band drainable, the streak never
+        // reached 2, and a viewer sitting 200ms behind live got no remedy and no
+        // diagnostic, forever. The gap is now 120..180, so anything at or beyond
+        // 180ms of excess is treated. 200ms is the case that regressed.
+        const moderate = initialState();
+        for (let i = 0; i < 12; i++) simulate([500], 300, moderate, i);
+        assert(moderate.rate > 1,
+            `200ms of sustained drift MUST engage catch-up; rate stayed `
+            + `${moderate.rate} — the dead gap is swallowing real drift`);
+
+        // ...and the gap is still a gap: a delay INSIDE it must not be engaged,
+        // or we are back to rewriting the element for noise.
+        const insideGap = initialState();
+        for (let i = 0; i < 60; i++) simulate([300 + (i % 2 === 0 ? 119 : 121)], 300, insideGap, i);
+        assertEqual(insideGap.rate, 1,
+            `a delay oscillating inside the dead gap must rest at 1.0x, got ${insideGap.rate}`);
+        assert(insideGap.writes === 0,
+            `a delay inside the dead gap must produce no writes at all, got ${insideGap.writes}`);
+    },
     // The accommodation must be drop-gated: the measured jitter-buffer delay
     // always tracks the jitterBufferTarget hint Chrome was given, so a
     // controller that raises to meet the measurement chases its own tail and
@@ -1183,7 +1457,7 @@ Object.assign(cases, {
         const { fn } = compileFunction('bufferAccommodationMs', {});
 
         // Late frames actually discarded AND the measured buffer 1.2s past the
-        // 180ms base: grant what Chrome needs (+100ms headroom, 50ms steps).
+        // 180ms base: grant what Chrome needs (+100ms headroom, 100ms steps).
         assertEqual(fn(1200, 0, 180, true, 0), 1300,
             'a real late-frame discard raises to the measured need + 100ms');
         assertEqual(fn(3000, 0, 180, true, 0), 2200,
@@ -1222,19 +1496,24 @@ Object.assign(cases, {
         assertEqual(fn(700, 450, 180, true, 0), 800,
             'a measured need well beyond the current grant must still raise');
         // And the drain still works.
-        assertEqual(fn(400, 400, 180, false, 5), 350,
-            'sustained calm still drains one 50ms step');
+        assertEqual(fn(400, 400, 180, false, 5), 300,
+            'sustained calm still drains one 100ms step');
 
         // Decode/GPU-pressure drops with the buffer at the target are not a
         // buffer problem: the 150ms margin keeps them from inflating latency.
         assertEqual(fn(260, 0, 180, true, 0), 0,
             'drops with the buffer barely above the target must not raise');
 
-        // Sustained calm (>=5 drop-free ticks) drains one 50ms step per tick.
+        // Sustained calm (>=5 drop-free ticks) drains one 100ms step per tick.
+        // The quantum is 100ms, not 50ms, and that is load-bearing: the 50ms
+        // quantum was EXACTLY equal to BUFFER_TARGET_BAND_MS, and reapplyBufferTargets
+        // filters with a strict `<`, so a 50ms step was never filtered and every
+        // accommodation increment became a real jitterBufferTarget write on both
+        // receivers. A 100ms step is a decisive correction rather than noise.
         assertEqual(fn(1300, 1300, 180, false, 4), 1300,
             'fewer than 5 calm ticks must hold');
-        assertEqual(fn(1300, 1300, 180, false, 5), 1250,
-            'calm ticks drain the accommodation 50ms per tick');
+        assertEqual(fn(1300, 1300, 180, false, 5), 1200,
+            'calm ticks drain the accommodation 100ms per tick');
         assertEqual(fn(1300, 30, 180, false, 5), 0,
             'the drain floors at zero');
 
@@ -1274,6 +1553,17 @@ Object.assign(cases, {
                 lastLossPct: 0,
                 lastAppliedTargetMs: null,
                 jitterFloorEmaMs: 0,
+                // Presentation evenness. superviseAdaptiveBuffer() reads these on
+                // every tick, so the extracted-function sandbox has to provide them
+                // or the supervisor throws before it can act on anything.
+                frameGapWindow: [],
+                unevenStreakTicks: 0,
+                unevenWidenApplied: false,
+                unevenFloorMs: 0,
+                unevenReleaseTicks: 0,
+                baseBufferTargetMs: () => 180,
+                currentBufferTargetMs: () => 180,
+                frameGapUnevenness: compileFunction('frameGapUnevenness', {}).fn,
                 accommodationTargetMs: 0,
                 abrBadSec: 0,
                 abrCalmSec: 0,
@@ -1371,6 +1661,17 @@ Object.assign(cases, {
                 lastLossPct: 0,
                 lastAppliedTargetMs: null,
                 jitterFloorEmaMs: 0,
+                // Presentation evenness. superviseAdaptiveBuffer() reads these on
+                // every tick, so the extracted-function sandbox has to provide them
+                // or the supervisor throws before it can act on anything.
+                frameGapWindow: [],
+                unevenStreakTicks: 0,
+                unevenWidenApplied: false,
+                unevenFloorMs: 0,
+                unevenReleaseTicks: 0,
+                baseBufferTargetMs: () => 180,
+                currentBufferTargetMs: () => 180,
+                frameGapUnevenness: compileFunction('frameGapUnevenness', {}).fn,
                 abrBadSec: 0,
                 abrCalmSec: 0,
                 lastRenditionSwitchAt: -60000,
@@ -1700,6 +2001,17 @@ Object.assign(cases, {
                 lastFramesReceived: 0,
                 lastAppliedTargetMs: null,
                 jitterFloorEmaMs: 0,
+                // Presentation evenness. superviseAdaptiveBuffer() reads these on
+                // every tick, so the extracted-function sandbox has to provide them
+                // or the supervisor throws before it can act on anything.
+                frameGapWindow: [],
+                unevenStreakTicks: 0,
+                unevenWidenApplied: false,
+                unevenFloorMs: 0,
+                unevenReleaseTicks: 0,
+                baseBufferTargetMs: () => 180,
+                currentBufferTargetMs: () => 180,
+                frameGapUnevenness: compileFunction('frameGapUnevenness', {}).fn,
                 abrBadSec: 0,
                 abrCalmSec: 0,
                 lastRenditionSwitchAt: -60000,

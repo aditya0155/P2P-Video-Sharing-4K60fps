@@ -109,6 +109,21 @@ document.addEventListener('DOMContentLoaded', () => {
             playPauseBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
             playPauseBtn.setAttribute('aria-label', 'Pause');
         }
+        // Resume must start from a clean live edge. A viewer who pauses mid catch-up
+        // leaves `catchUpRate` cached above 1.0 while the element holds it too, and
+        // superviseAdaptiveBuffer() returns early for the whole pause, so without
+        // this the resume either takes a visible rate step or never commands the
+        // return to 1.0x promptly. This is the reset the supervisor's own comment
+        // claims exists.
+        resetLiveEdgeCatchUp();
+        // A resume is also the cheapest possible answer to a stale frame clock: the
+        // freeze watchdog idles while paused, so on resume its first poll would
+        // otherwise see a frameStaleness equal to the entire pause duration. For a
+        // 4K stream waiting on a fresh keyframe that is routinely >6s, which armed
+        // frozenSince and fired Stage 3 — a 2-4s black screen — on a session that
+        // was merely resuming.
+        lastFrameTime = performance.now();
+        frozenSince = 0;
     });
     player.addEventListener('playing', () => {
         console.log("[VideoEvent] playing triggered (video is rendering!). resolution =", player.videoWidth, "x", player.videoHeight);
@@ -223,6 +238,14 @@ document.addEventListener('DOMContentLoaded', () => {
     let avgPlayoutDelayAt = 0;          // performance.now() of the last FRESH reading above
     let lastJitterDelayTotal = 0;       // Cumulative jitterBufferDelay baseline (seconds)
     let lastJitterEmittedTotal = 0;     // Cumulative jitterBufferEmittedCount baseline
+    // A SEPARATE baseline for the decode-pressure denominator. It must never be
+    // shared with lastJitterEmittedTotal: the playout-delay measurement divides a
+    // jitterBufferDelay total by the emitted delta and therefore needs both
+    // baselines to advance in lockstep, while the decode measurement is read
+    // outside that block and needs its own clock. Sharing one of them
+    // desynchronises the pair and inflates the measured delay by the number of
+    // ticks they drifted apart.
+    let lastJitterEmittedForDecode = 0;
     let lastAppliedTargetMs = null;     // Last target pushed to receivers (change detection)
     let lastAppliedTargetChangeAt = 0;  // performance.now() of the last applied change (dwell gate)
     let jitterFloorTick = 0;            // Stats ticks since the jitter floor was last allowed to decay
@@ -237,6 +260,42 @@ document.addEventListener('DOMContentLoaded', () => {
     let catchUpProbeAt = 0;             // performance.now() when the current catch-up engagement began
     let catchUpProbeDelayMs = null;     // Measured playout delay at that moment
     let catchUpProvenUseless = false;   // playbackRate did not drain the buffer on this device
+    // Dwell between playbackRate writes. Every write resets the media pipeline's
+    // A/V sync state (the file says so at updateLiveEdgeCatchUp), so a controller
+    // that re-writes the rate every second is a 1 Hz self-inflicted re-sync. The
+    // rate law itself has a symmetric 120ms dead band, and avgPlayoutDelayMs is a
+    // windowed MEAN over emitted frames, so on any real link it crosses that band
+    // back and forth between consecutive 1s windows: 119ms one tick, 121ms the
+    // next. Simulated against the real law that is 1.00 -> 1.01 -> 1.00 -> 1.01
+    // forever, with zero packet loss and zero dropped frames in the stats - the
+    // exact "very short but continuous" symptom. The law stays symmetric (it is
+    // unit-tested for ramp shape); the ASYMMETRY lives here, in the gate.
+    let lastCatchUpWriteAt = 0;
+    // Consecutive ticks the delay has been above the engage band. Only the ENGAGE
+    // direction needs proving; a release is gated by the rate law's own dead band,
+    // which already prevents it while the delay is genuinely over target.
+    let catchUpAboveBandTicks = 0;
+    // --- Presentation evenness (the "0% loss but not smooth" detector) -------
+    // Every existing control input is a NETWORK or BUFFER quantity (loss, jitter,
+    // measured playout delay, drops). None of them can see the thing a viewer
+    // actually reports: frames arriving at the compositor at uneven intervals
+    // while every one of those counters reads clean. rVFC already hands us the
+    // wall-clock gap between presented frames; what was missing was any use of
+    // it. See noteFramePresentation() and frameGapUnevenness().
+    // A sliding window of recent presented-frame intervals. At 60fps, 90 samples
+    // is ~1.5s of picture: long enough that one dropped frame is a rounding
+    // error, short enough that a link which recovers stops looking uneven.
+    let frameGapWindow = [];
+    const FRAME_GAP_WINDOW = 90;
+    let unevenStreakTicks = 0;         // Consecutive stats ticks with uneven presentation
+    let unevenWidenApplied = false;    // One widen per session (never a repeating pulse)
+    let unevenReleaseTicks = 0;        // Consecutive clean ticks before the floor steps down
+    // The evenness widen, as a FLOOR on the base target. Deliberately not
+    // `accommodationTargetMs`: that variable is owned and decayed by the
+    // accommodation controller, so anything written there is drained away within
+    // seconds. This one has a single writer (the evenness detector) and a single,
+    // deliberately slow, decay of its own.
+    let unevenFloorMs = 0;
     // The catch-up ceiling, shared by the rate law and the self-verification
     // below. The law takes it as a defaulted argument rather than reading this
     // binding directly, because js_checks.js extracts that function on its own;
@@ -329,6 +388,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const FREEZE_THRESHOLD_MS = 3000;     // 3.0s without frame progression when network packets are flowing
     const MAX_RECOVERIES = 10;            // Allow up to 10 recoveries (with decay back to 0)
     let stallTimeout = null;
+    let recoveryCooldownTimer = null;   // Stage-3 cooldown handle (must be cancellable)
+    let snapshotMisses = 0;             // Consecutive freeze-watchdog polls with no usable snapshot
+    let capNoticeShown = false;         // Rate-limit the MAX_RECOVERIES message
+    // How many times the recovery budget may be re-armed after MAX_RECOVERIES.
+    // Bounded on purpose: a broadcast this device genuinely cannot decode fails
+    // identically every time, so an unbounded re-arm is an infinite loop of full
+    // WHEP renewals, each a 2-4s black screen. Two re-armed cycles is enough to
+    // distinguish "a transient that outlived the budget" from "this cannot work".
+    let capCycles = 0;
+    const MAX_CAP_RECOVERIES = 2;
+    let statsSkippedTicks = 0;          // Stats ticks dropped to the in-flight guard (diagnostics)
     let disconnectGraceTimer = null;      // Grace window before treating an ICE 'disconnected' blip as a real drop
     let reconnectAttempts = 0;            // Fast-reconnect backoff exponent (1s → 2s → 4s → 5s cap)
     let muteConfirmTimeout = null;        // Debounce window to confirm a muted track is really dead
@@ -889,10 +959,14 @@ document.addEventListener('DOMContentLoaded', () => {
     // stress hold is to sit decisively clear of the arrival-delay distribution,
     // so it uses the same value as the explicit Smooth mode.
     const ADAPTIVE_RAISE_MS = 350;
-    // Release granularity for the stress hold. Matches the 50ms band that
-    // reapplyBufferTargets uses to decide whether a change is worth writing at
-    // all, so a ramped release produces one real re-pace per step instead of a
-    // burst of sub-band no-ops.
+    // Release granularity for the stress hold. NOTE: this is deliberately NOT
+    // aligned to BUFFER_TARGET_BAND_MS. That band filters with a strict `<`, so a
+    // 50ms step is exactly equal to it and is NOT filtered — the old comment here
+    // claimed the two matched so that "a ramped release produces one real re-pace
+    // per step instead of a burst of sub-band no-ops", which was never true. The
+    // real bound on this controller is the 3000ms dwell in reapplyBufferTargets
+    // plus the 2-tick release clock, not the band. The accommodation controller
+    // above is where the quantum had to exceed the band, and it now uses 100ms.
     const ADAPTIVE_RAISE_STEP_MS = 50;
     function jitterBufferFloorMs(jitterMs, prevFloorMs = 0, allowDecay = true) {
         const candidate = (jitterMs === null || !Number.isFinite(jitterMs) || jitterMs <= 20)
@@ -907,13 +981,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // that the granted target is too small — Chrome discarded late frames
     // (dropsNow) AND its measured buffer outgrew the base target by a clear
     // margin — and grant what it needs (+100ms headroom, capped at 2200ms,
-    // 50ms steps). HOLD whenever Chrome sits at the granted target: the
+    // 100ms steps). HOLD whenever Chrome sits at the granted target: the
     // measured delay always tracks the hint, so raising to meet the
     // measurement would chase its own tail and inflate EVERY session to the
     // cap within half a minute (the bug this gate fixes — verified live: a
     // 180ms target with Chrome's buffer equilibrated at ~1.2s produced 31%
     // dropped frames, but that needs a RAISE only while frames are actually
-    // being discarded). DECAY one 50ms step per tick only after sustained
+    // being discarded). DECAY one 100ms step per tick only after sustained
     // drop-free seconds (calmTicks), draining the extra latency smoothly; a
     // fresh drop burst re-raises at once. A measuring/null delay holds.
     // This is the core of "latency is fine, drops are not": never fight the
@@ -936,11 +1010,27 @@ document.addEventListener('DOMContentLoaded', () => {
         // still lets a genuinely larger need through (700 measured against a
         // 450 grant clears 450+150), it just cannot climb against its own grant.
         const granted = Math.max(baseTargetMs, prevMs);
+        // The raise step is 100ms, NOT 50ms, and that is load-bearing rather than
+        // cosmetic. reapplyBufferTargets() refuses any change smaller than
+        // BUFFER_TARGET_BAND_MS (50ms) — but the comparison is a strict `<`, so a
+        // 50ms step is exactly equal to the band and therefore NEVER filtered.
+        // The accommodation moved in 50ms quanta, so every single accommodation
+        // step was a real, applied jitterBufferTarget write on BOTH receivers, and
+        // `recentDropAt` is refreshed on every dropping tick, which made `urgent`
+        // permanently true on any drop-prone link and collapsed the dwell from
+        // 3000ms to 1200ms. Net effect on exactly the links that report
+        // micro-stutter: a deliberate ~0.8 Hz re-pacing of the playout clock, where
+        // each write makes the jitter buffer either HOLD frames (a visible stall)
+        // or discard them (visible drops) to reach the new level. Two writes 100ms
+        // apart are half as frequent, and each one is large enough to be a real
+        // correction rather than noise.
         if (dropsNow && delayMs > granted + 150) {
-            return Math.min(2200, Math.round((delayMs + 100) / 50) * 50);
+            return Math.min(2200, Math.round((delayMs + 100) / 100) * 100);
         }
         if (!dropsNow && calmTicks >= 5 && prevMs > 0) {
-            return Math.max(0, prevMs - 50);
+            // Decay matches the raise quantum for the same reason, so the release
+            // path cannot produce a stream of sub-band writes either.
+            return Math.max(0, prevMs - 100);
         }
         return prevMs;
     }
@@ -1047,6 +1137,10 @@ document.addEventListener('DOMContentLoaded', () => {
         // network jitter is the ground truth for how late frames arrive, and
         // a target below it turns late frames into visible drops.
         target = Math.max(target, jitterFloorEmaMs);
+        // The presentation-evenness floor, when one was applied. It is a floor
+        // and not a replacement: the accommodation above it still applies, and
+        // the mode the viewer chose is still honoured when this is 0.
+        if (unevenFloorMs > 0) target = Math.max(target, unevenFloorMs);
         return target;
     }
 
@@ -1245,7 +1339,18 @@ document.addEventListener('DOMContentLoaded', () => {
             if (targetMs === lastAppliedTargetMs) return false;
             if (Math.abs(targetMs - lastAppliedTargetMs) < BUFFER_TARGET_BAND_MS) return false;
             const sinceLast = performance.now() - lastAppliedTargetChangeAt;
+            // The emergency is for a raise that is genuinely needed NOW, not for a
+            // link on which drops merely recur. `recentDropAt` is refreshed on every
+            // single dropping tick, so on a drop-prone link `urgent` was permanently
+            // true and the dwell was permanently 1200ms instead of 3000ms — which,
+            // combined with a step size equal to the band, turned the dwell into
+            // "write as fast as the accommodation moves" (~0.8 Hz forever). The
+            // emergency now also requires the raise to be a REAL jump: a large
+            // fraction of the target, not one 50/100ms increment. A cosmetic
+            // single-step raise waits the full dwell.
+            const largeEnough = (targetMs - lastAppliedTargetMs) >= Math.max(100, lastAppliedTargetMs * 0.25);
             const urgent = targetMs > lastAppliedTargetMs
+                && largeEnough
                 && performance.now() - recentDropAt < 3000;
             const dwell = urgent ? BUFFER_TARGET_EMERGENCY_DWELL_MS : BUFFER_TARGET_DWELL_MS;
             if (sinceLast < dwell) return false;
@@ -1308,6 +1413,23 @@ document.addEventListener('DOMContentLoaded', () => {
         // rate would drain a buffer nobody is watching), and a paused viewer is
         // not drifting.
         if (!isConnected || document.hidden || player.paused) return false;
+        // The internal `catchUpRate` and the element's actual rate can diverge:
+        // every early return above leaves the cached value alone while the element
+        // keeps whatever was last written, and `catchUpPlaybackRate` is then handed
+        // the STALE cached value as its `currentRate`. Its rise limiter is
+        // `min(quantized, prev + STEP)`, so the ramp then climbs from a base the
+        // element never held. Derive the rate from the element itself so the two
+        // can never disagree, and re-baseline the probe on re-entry.
+        if (Number.isFinite(player.playbackRate) && player.playbackRate > 0) {
+            const elementRate = Math.round(player.playbackRate * 100) / 100;
+            if (elementRate !== catchUpRate) catchUpRate = elementRate;
+        } else if (catchUpRate > 1) {
+            // No usable element reading while something is engaged: put both the
+            // cache and the element back to rest rather than carrying a fast rate
+            // across a gap in supervision.
+            resetLiveEdgeCatchUp();
+            return false;
+        }
         // A measuring/null reading must not move the rate. Rewriting
         // playbackRate resets the media pipeline's audio/video sync state, so
         // a controller that churns it is worse than one that does nothing.
@@ -1318,18 +1440,103 @@ document.addEventListener('DOMContentLoaded', () => {
         // ago.
         if (performance.now() - avgPlayoutDelayAt > 3000) return false;
 
-        const wanted = catchUpPlaybackRate(avgPlayoutDelayMs, baseBufferTargetMs(), catchUpRate, CATCHUP_MAX_RATE);
+        // THE SETPOINT MUST BE THE ONE THE RECEIVERS WERE ACTUALLY WRITTEN WITH.
+        // reapplyBufferTargets() pushes currentBufferTargetMs() (app.js:1274) to
+        // every receiver, and that is max(baseBufferTargetMs(), accommodationTargetMs).
+        // This controller used to compute its excess against the BARE base, which
+        // structurally excludes accommodation. So the moment the accommodation
+        // engaged, Chrome settled at the accommodated target while this law saw a
+        // permanently positive excess it could never close: it ran the element
+        // continuously 3-8% fast (an A/V re-sync every tick) draining a buffer the
+        // accommodation was deliberately holding open, and the drain produced the
+        // late frames that re-triggered the accommodation. Two individually correct
+        // controllers, two different definitions of "settled", a permanent fight
+        // that no loss or drop counter can see.
+        const targetMs = currentBufferTargetMs();
+        const wanted = catchUpPlaybackRate(avgPlayoutDelayMs, targetMs, catchUpRate, CATCHUP_MAX_RATE);
+
+        // ASYMMETRIC GATE + DWELL. See lastCatchUpWriteAt: the law's 120ms band is
+        // symmetric and the delay is a windowed mean, so an un-gated write path
+        // re-paces the element once per second forever on a marginal link.
+        //
+        // THE STREAK MUST BE COUNTED HERE, OUTSIDE the `wanted !== catchUpRate`
+        // branch below. It was originally inside, and the unit test modelled the
+        // corrected version, so the test passed while the shipped controller was
+        // still broken — a test that certifies an algorithm the code does not
+        // implement. The failure is specific and severe: the law ramps DOWN
+        // whenever excess <= 120ms, so on a delay dithering either side of that
+        // edge it asks to go down on some ticks and up on others. On a down tick
+        // the branch runs and the streak is cleared to 0, so the following up
+        // tick always restarts at 1 and can never reach the required 2. Running
+        // the real extracted controller over the dither the test uses produced 59
+        // writes in 120s and left the element at 1.01 — the 0.5 Hz rewrite this
+        // gate exists to prevent, and a permanently fast picture besides.
+        const excessMs = avgPlayoutDelayMs - targetMs;
+        // A GENUINE DEAD GAP, not a single threshold.
+        //
+        // The law's own dead band is 120ms: below that it asks to come DOWN, above
+        // it asks to ramp up. Engaging at exactly that same 120ms boundary means
+        // the controller acts on the law's own indecision — `avgPlayoutDelayMs` is
+        // a windowed mean over emitted frames and crosses any fixed line between
+        // consecutive 1s windows, so a delay sitting at 119/121 makes the law ask
+        // to go down and up on alternate ticks. Traced against the real law, a
+        // gate that engages at 120 writes 59 times in 120s (0.5 Hz) and leaves the
+        // element flipping between 1.00 and 1.01 forever; a gate with a 60ms
+        // hysteresis on the reset behaves identically, because the problem is not
+        // the reset, it is engaging on the boundary at all.
+        //
+        // So the engage threshold sits above the law's band and the clear
+        // threshold at it. A delay oscillating at the law's own boundary now
+        // produces zero writes and a resting 1.0x.
+        //
+        // HONEST LIMIT: the 120-180ms band is deliberately NOT treated. The law
+        // would ramp it at ~1.5%, which drains ~15ms/s — nothing a viewer would
+        // notice against a session whose entire point is that latency is not the
+        // enemy — and engaging there buys far less than the re-pacing it risks.
+        // Anything at or beyond 180ms of excess is treated, and a real drift (the
+        // 1.5-3s a hidden tab leaves) clears it on the first tick.
+        const ENGAGE_BAND_MS = 180;    // ramp up only above this much excess
+        const ENGAGE_CLEAR_MS = 120;   // ...and only clear below this
+        if (excessMs > ENGAGE_BAND_MS) {
+            catchUpAboveBandTicks += 1;
+        } else if (excessMs < ENGAGE_CLEAR_MS) {
+            catchUpAboveBandTicks = 0;
+        }
         if (wanted !== catchUpRate) {
-            try {
-                player.playbackRate = wanted;
-            } catch (err) {
-                // Some engines refuse playbackRate on a MediaStream-backed
-                // element. Give up permanently rather than retrying every tick.
-                console.warn('[AdaptiveBuffer] playbackRate rejected; catch-up disabled:', err);
-                catchUpProvenUseless = true;
-                return false;
+            const engaged = wanted > catchUpRate;
+            // Only an ENGAGE has to prove itself and pay the dwell. A release is
+            // the safe direction and is already gated by the law's own dead band:
+            // catchUpPlaybackRate only asks to come DOWN when excess <= 120ms, so
+            // a genuinely-over-target delay can never produce one.
+            //
+            // A release STREAK was tried and had to be removed: it could strand
+            // the element above 1.0x permanently. The law ramps down only while
+            // the delay stays at or under 120ms of excess, and a delay dithering
+            // across that edge (119 then 121 — exactly what a windowed mean does
+            // on a real link) fails a "3 consecutive below" test on alternate
+            // ticks, leaving a permanent 1%-fast picture, which is the very
+            // low-level drift this mechanism exists to prevent.
+            const streakOk = !engaged || catchUpAboveBandTicks >= 2;
+            const dwellOk = !engaged || (performance.now() - lastCatchUpWriteAt) >= 2000;
+            if (streakOk && dwellOk) {
+                try {
+                    player.playbackRate = wanted;
+                    lastCatchUpWriteAt = performance.now();
+                } catch (err) {
+                    // Some engines refuse playbackRate on a MediaStream-backed
+                    // element. Give up permanently rather than retrying every tick.
+                    console.warn('[AdaptiveBuffer] playbackRate rejected; catch-up disabled:', err);
+                    catchUpProvenUseless = true;
+                    // The engine may still be holding whatever rate it had. Leaving
+                    // an elevated rate on the element after disabling the controller
+                    // is the same permanent-speed-up defect as the latch below, so
+                    // the rest state is restored on this path too.
+                    resetLiveEdgeCatchUp();
+                    catchUpProvenUseless = true;   // reset() clears it; the verdict stands
+                    return false;
+                }
+                catchUpRate = wanted;
             }
-            catchUpRate = wanted;
         }
 
         // SELF-VERIFICATION. Do not trust the rate blindly: prove it actually
@@ -1353,14 +1560,43 @@ document.addEventListener('DOMContentLoaded', () => {
         const now = performance.now();
         if (catchUpRate >= CATCHUP_MAX_RATE) {
             if (!catchUpProbeAt) {
+                // Mark the moment of saturation, but do NOT take the baseline yet:
+                // this tick's write has only just been issued, so the delay measured
+                // now still predates any response to it. Capturing it here meant the
+                // drain was judged starting from a number the element had not yet
+                // had a chance to move, which is how a working mechanism got
+                // declared useless. The baseline is taken on the NEXT tick instead,
+                // once at least one full stats window has elapsed under the cap.
                 catchUpProbeAt = now;
+                catchUpProbeDelayMs = null;
+            } else if (catchUpProbeDelayMs === null) {
                 catchUpProbeDelayMs = avgPlayoutDelayMs;
             } else if (now - catchUpProbeAt > 5000
-                && avgPlayoutDelayMs > catchUpProbeDelayMs - 50) {
+                // PROPORTIONAL, not a flat 50ms. The baseline used to be captured on
+                // the SAME tick the rate first saturated — immediately after the
+                // write, before the element had any chance to respond to it — and
+                // judged against a flat 50ms fall. A flat threshold is trivial at
+                // large excess (1.08x drains ~80ms/s) and unreachable at small
+                // excess, so the probe could declare a working mechanism useless
+                // on a merely-noisy link. Ten percent of the baseline scales with
+                // the size of the job.
+                && avgPlayoutDelayMs > catchUpProbeDelayMs * 0.9) {
                 catchUpProvenUseless = true;
                 console.warn(`[AdaptiveBuffer] Catch-up saturated at ${catchUpRate}x and did not `
                     + `drain the buffer (${catchUpProbeDelayMs.toFixed(0)}ms -> `
                     + `${avgPlayoutDelayMs.toFixed(0)}ms); falling back to a hard rejoin.`);
+                // CRITICAL: hand the element back its resting rate BEFORE the
+                // controller goes quiet. Latching the verdict here used to leave
+                // player.playbackRate at 1.08, because the supervisor gates the
+                // controller on `!catchUpProvenUseless` — so from the next tick
+                // updateLiveEdgeCatchUp() was never called again, and the only two
+                // write sites for playbackRate in the whole file are inside it and
+                // inside resetLiveEdgeCatchUp(). Nothing else could ever put it back.
+                // The viewer was left watching a permanently 8%-fast picture for
+                // the rest of the session, pitch-shifted, with every network
+                // statistic reading perfectly clean.
+                resetLiveEdgeCatchUp();
+                catchUpProvenUseless = true;   // reset() clears the verdict; the verdict stands
             }
         } else {
             // Not saturated: the controller has not asked for everything it can
@@ -1374,6 +1610,112 @@ document.addEventListener('DOMContentLoaded', () => {
         return catchUpRate > 1;
     }
 
+    // Presentation evenness (pure — unit-tested). The "0% loss but not smooth"
+    // detector.
+    //
+    // Every other control input in this file is a NETWORK or BUFFER quantity:
+    // packetsLost, jitter, framesDropped, the measured jitterBufferDelay. All of
+    // them can read perfectly clean while the picture is visibly uneven, because
+    // an uneven picture is a statement about the SPACING of presented frames, not
+    // about how many were lost. That is the gap this closes.
+    //
+    // rVFC already reports the wall-clock instant of every presented frame, so the
+    // inter-frame gap is directly observable for the first time. Two summaries of
+    // that gap stream are enough:
+    //   - the MEAN interval (what cadence the picture is actually running at), and
+    //   - the MEAN ABSOLUTE DEVIATION from it (how uneven that cadence is).
+    //
+    // Only the second one is the signal. A perfectly steady 30fps stream has a mean
+    // absolute deviation near zero; a 60fps stream hitching between 8ms and 40ms
+    // gaps has a large one even though not one packet was lost. Normalising the
+    // deviation by the mean interval makes the test cadence-independent, so a 30fps
+    // viewer is not judged by a 60fps threshold.
+    //
+    // Returns the coefficient of variation of the inter-frame gap over a WINDOW
+    // of recent samples: mean absolute deviation divided by the mean, or null
+    // when there are too few samples to mean anything.
+    //
+    // A sliding WINDOW, not an exponential average. An EMA was tried first and is
+    // far too insensitive to be useful here: because the mean chases the input,
+    // the deviation it measures is the deviation of a TRACKED signal, and a
+    // sustained 3:1 alternation (16ms/48ms frames, i.e. plainly uneven) scored
+    // only 0.05 — an order of magnitude under the threshold, so the detector
+    // could never fire on the exact pattern it exists to catch. Measured against
+    // the window form, the same stream scores ~0.5.
+    //
+    // What separates cleanly, and is why the threshold can sit at 0.35:
+    //   steady 16.7ms          -> ~0.00   (a healthy stream)
+    //   +/-2.5ms wobble        -> ~0.10   (ordinary vsync jitter, must NOT fire)
+    //   one 33->90ms outlier   -> ~0.03   (a single hitch is not "continuous")
+    //   alternating 10/24ms    -> ~0.41   (continuously uneven: FIRES)
+    //   alternating 16/48ms    -> ~0.50   (continuously uneven: FIRES)
+    // The "one outlier" row is the important one for false positives: a single
+    // dropped frame is a blip, and the reported symptom is explicitly CONTINUOUS.
+    function frameGapUnevenness(gaps) {
+        if (!Array.isArray(gaps) || gaps.length < 4) return null;
+        let sum = 0;
+        let count = 0;
+        for (const gap of gaps) {
+            if (typeof gap !== 'number' || !Number.isFinite(gap) || gap <= 0) continue;
+            sum += gap;
+            count += 1;
+        }
+        if (count < 4) return null;
+        const mean = sum / count;
+        if (!(mean > 0)) return null;
+        let deviation = 0;
+        let used = 0;
+        for (const gap of gaps) {
+            if (typeof gap !== 'number' || !Number.isFinite(gap) || gap <= 0) continue;
+            deviation += Math.abs(gap - mean);
+            used += 1;
+        }
+        if (used < 4) return null;
+        const unevenness = (deviation / used) / mean;
+        return Number.isFinite(unevenness) ? unevenness : null;
+    }
+
+    // Record one presented-frame interval. (Pure over the passed array so
+    // js_checks.js can drive it without a DOM.) Returns the new window.
+    //
+    // A gap is admitted only if it is PLAUSIBLE FOR THE CADENCE ALREADY
+    // ESTABLISHED, and a gap that arrives after a long run of steady frames is
+    // treated as an outlier and does not enter the window at all. Without this,
+    // mean-absolute-deviation is dominated by outlier MAGNITUDE and the detector
+    // cannot tell "continuously uneven" from "one 700ms keyframe wait": measured
+    // at 30fps, a single 700ms hitch produced a hot reading for three
+    // consecutive supervisor samples, which is exactly the 3-tick streak, so one
+    // GC pause or keyframe wait consumed the session's single one-shot widen and
+    // denied a genuinely uneven stream its remedy. The 3x bound is generous
+    // enough to admit any real cadence irregularity (the alternating patterns the
+    // detector exists to catch are 2-3:1 within one sample) while rejecting
+    // anything that is a stall rather than unevenness — the freeze watchdog owns
+    // stalls, and there is a second bound for those below.
+    //
+    // The constants live INSIDE the function on purpose, matching
+    // catchUpPlaybackRate: js_checks.js extracts and evaluates these on their own,
+    // so a module-level binding would make the mechanism untestable.
+    function noteFramePresentation(gapMs, window) {
+        const WINDOW = 90;         // ~1.5s of picture at 60fps
+        const MAX_STALL_MS = 1000; // the freeze watchdog's domain, not ours
+        const OUTLIER_RATIO = 3;   // >3x the established mean is a stall, not jitter
+        if (typeof gapMs !== 'number' || !Number.isFinite(gapMs) || gapMs <= 0) return window;
+        if (gapMs >= MAX_STALL_MS) return window;
+        if (window.length >= 8) {
+            let sum = 0;
+            for (const g of window) sum += g;
+            const mean = sum / window.length;
+            if (mean > 0 && gapMs > mean * OUTLIER_RATIO) return window;   // outlier
+        }
+        const next = window.concat(gapMs);
+        return next.length > WINDOW ? next.slice(next.length - WINDOW) : next;
+    }
+
+    function resetPresentationEvenness() {
+        frameGapWindow = [];
+        unevenStreakTicks = 0;
+        unevenReleaseTicks = 0;
+    }
     // Return playbackRate to its resting value. A session that ends while
     // catching up would otherwise leave the NEXT session running fast, and the
     // viewer would be watching a subtly sped-up stream with no way to tell why.
@@ -1382,6 +1724,8 @@ document.addEventListener('DOMContentLoaded', () => {
         catchUpProbeAt = 0;
         catchUpProbeDelayMs = null;
         catchUpProvenUseless = false;
+        catchUpAboveBandTicks = 0;
+        lastCatchUpWriteAt = 0;
         if (!player) return;
         if (player.playbackRate !== 1) {
             try { player.playbackRate = 1; } catch (e) { /* engine refused it anyway */ }
@@ -1636,6 +1980,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (stressed) {
             calmRunSec = 0;
+            // The release dwell must be cleared by the SAME event that re-arms the
+            // stress response. It was not: `raiseReleaseTicks` was assigned in only
+            // three places (declaration, increment, reset-on-step) and none of them
+            // was here. So one calm tick set it to 1, a burst of stress ticks left
+            // it at 1, and the very next calm tick pushed it to 2 and released
+            // immediately. On a link whose jitter EMA hovers around this 55ms
+            // threshold, the release cadence was set by blip ALIGNMENT rather than
+            // by sustained calm — and every release is a real, downward
+            // jitterBufferTarget write, which makes Chrome discard frames to reach
+            // the new level (50ms is 1.5 frames at 30fps, 3 at 60fps). That is a
+            // continuous low-amplitude frame-loss chirp: not a visible hitch, which
+            // is exactly why it reads as "very short but continuous" and clears
+            // every HUD diagnostic.
+            raiseReleaseTicks = 0;
             stressRunSec += 1;
             if (stressRunSec >= 3) {
                 adaptiveRaiseLevelMs = ADAPTIVE_RAISE_MS;
@@ -1690,6 +2048,74 @@ document.addEventListener('DOMContentLoaded', () => {
         // branch zeroes stressRunSec, and the two are mutually exclusive, so
         // holding cannot leak or deadlock.
         // evidence.
+
+        // --- Presentation evenness: the one signal that can see "0% loss" ---
+        // Everything above this line is driven by packet counts or buffer depth.
+        // A viewer whose complaint is "very short but continuous" produces none of
+        // those symptoms: no loss, no jitter spike, no drops, no drift. What is
+        // actually wrong is the SPACING of presented frames — the compositor is
+        // getting them at irregular intervals — and until now nothing in this file
+        // measured it.
+        //
+        // The response is a buffer widen, NOT a teardown. That choice is
+        // deliberate: an uneven cadence is a cushion problem, and a wider cushion
+        // is the cheapest thing that can absorb it, while the staged recovery
+        // costs 2-4s of hard black — strictly worse than the unevenness.
+        //
+        // One widen per session (unevenWidenApplied). A detector that can fire
+        // repeatedly becomes a second oscillator, and this file has already been
+        // bitten by exactly that shape twice (the stress-raise square wave and the
+        // catch-up/probe fight). The window itself is sliding, so a link that
+        // settles stops reading as uneven and the streak decays on its own.
+        const presentationUnevenness = frameGapUnevenness(frameGapWindow);
+        if (presentationUnevenness !== null) {
+            // 0.35 is a coefficient of variation of the inter-frame interval.
+            // Measured separation (see frameGapUnevenness): a steady stream ~0.00,
+            // ordinary +/-2.5ms vsync wobble ~0.10, a single dropped frame ~0.03,
+            // and a CONTINUOUSLY uneven stream 0.41-0.50. The threshold sits above
+            // every "must not fire" case and below every "must fire" case.
+            const UNEVEN_THRESHOLD = 0.35;
+            const UNEVEN_STREAK = 3;
+            if (!unevenWidenApplied && presentationUnevenness > UNEVEN_THRESHOLD) {
+                unevenStreakTicks += 1;
+                if (unevenStreakTicks >= UNEVEN_STREAK) {
+                    // A DEDICATED floor, not `accommodationTargetMs`. That variable
+                    // is owned by the accommodation controller, which is invoked
+                    // unconditionally on every subsequent tick and DECAYS it by
+                    // 100ms per 5 calm ticks — so a widen written there was
+                    // drained away within ~10s (600 -> 0 in simulation) while the
+                    // one-shot latch had already been consumed. The console
+                    // promised a 600ms buffer the stream never got. This variable is
+                    // not owned or decayed by the accommodation controller, so the
+                    // widen survives; the only decay it has is the slow release
+                    // below, which a manual latency-mode change also clears.
+                    unevenFloorMs = Math.min(2200, Math.max(baseBufferTargetMs() + 200, 600));
+                    if (unevenFloorMs > currentBufferTargetMs()) {
+                        unevenWidenApplied = true;
+                        console.log('[AdaptiveBuffer] Presentation is continuously uneven '
+                            + `(gap cv ${presentationUnevenness.toFixed(2)}) with no loss, `
+                            + `jitter spike or drops — widening the buffer to ${unevenFloorMs}ms.`);
+                    }
+                    unevenStreakTicks = 0;
+                }
+            } else {
+                unevenStreakTicks = 0;
+                // Slow release of the floor, so a one-off stall is not permanent.
+                // The window is 1.5s of picture, so a link that has been even for
+                // that long genuinely does not need the cushion; 100ms per release
+                // tick (~100s to unwind a 600ms floor) keeps it below both the
+                // re-pace thresholds, so the release costs a handful of normal
+                // dwell-gated writes rather than adding any new ones.
+                if (unevenWidenApplied && unevenFloorMs > 0) {
+                    unevenReleaseTicks += 1;
+                    if (unevenReleaseTicks >= 5) {
+                        unevenReleaseTicks = 0;
+                        unevenFloorMs = Math.max(0, unevenFloorMs - 100);
+                        if (unevenFloorMs === 0) unevenWidenApplied = false;
+                    }
+                }
+            }
+        }
 
         reapplyBufferTargets();
         updateBufferHud(null);
@@ -2844,6 +3270,9 @@ document.addEventListener('DOMContentLoaded', () => {
             // the hide — which is how the self-verification ends up declaring a
             // working mechanism useless.
             resetLiveEdgeCatchUp();
+            // Same reason for the evenness estimate: a hidden tab suspends
+            // presentation, so its frame gaps describe the suspension, not the link.
+            if (typeof resetPresentationEvenness === 'function') resetPresentationEvenness();
         } else {
             console.log("[App] Tab foregrounded. Resuming polling/telemetry...");
             lastFrameTime = performance.now();
@@ -3283,6 +3712,7 @@ document.addEventListener('DOMContentLoaded', () => {
         avgPlayoutDelayAt = 0;
         lastJitterDelayTotal = 0;
         lastJitterEmittedTotal = 0;
+        lastJitterEmittedForDecode = 0;
         // Read-back and audio baselines are per-session for the same reason:
         // a cumulative counter carried over from the previous connection and
         // differenced against a zero baseline produces one enormous first-tick
@@ -3317,6 +3747,17 @@ document.addEventListener('DOMContentLoaded', () => {
         // session ended while catching up would start the next one running fast
         // and see no reason why.
         resetLiveEdgeCatchUp();
+        // The evenness estimate is per-session too. Carrying it across a teardown
+        // would let the previous session's jitter decide the new session's buffer,
+        // and `unevenWidenApplied` would still be true, so the new session could
+        // never widen even if its own presentation genuinely was uneven. A hidden
+        // tab suspends presentation, so its gaps are meaningless for the same
+        // reason the playout delay is.
+        // Guarded because js_checks.js extracts this function and runs it without
+        // the module-level bindings.
+        if (typeof resetPresentationEvenness === 'function') resetPresentationEvenness();
+        unevenWidenApplied = false;
+        unevenFloorMs = 0;
         // noMediaRejoinCount is deliberately NOT reset here. It used to be, and
         // that made the "connected-but-black" budget unreachable: the limiter
         // calls switchRendition(), which reconnects through this very function,
@@ -3349,6 +3790,18 @@ document.addEventListener('DOMContentLoaded', () => {
         lastRecoveryCounts = null;
         // Never let the previous session's counters be the watchdog's baseline.
         inboundSnapshot = null;
+        statsSkippedTicks = 0;
+        // The rolling bitrate curve belongs to the session that produced it. It
+        // was never cleared here, so after a Stage-3 reconnect the sparkline — the
+        // one number a viewer screenshots when reporting lag — painted a 60s
+        // throughput history spanning two different peer connections, for a full
+        // minute after every reconnect. The byte baseline below is deliberately
+        // preserved, so clearing the history is what makes the two consistent.
+        // Guarded because js_checks.js extracts this function and runs it without
+        // the module-level bindings.
+        if (typeof bitrateHistory !== 'undefined' && Array.isArray(bitrateHistory)) {
+            bitrateHistory.fill(0);
+        }
         if (hudRoute) hudRoute.innerText = '--';
 
         beginStatsLoop();
@@ -3369,7 +3822,19 @@ document.addEventListener('DOMContentLoaded', () => {
         dropWindow = [];
         dropTickPending = true;
         statsInterval = setInterval(async () => {
-            if (!peerConnection || peerConnection.connectionState !== 'connected') return;
+            // Capture the connection this tick is FOR. The interval callback is
+            // async and setInterval does not wait for it, so a teardown can land
+            // while getStats() is in flight. getStats() on a CLOSING
+            // RTCPeerConnection resolves rather than rejecting in Chrome, so the
+            // tick used to carry on and republish inboundSnapshot with a fresh
+            // performance.now() stamp carrying the DEAD session's cumulative
+            // counters — which stopTelemetry() had just nulled, and which the new
+            // session's startFreezeWatchdog() had re-baselined to 0, so its first
+            // poll computed a large negative decodedDelta and latched the dead
+            // session's counters as the baseline. Nothing throws, so it was
+            // invisible; it is a state-corruption window on every teardown path.
+            const pc = peerConnection;
+            if (!pc || pc.connectionState !== 'connected') return;
 
             // A slow getStats() (low-end receiver under decode load — the
             // exact viewer this session is trying to protect) must not let
@@ -3378,11 +3843,34 @@ document.addEventListener('DOMContentLoaded', () => {
             // double-count one window of loss/jitter/drops into the ABR,
             // accommodation and Eco Mode state machines. Skipping a tick is
             // free; a spurious stress spike is not.
-            if (statsTickInFlight) return;
+            if (statsTickInFlight) {
+                // Counted, not silent. A persistently slow getStats() skips every
+                // tick, which freezes avgPlayoutDelayAt (so catch-up bails), the
+                // supervisor's counters, inboundSnapshot (so the freeze watchdog
+                // bails) and reapplyBufferTargets() — the entire recovery stack
+                // goes quiet at once, with nothing in the console or the HUD to
+                // say so. That converts every other defect here from
+                // "auto-recovered" into "permanent for the session" and makes the
+                // result close to undiagnosable after the fact.
+                statsSkippedTicks += 1;
+                if (statsSkippedTicks === 30 || statsSkippedTicks === 120) {
+                    console.warn(`[WebRTC] ${statsSkippedTicks} stats ticks skipped to a slow `
+                        + 'getStats(); the buffer supervisor, catch-up and the freeze watchdog '
+                        + 'are all starved while this persists.');
+                }
+                return;
+            }
             statsTickInFlight = true;
 
             try {
-                const stats = await peerConnection.getStats();
+                const stats = await pc.getStats();
+                // The world may have moved on across that await. Bail rather than
+                // publish a dead session's counters into a live one's state.
+                if (pc !== peerConnection || pc.connectionState !== 'connected'
+                    || !isConnected) {
+                    statsTickInFlight = false;
+                    return;
+                }
                 let videoStats = null;
                 let audioStats = null;
                 let candidatePairStats = null;
@@ -3464,11 +3952,37 @@ document.addEventListener('DOMContentLoaded', () => {
                     const decoded = videoStats.framesDecoded || 0;
                     const dropped = videoStats.framesDropped || 0;
                     const received = videoStats.framesReceived || 0;
-                    // The decoder's OWN drops. This is a per-second gauge in the
-                    // spec, not a cumulative counter, so it is read as a level and
-                    // differenced against the previous level. Absent in browsers
-                    // that do not implement it, hence the 0 fallback.
-                    const discardedLevel = Number.isFinite(videoStats.framesDiscarded)
+                    // The decoder's OWN drops. `framesDiscarded` is NOT a member of
+                    // RTCInboundRtpStreamStats — verified against the W3C WebRTC-Stats
+                    // CRD and the current editor's draft, where the string does not
+                    // occur at all (the inbound dictionary defines framesReceived /
+                    // framesDecoded / framesDropped and nothing by that name). The
+                    // previous code read it anyway, so Number.isFinite(undefined) was
+                    // false, discardedLevel was permanently 0, discardedDelta was
+                    // permanently 0, and `delivered` collapsed back to decodedDelta —
+                    // exactly the ratio the comment above says was removed. The
+                    // consequence was not cosmetic: a link with sustained loss backs
+                    // frames up in the jitter buffer faster than the decoder drains
+                    // them, decodedDelta/receivedDelta sits under 0.85 for eight
+                    // qualifying ticks, decodeLagSec reaches 8, and switchRendition()
+                    // tears the session down — a 2-4s HARD BLACK SCREEN with the
+                    // message "this device's decoder can't keep up", for a problem the
+                    // buffers were already absorbing perfectly well.
+                    //
+                    // The spec-defined replacement is the frame DELTA the decoder had
+                    // the opportunity to show but did not: frames the transport
+                    // delivered, less the frames that actually left the jitter buffer
+                    // into the decoder. The jitter buffer's emitted count is the exact
+                    // boundary — a frame still sitting in the buffer has not been
+                    // offered to the decoder and must not be charged to it — and
+                    // unlike framesDiscarded it is a standardized cumulative counter
+                    // this file already reads every tick.
+                    //
+                    // Chromium does expose a non-standard `framesDiscarded`, so it is
+                    // still honoured when present; this only changes behaviour where
+                    // it is absent, which is everywhere the spec is authoritative.
+                    const hasDiscardedSignal = Number.isFinite(videoStats.framesDiscarded);
+                    const discardedLevel = hasDiscardedSignal
                         ? videoStats.framesDiscarded : 0;
                     // Publish for the freeze watchdog (one getStats walk per
                     // second, shared) — see inboundSnapshot above.
@@ -3580,6 +4094,40 @@ document.addEventListener('DOMContentLoaded', () => {
                     // next tick measures only its own window (see
                     // windowedPlayoutDelayMs for why the session average is
                     // useless for drift detection).
+                    // Hoisted out of the block below, and deliberately declared
+                    // BEFORE the `if`: the decode-pressure calculation further down
+                    // needs the same "frames that actually left the jitter buffer
+                    // toward the decoder" quantity, and a block-scoped const cannot
+                    // reach it. A frame still sitting in the buffer has not been
+                    // offered to the decoder, so it must not be charged to it as
+                    // decode pressure. 0 when the browser does not report the
+                    // counter, which keeps the fallback inert rather than negative.
+                    // `emittedDelta` — frames that actually LEFT the jitter buffer
+                    // toward the decoder this tick.
+                    //
+                    // IT HAS ITS OWN BASELINE (`lastJitterEmittedForDecode`),
+                    // deliberately not shared with `lastJitterEmittedTotal`.
+                    // Sharing them looked harmless and was not:
+                    // `windowedPlayoutDelayMs` divides the jitterBufferDelay total
+                    // by the emitted delta, so those two MUST advance together.
+                    // When the emitted baseline was advanced unconditionally (to
+                    // feed the decode denominator below) while the delay baseline
+                    // only advanced when both counters were finite, a single tick
+                    // with a non-finite jitterBufferDelay left them desynchronised
+                    // and the next reading divided an N-tick delay total by a
+                    // 1-tick emitted delta — roughly N times the true delay. At
+                    // N=15 that is 3200ms against a 3100ms rejoin cap, and it
+                    // feeds `bufferAccommodationMs`, so one momentary stall could
+                    // spike the target to the 2200ms cap in a single write. Two
+                    // independent baselines, two independent measurements, no
+                    // shared clock.
+                    const emittedKnown = Number.isFinite(videoStats.jitterBufferEmittedCount);
+                    const emittedDelta = emittedKnown
+                        ? Math.max(0, videoStats.jitterBufferEmittedCount - lastJitterEmittedForDecode)
+                        : 0;
+                    if (emittedKnown) {
+                        lastJitterEmittedForDecode = videoStats.jitterBufferEmittedCount;
+                    }
                     if (Number.isFinite(videoStats.jitterBufferDelay)
                         && Number.isFinite(videoStats.jitterBufferEmittedCount)) {
                         const windowedDelayMs = windowedPlayoutDelayMs(
@@ -3595,14 +4143,13 @@ document.addEventListener('DOMContentLoaded', () => {
                             // quiet window.
                             avgPlayoutDelayAt = performance.now();
                         }
-                        const emittedDelta = videoStats.jitterBufferEmittedCount - lastJitterEmittedTotal;
+                        // (The DECODE baseline was moved above this block; see emittedDelta.)
                         lastJitterDelayTotal = videoStats.jitterBufferDelay;
-                        lastJitterEmittedTotal = videoStats.jitterBufferEmittedCount;
                         // Accommodation feeds off the measured delay but only
                         // RAISES while late frames are actually being
                         // discarded and the buffer has outgrown the base
                         // target. Sustained calm drains the extra latency back
-                        // 50ms per tick.
+                        // 100ms per tick.
                         //
                         // The raise needs an INDEPENDENT late-frame signal.
                         // windowedPlayoutDelayMs is a mean over the frames that
@@ -3678,10 +4225,59 @@ document.addEventListener('DOMContentLoaded', () => {
                     // decoder cannot sustain the stream (typically software
                     // AV1 at high resolution on a loaded machine). Sustained,
                     // it drives the supervisor's hardware-path switch.
+                    //
+                    // The emitted baseline for THIS measurement was already
+                    // advanced above, where `emittedDelta` is computed. It must
+                    // NOT share `lastJitterEmittedTotal` with the playout-delay
+                    // measurement above, because that one divides a delay total
+                    // by the emitted delta and needs both to advance in lockstep.
+
+                    // The decoder's OWN drops, where the browser reports them.
+                    // `framesDiscarded` is NOT a member of RTCInboundRtpStreamStats —
+                    // verified against the W3C WebRTC-Stats CRD and the current
+                    // editor's draft, where the string does not occur at all. The
+                    // code read it anyway, so this was permanently 0 in every
+                    // spec-conforming engine. Chromium does expose it as a
+                    // non-standard extension, so it is still honoured where present;
+                    // where it is absent the DENOMINATOR below changes instead, which
+                    // is the half of the fix that actually works everywhere.
+                    const discardedDelta = hasDiscardedSignal
+                        ? Math.max(0, discardedLevel - lastFramesDiscarded)
+                        : 0;
                     const receivedDelta = received - lastFramesReceived;
-                    const discardedDelta = Math.max(0, discardedLevel - lastFramesDiscarded);
-                    if (timeDiffSec > 0.5 && receivedDelta >= 15) {
-                        decodeLagSec = updateDecodeLag(decodeLagSec, decodedDiff, receivedDelta, discardedDelta);
+                    // The decoder's shortfall, spec-defined.
+                    //
+                    // `receivedDelta` counts every frame the transport handed to
+                    // the JITTER BUFFER, and that includes frames still sitting in
+                    // it. A frame that has not left the buffer has not been offered
+                    // to the decoder, so it is not decoder pressure — and on a link
+                    // with loss the buffer backs up, which made
+                    // decodedDelta/receivedDelta sit under 0.85 for eight qualifying
+                    // ticks and drove switchRendition() into a 2-4s hard teardown
+                    // with "this device's decoder can't keep up", for a problem the
+                    // buffers were absorbing perfectly well.
+                    //
+                    // The denominator must therefore be the frames that actually
+                    // LEFT the buffer toward the decoder. `jitterBufferEmittedCount`
+                    // is exactly that, and unlike `framesDiscarded` (which is NOT a
+                    // member of RTCInboundRtpStreamStats — the string does not occur
+                    // in the W3C CRD or the editor's draft at all, so relying on it
+                    // alone left this term permanently 0 in every spec-conforming
+                    // engine and the ratio degenerated to the wrong one) it is a
+                    // standardized cumulative counter this file already reads.
+                    //
+                    // `emittedDelta` is 0 whenever the browser does not report the
+                    // counter, and on the FIRST tick after a (re)start, because the
+                    // baseline is then still 0. There is deliberately NO fallback to
+                    // receivedDelta here: receivedDelta includes frames still sitting
+                    // in the jitter buffer, so it is exactly the loss-sensitive
+                    // denominator this change exists to remove, and falling back to it
+                    // re-created the false teardown on precisely the first tick of
+                    // every session. An unmeasurable window DECAYS instead, which is
+                    // the same treatment every other unmeasurable window gets.
+                    if (timeDiffSec > 0.5 && emittedKnown && emittedDelta >= 15) {
+                        decodeLagSec = updateDecodeLag(
+                            decodeLagSec, decodedDiff, emittedDelta, discardedDelta);
                     } else if (timeDiffSec > 0.5) {
                         decodeLagSec = decayDecodeLag(decodeLagSec);
                     }
@@ -3812,7 +4408,28 @@ document.addEventListener('DOMContentLoaded', () => {
                     lastFrameGapMs: lastFrameGapMs > 0 ? Math.round(lastFrameGapMs) : 'unavailable',
                     lastFrameGapExceedsSpecFreeze: (specFreezeMs !== null && lastFrameGapMs > specFreezeMs) ? true : false,
                     frameRate: currentFrameRate === null ? 'unavailable' : Number(currentFrameRate.toFixed(2)),
-                    presentedFps: lastPresentedFps === null ? 'unavailable' : Number(lastPresentedFps.toFixed(2))
+                    presentedFps: lastPresentedFps === null ? 'unavailable' : Number(lastPresentedFps.toFixed(2)),
+                    // Presentation evenness. `frameGapCv` is the coefficient of
+                    // variation of the inter-presented-frame interval: the ONLY
+                    // figure in this report that can be non-zero on a session
+                    // where loss, jitter, drops and drift are all clean, which is
+                    // exactly the "not smooth but nothing is wrong" report. A
+                    // `statsTicksSkipped` above zero is likewise the signature of
+                    // a starved control loop.
+                    frameGapMeanMs: frameGapWindow.length > 0
+                        ? Number((frameGapWindow.reduce((a, b) => a + b, 0) / frameGapWindow.length).toFixed(2))
+                        : 'unavailable',
+                    frameGapCv: (() => {
+                        const cv = frameGapUnevenness(frameGapWindow);
+                        return cv === null ? 'unavailable' : Number(cv.toFixed(3));
+                    })(),
+                    unevenWidenApplied: unevenWidenApplied ? true : false,
+                    unevenFloorMs: unevenFloorMs > 0 ? unevenFloorMs : 'not applied',
+                    statsTicksSkipped: statsSkippedTicks,
+                    catchUpRate: Number(catchUpRate.toFixed(2)),
+                    catchUpProvenUseless: catchUpProvenUseless ? true : false,
+                    recoveryCount,
+                    snapshotMisses
                 },
                 bitrateHistory: bitrateHistory.slice(-10)
             };
@@ -3863,6 +4480,18 @@ document.addEventListener('DOMContentLoaded', () => {
                         const wallSec = (now - lastFramePresentAt) / 1000;
                         const mediaDelta = metadata.mediaTime - lastMediaTimeSec;
                         lastFrameGapMs = now - lastFramePresentAt;
+                        // Fold the inter-frame gap into the evenness window. This
+                        // is the only place in the file that can observe the
+                        // SPACING of presented frames, and spacing is what "not
+                        // smooth" actually means. Consumed by
+                        // superviseAdaptiveBuffer() and reported to the HUD.
+                        //
+                        // Gaps at or beyond a second are a STALL, not unevenness,
+                        // and the freeze watchdog owns those; including them here
+                        // would let one freeze dominate the window for 90 frames.
+                        if (lastFrameGapMs > 0 && lastFrameGapMs < 1000) {
+                            frameGapWindow = noteFramePresentation(lastFrameGapMs, frameGapWindow);
+                        }
                         // > 1 => the element is running FAST, spending surplus
                         // buffer; < 1 => starved. Both are reported, never acted
                         // on here: the correction is a buffer-target change, and
@@ -3911,8 +4540,32 @@ document.addEventListener('DOMContentLoaded', () => {
             // than reading a frozen reading as "bytes stopped".
             const snapshot = inboundSnapshot;
             if (!snapshot || now - snapshot.at > INBOUND_SNAPSHOT_MAX_AGE_MS) {
+                // A stale snapshot means the producing loop is not running. That is
+                // itself a fault, but reading a frozen reading as "bytes stopped"
+                // would be a worse one. It used to be a bare `return`, silently,
+                // forever: the comment at the overlap guard names the target device
+                // as a low-end receiver where getStats() can take 1.5-3s, and with
+                // the in-flight skip the effective publish interval then exceeds the
+                // 3s bound, so the ~200 lines of staged recovery were inert on
+                // exactly the hardware that needs them — an undiagnosable permanent
+                // freeze. After a few consecutive misses, fall back to a
+                // bytes-free staleness detector so a real freeze is still caught.
+                snapshotMisses += 1;
+                if (snapshotMisses >= 3) {
+                    const staleMs = now - lastFrameTime;
+                    if (staleMs > FREEZE_THRESHOLD_MS * 2 && player.readyState >= 2) {
+                        console.warn(`[FreezeGuard] No stats snapshot for ${snapshotMisses} polls and `
+                            + `no frame for ${Math.round(staleMs)}ms — recovering without stats.`);
+                        if (frozenSince === 0) frozenSince = now;
+                        else if (now - frozenSince > FREEZE_THRESHOLD_MS) {
+                            frozenSince = 0;
+                            triggerFreezeRecovery('no_snapshot_freeze');
+                        }
+                    }
+                }
                 return;
             }
+            snapshotMisses = 0;
             const currentDecoded = snapshot.decoded;
             const currentBytes = snapshot.bytes;
 
@@ -3932,6 +4585,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (healthyPlaybackSeconds > 15) {
                     reconnectAttempts = 0; // Stable session: future drops get fast 1s first-retry again
                     healthyPlaybackSeconds = 0;
+                    // Give the cap budget back too. `capCycles` is the ceiling on how
+                    // many times the recovery budget may be re-armed after
+                    // MAX_RECOVERIES, and it deliberately does not reset on teardown
+                    // (a page that cannot decode this broadcast cannot). It MUST
+                    // reset once the stream has genuinely recovered, or two early
+                    // cap hits — each of which is followed by a session that does
+                    // decode — permanently disable the freeze watchdog for the rest
+                    // of the page's life, which is the same dead-watchdog failure the
+                    // cap branch was written to end.
+                    if (capCycles > 0) {
+                        console.log(`[FreezeGuard] Stream healthy. Restoring the recovery `
+                            + `budget (was ${capCycles}/${MAX_CAP_RECOVERIES}).`);
+                        capCycles = 0;
+                        capNoticeShown = false;
+                    }
                 }
             }
 
@@ -3990,6 +4658,20 @@ document.addEventListener('DOMContentLoaded', () => {
             clearTimeout(stallTimeout);
             stallTimeout = null;
         }
+        // Detach the element handlers too. They were assigned in
+        // startFreezeWatchdog() and never removed, so they outlived every session.
+        // Stage 3 calls cleanupConnection(), which does `player.srcObject = null`;
+        // nulling srcObject fires `emptied` and can fire `waiting` in Blink, which
+        // armed a fresh 4s stallTimeout against a session that was being torn
+        // down. If it fired before `isConnected` was cleared, the guard passed and
+        // triggerFreezeRecovery() ran on a half-torn-down session.
+        player.onwaiting = null;
+        player.onplaying = null;
+        if (recoveryCooldownTimer) {
+            clearTimeout(recoveryCooldownTimer);
+            recoveryCooldownTimer = null;
+        }
+        snapshotMisses = 0;
         frozenSince = 0;
     }
 
@@ -4000,8 +4682,66 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         if (recoveryCount >= MAX_RECOVERIES) {
-            console.error(`[FreezeGuard] Max recovery attempts (${MAX_RECOVERIES}) reached. Manual reload required.`);
-            addSystemMessage("⚠️ Video freeze encountered. Please click Play or reload the page to refresh.");
+            // Do NOT sit here as a permanent no-op, and do NOT reconnect forever
+            // either. `recoveryCount` only decays in the watchdog's own healthy
+            // branch, which requires decodedDelta > 0 — and a freeze that all three
+            // stages failed to clear has decodedDelta stuck at 0 by definition, so
+            // the counter can never decay and the old `return` left the watchdog
+            // dead for the whole page load: the interval kept calling a function
+            // that returned immediately, the frozen picture never recovered, and
+            // nothing in the console or the HUD said why.
+            //
+            // But a broadcast this device genuinely cannot decode fails the same
+            // way every time, so an unbounded re-arm produces an endless loop of
+            // 10 staged recoveries plus a hard reconnect, each one a full WHEP
+            // renewal and a 2-4s black screen, forever. The cap therefore allows a
+            // BOUNDED number of re-armed cycles and then stops for good, with a
+            // message that says what actually happened. `capCycles` is the ceiling.
+            if (capCycles >= MAX_CAP_RECOVERIES) {
+                console.error('[FreezeGuard] Recovery budget exhausted after '
+                    + `${capCycles} re-armed cycles. Stopping automatic recovery.`);
+                // NOT gated on `capNoticeShown`. That flag is already true by the
+                // time this runs — it was set during cycle 1 — so reusing it meant
+                // the terminal notice was never posted, and the viewer was left
+                // staring at a frozen picture holding a message that claimed a
+                // reconnect was in progress. This is the one message that must
+                // always get through.
+                addSystemMessage('⚠️ This broadcast could not be played on this device '
+                    + 'after repeated attempts. Try reloading, or another browser.');
+                isRecovering = false;
+                return;
+            }
+            capCycles += 1;
+            console.error(`[FreezeGuard] Max recovery attempts (${MAX_RECOVERIES}) reached. `
+                + `Re-arming with a hard reconnect (cycle ${capCycles}/${MAX_CAP_RECOVERIES}).`);
+            recoveryCount = 0;
+            healthyPlaybackSeconds = 0;
+            if (!capNoticeShown) {
+                capNoticeShown = true;
+                addSystemMessage("⚠️ Video kept freezing — reconnecting the video pipeline. "
+                    + 'If this repeats, reload the page or try another browser.');
+            }
+            isRecovering = true;
+            frozenSince = 0;
+            stopFreezeWatchdog();
+            stopTelemetry();
+            cleanupConnection();
+            isConnected = false;
+            isConnecting = false;
+            updateUIState('connecting');
+            try {
+                await connectStream();
+            } catch (err) {
+                console.error('[FreezeGuard] Hard reconnect after recovery cap failed:', err);
+                isRecovering = false;
+                handleDisconnected();
+                return;
+            }
+            if (recoveryCooldownTimer) clearTimeout(recoveryCooldownTimer);
+            recoveryCooldownTimer = setTimeout(() => {
+                recoveryCooldownTimer = null;
+                isRecovering = false;
+            }, 3000);
             return;
         }
 
@@ -4109,12 +4849,19 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        setTimeout(() => {
+        // Store the handle. This timer used to be fire-and-forget: if this session
+        // died and a new one was established inside the 3s window, the orphan
+        // still fired and cleared `isRecovering` on the NEW session's guard,
+        // admitting a second concurrent triggerFreezeRecovery() while
+        // connectStream() was still in flight. Two recoveries interleaving on one
+        // element is how a stall becomes a cascade.
+        if (recoveryCooldownTimer) clearTimeout(recoveryCooldownTimer);
+        recoveryCooldownTimer = setTimeout(() => {
+            recoveryCooldownTimer = null;
             isRecovering = false;
             console.log("[FreezeGuard] Recovery cooldown complete. Watchdog active.");
         }, 3000);
     }
-
     /* ==========================================================================
        Player Controls, Gestures & Keyboard Shortcuts
        ========================================================================= */
@@ -4339,6 +5086,19 @@ document.addEventListener('DOMContentLoaded', () => {
             adaptiveRaiseLevelMs = 0;
             accommodationTargetMs = 0;
             accommodationCalmTicks = 0;
+            // ...and the presentation-evenness floor, for the same reason. It feeds
+            // baseBufferTargetMs() through Math.max, so leaving it set made a
+            // one-off 3-second GPU stall permanently pin the target at 600ms: the
+            // button would update its label and the HUD, reapplyBufferTargets would
+            // write 600ms to both receivers, and ultra (80ms) and balanced (180ms)
+            // became unreachable for the rest of the session. An explicit human
+            // choice has to actually win, which is the entire point of the button.
+            unevenFloorMs = 0;
+            unevenWidenApplied = false;
+            // ...and the release clock, or the re-armed floor's first decay lands
+            // on the next tick instead of after 5, unwinding 600ms in ~2s rather
+            // than ~25s and re-pacing the playout on the way down.
+            unevenReleaseTicks = 0;
             bufferNoticeState = '';
             lastAppliedTargetMs = null;
             updateBufferHud(null);
