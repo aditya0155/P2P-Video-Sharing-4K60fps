@@ -642,6 +642,50 @@ device "could not" catch up and handed the session to the hard 2–4 s rejoin.
 The mechanism degraded into exactly the teardown it exists to avoid. The
 settle point is now the granted target.
 
+### Which checkout is actually running
+
+This repo has **~40 git worktrees plus a main checkout**, each holding its own
+copy of `app.js`/`server.js`, and **every port in `mediamtx.yml` is fixed**
+(3000 / 8888 / 1935 / 8554 / 8889 / 8189). So the classic failure is silent:
+the host is already running from the main checkout, you double-click
+`start_host.bat` in a worktree, the second instance cannot bind, and the page
+you are looking at is the *other* checkout's code — presenting as "my edit did
+nothing" rather than as a port conflict.
+
+Three things now make that visible instead:
+
+- `start_host.ps1` prints `Starting host from: <absolute path>` as its first
+  line, and flags `this is a git WORKTREE` when `.git` is a file rather than a
+  directory.
+- `server.js` prints `Serving from: <absolute path>`, because `STATIC_DIR` is
+  `__dirname` — so it serves whichever copy it was launched from.
+- A port conflict now **names the holder** (process, pid, and full command line)
+  and connects it to the cause, instead of saying only that the port is busy.
+  (`OwningProcess` is a property of the *connection*, not of `Win32_Process`;
+  reading it off the process is what produced an empty pid in the one message
+  whose entire purpose is identification.)
+
+### The worktree is a strictly worse place to run from — and said nothing
+
+`ffmpeg_win/` and `cloudflared_config.yml` are in `.gitignore`, so by design they
+exist **only in the main checkout**. A host started from a worktree therefore
+degraded in two ways, silently:
+
+- **The AV1 leg.** `resolveFfmpegBinary()` fell back to the ffmpeg on `PATH`,
+  and on this host that is **8.0** — the version whose own comment says it cannot
+  bridge a WHIP AV1 source (it loops forever on `Unexpected fragment
+  continuation`). The fallback now announces itself, names the version it
+  actually resolved, and explains that worktrees lack `ffmpeg_win/`. A silence
+  here surfaced minutes later as a mysterious circuit-breaker trip with nothing
+  tying it to a missing directory.
+- **The tunnel.** No `cloudflared_config.yml` meant no public tunnel, so remote
+  viewers could not connect while `127.0.0.1` worked fine — the kind of split
+  that looks like a viewer-side bug.
+
+`start_host.ps1` warns about both at startup. Neither is fatal (an H.264 host
+with no tunnel still serves locally), but both are now named rather than
+discovered later.
+
 ### Smaller items
 
 - The audio transceiver was added and then left entirely to the UA's codec
