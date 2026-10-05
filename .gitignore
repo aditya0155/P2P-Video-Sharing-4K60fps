@@ -21,3 +21,6 @@ _audit_tmp/
 _studio_backup_*/
 JS_CHECKS_REBUILD_NOTE.md
 repo_checkout/
+
+# Stray scratch output from manual runs.
+testout.txt
