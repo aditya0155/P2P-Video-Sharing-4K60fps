@@ -2197,13 +2197,40 @@ document.addEventListener('DOMContentLoaded', () => {
                     && !/ [0-9a-f]{8}-[0-9a-f-]+\.local \d+ /i.test(line));
             };
             console.log("[WebRTC] Waiting up to 6s for a routable ICE candidate...");
+            // ATTEMPT-OWNED TIMER HANDLES.
+            //
+            // `gatherTimeout` is module-scoped so cleanupConnection() can cancel
+            // this window, but that made it a shared slot that TWO attempts
+            // write to. Every clearing path therefore has to prove the handle it
+            // is clearing is still the one THIS attempt armed.
+            //
+            // Without that check the stale attempt wins. Teardown clears the
+            // global, the replacement attempt arms its own cap, and then this
+            // attempt's `finish()` — resumed by a routablePoll timer that
+            // cleanupConnection does NOT clear, because it is a local of this
+            // closure and not a module global — clears the NEW attempt's 6s cap
+            // and nulls the global. Two things break at once for the live
+            // attempt: the cap that bounds ICE gathering is gone, and
+            // `pollRoutable` guards on "is the window still open", which it
+            // reads from that same global — so the routable-candidate fast path
+            // dies too, silently reverting to "gathering complete or forever"
+            // on exactly the hard networks (STUN blocked, TURN slow) that
+            // routine exists for. The attempt then hangs until the 26s connect
+            // watchdog instead of the 6s it is supposed to be bound by.
+            let gatherCap = null;      // this attempt's cap handle
+            let gatherOpen = false;    // this attempt's window state
             await new Promise((resolve) => {
                 let checkState;
                 let routablePoll = null;
                 let routableSettle = null;
 
                 const finish = (why) => {
-                    if (gatherTimeout) { clearTimeout(gatherTimeout); gatherTimeout = null; }
+                    if (!gatherOpen) return;   // idempotent: finish can race itself
+                    gatherOpen = false;
+                    // Release the shared slot only while it still holds OUR
+                    // handle. A newer attempt's cap must survive us.
+                    if (gatherTimeout === gatherCap) gatherTimeout = null;
+                    gatherCap = null;
                     if (routablePoll) { clearTimeout(routablePoll); routablePoll = null; }
                     if (routableSettle) { clearTimeout(routableSettle); routableSettle = null; }
                     pc.removeEventListener('icegatheringstatechange', checkState);
@@ -2233,7 +2260,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     // posts WHEP, never errors and never times out. Resolve it
                     // through finish() so the caller runs its own stale check.
                     if (superseded()) { finish('superseded'); return; }
-                    if (routableSettle || gatherTimeout === null) return;
+                    // ATTEMPT-LOCAL window state. This used to read the module
+                    // global `gatherTimeout`, which a superseded attempt's
+                    // finish() can null out from under the live attempt — that
+                    // silently killed this whole loop. See the note above.
+                    if (routableSettle || !gatherOpen) return;
                     if (!hasRoutableCandidate()) {
                         routablePoll = setTimeout(pollRoutable, 100);
                         return;
@@ -2243,17 +2274,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 pc.addEventListener('icegatheringstatechange', checkState);
                 // ORDER MATTERS. The cap must be armed BEFORE the first
-                // pollRoutable() call: that function's guard tests
-                // `gatherTimeout === null` to know the window is still open, so
-                // priming the poll first made it return immediately and never
-                // reschedule. The routable-candidate logic was therefore dead
-                // code and this window silently degraded to "gathering complete
-                // or 6s" — which is neither what it claims to do nor the 3s cap
-                // it replaced.
-                gatherTimeout = setTimeout(() => finish('6s cap reached'), 6000);
+                // pollRoutable() call, and the window flag must be open before
+                // either: pollRoutable()'s guard tests `gatherOpen` to know the
+                // window is still open, so arming out of order made it return
+                // immediately and never reschedule. The routable-candidate
+                // logic would then be dead code and the window would silently
+                // degrade to "gathering complete or 6s".
+                gatherOpen = true;
+                gatherCap = setTimeout(() => finish('6s cap reached'), 6000);
+                gatherTimeout = gatherCap;
                 pollRoutable();
             });
-            if (gatherTimeout) { clearTimeout(gatherTimeout); gatherTimeout = null; }
+            // The window owns its cap; clear it only if this attempt is still
+            // the one holding the shared slot. (finish() above normally already
+            // did, but the promise can resolve via a path that left it armed.)
+            if (gatherTimeout === gatherCap) {
+                clearTimeout(gatherCap);
+                gatherTimeout = null;
+            }
+            gatherCap = null;
+            gatherOpen = false;
             if (superseded()) {
                 console.log("[WebRTC] Gather window exited but a newer connection took over; not sending WHEP.");
                 return;
@@ -2270,14 +2310,31 @@ document.addEventListener('DOMContentLoaded', () => {
                 : whepUrl;
             console.log("[WHEP POST URL]:", activeWhepUrl);
 
-            whepAbortController = new AbortController();
+            // ATTEMPT-OWNED, exactly as the ICE-gather cap above.
+            //
+            // Both handles are module globals purely so cleanupConnection() can
+            // cancel an in-flight attempt. That makes them a slot two attempts
+            // write to, and this attempt's `finally` was the dangerous writer:
+            // teardown clears the globals, the replacement attempt arms its own
+            // controller and timer, and then THIS attempt's aborted fetch
+            // rejects and its `finally` clears the NEW attempt's 10s POST bound
+            // and nulls the global. The live attempt is then left with a WHEP
+            // POST that no timeout can end and that teardown can no longer
+            // cancel, so a stalled POST hangs until the 26s connect watchdog
+            // instead of 10s — and the reason is invisible in the log, which
+            // shows only the successful connect.
+            const myAbortController = new AbortController();
+            whepAbortController = myAbortController;
             // Bound the handshake round-trip: without this, a stalled POST would sit
             // until the 26s connect watchdog fired. Signaling is a local ~10ms exchange, so
             // 10s means something is genuinely broken and a fast retry helps sooner.
-            whepPostTimeout = setTimeout(() => {
+            // The callback aborts THIS attempt's controller, not whatever the
+            // global happens to hold when it finally runs.
+            const myPostTimeout = setTimeout(() => {
                 console.warn("[WebRTC] WHEP POST exceeded 10s without a response. Aborting handshake.");
-                if (whepAbortController) whepAbortController.abort();
+                try { myAbortController.abort(); } catch (e) { /* already aborted */ }
             }, 10000);
+            whepPostTimeout = myPostTimeout;
             let response;
             try {
                 response = await fetch(activeWhepUrl, {
@@ -2286,13 +2343,13 @@ document.addEventListener('DOMContentLoaded', () => {
                         'Content-Type': 'application/sdp'
                     },
                     body: finalOfferSdp,
-                    signal: whepAbortController.signal
+                    signal: myAbortController.signal
                 });
             } finally {
-                if (whepPostTimeout) {
-                    clearTimeout(whepPostTimeout);
-                    whepPostTimeout = null;
-                }
+                // Clear only our own handle, and release the shared slots only
+                // while they still hold it.
+                clearTimeout(myPostTimeout);
+                if (whepPostTimeout === myPostTimeout) whepPostTimeout = null;
             }
 
             console.log("[WHEP POST Response Status]:", response.status, response.statusText);
@@ -2393,6 +2450,32 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
             console.error("[WebRTC] Error in connection sequence:", error);
+            // A SUPERSEDED attempt must not tear down the session that replaced
+            // it. Only the AbortError branch above had this guard, and it is not
+            // the only way a torn-down attempt can fail: cleanupConnection()
+            // calls `pc.close()` on the old connection while this attempt may
+            // still be suspended on `createOffer()` / `setLocalDescription()`,
+            // and those reject with InvalidStateError/OperationError
+            // ("signalingState is 'closed'"), NOT AbortError. That lands here,
+            // where the code unconditionally cleared isConnecting and ran
+            // handleDisconnected() — which clears the LIVE attempt's 26s
+            // connect watchdog, closes the LIVE attempt's peer connection,
+            // paints the page OFFLINE and re-arms the status poll.
+            //
+            // So a stale attempt that failed after being superseded destroys a
+            // perfectly healthy session, and the viewer's own log shows a clean
+            // connect followed by an unexplained drop. Every teardown trigger
+            // can produce it: an ABR rendition switch, the freeze watchdog's
+            // Stage 3, the seam safety net, or the network-change handler — each
+            // of which tears the in-flight attempt down mid-handshake.
+            //
+            // The identity check is the same one every other continuation in
+            // this function uses; a superseded attempt's failure is simply not
+            // news about the current session.
+            if (superseded()) {
+                console.warn("[WebRTC] A superseded session failed; leaving the current one alone.", error);
+                return;
+            }
             isConnecting = false;
             handleDisconnected();
         }
