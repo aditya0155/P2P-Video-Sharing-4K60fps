@@ -1,6 +1,30 @@
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $PSCommandPath
+
+# --- Refuse to broadcast from a throwaway checkout -------------------------
+# A linked git worktree (an editor/agent sandbox under .git\worktrees, or any
+# path whose .git is a FILE rather than a directory) is a short-lived scratch
+# copy, not the project. Serving from one is silent and badly misleading:
+# server.js and mediamtx.yml both resolve everything from their own directory,
+# so a viewer gets the sandbox's app.js while the operator edits the real one.
+# The symptom is a fix that "did nothing", or a config change that never takes
+# effect -- with nothing in the logs to say the code being served is not the
+# code on disk in the project folder.
+#
+# This actually happened here: the live site on port 3000 was being served by
+# a worktree whose copy of app.js had diverged from the main checkout's.
+$gitMarker = Join-Path $scriptDir '.git'
+if (Test-Path -LiteralPath $gitMarker) {
+    $isLinkedWorktree = -not (Get-Item -LiteralPath $gitMarker -Force).PSIsContainer
+    if ($isLinkedWorktree) {
+        throw ("Refusing to start from a linked git worktree: $scriptDir`n" +
+               "This is a throwaway agent/editor sandbox, so the site would serve " +
+               "that copy instead of your project. Start the host from the real " +
+               "project folder (the one whose .git is a directory).")
+    }
+}
+
 $serverPath = Join-Path $scriptDir 'server.js'
 $configPath = Join-Path $scriptDir 'mediamtx.yml'
 $mediamtxPath = Join-Path $scriptDir 'mediamtx_win\mediamtx.exe'
