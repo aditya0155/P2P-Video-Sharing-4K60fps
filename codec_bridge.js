@@ -67,20 +67,62 @@ const BUNDLED_FFMPEG = path.join(__dirname,
 // absent from 8.0), which is what lets OBS WHIP AV1 sources sync on the RTSP
 // leg — ffmpeg 8.0 loops forever on "Unexpected fragment continuation". An
 // explicit BRIDGE_FFMPEG override wins; the system PATH is the last fallback.
+//
+// WHY the source is returned alongside the binary.
+//
+// `ffmpeg_win/` is gitignored. That means it is present in the main checkout and
+// ABSENT from every git worktree and every fresh clone — the two places code
+// actually gets edited. The old resolver fell back to a bare `'ffmpeg'` with no
+// diagnostic of any kind, so an operator starting the host from a worktree got a
+// transcoder running on whatever ffmpeg happened to be first on PATH: a different
+// build, without the AV1 depacketizer fix, silently. Nothing in the hook log
+// distinguished that from a deliberate `BRIDGE_FFMPEG` override, and the only
+// line that mentioned ffmpeg printed the bare word inside a long argument list.
+//
+// The failure it produces is the confusing kind rather than the loud kind. The
+// host starts, the local page plays, and the symptom is that changes to the
+// receiver or the bridge appear to do nothing, or that an AV1/WHIP source stalls
+// on the RTSP leg — both consistent with "I fixed the wrong copy of the project"
+// and neither pointing at the encoder. That is worth a startup line.
+//
+// `FFMPEG` stays a plain string because the ffprobe-sibling derivation below
+// branches on it (`!== 'ffmpeg'`).
 function resolveFfmpegBinary() {
     if (process.env.BRIDGE_FFMPEG) {
-        return process.env.BRIDGE_FFMPEG;
+        return { binary: process.env.BRIDGE_FFMPEG, source: 'BRIDGE_FFMPEG override' };
     }
     try {
         if (fs.existsSync(BUNDLED_FFMPEG)) {
-            return BUNDLED_FFMPEG;
+            return { binary: BUNDLED_FFMPEG, source: 'bundled build' };
         }
     } catch (err) {
         /* stat failure falls through to PATH */
     }
-    return 'ffmpeg';
+    return { binary: 'ffmpeg', source: 'PATH fallback (bundled build not found)' };
 }
-const FFMPEG = resolveFfmpegBinary();
+const FFMPEG_RESOLVED = resolveFfmpegBinary();
+const FFMPEG = FFMPEG_RESOLVED.binary;
+
+// Announced once per bridge start, and loudly when the fallback was taken. The
+// bridge runs as a MediaMTX runOnAvailable hook, so this lands in the launcher
+// window alongside the rest of the hook output.
+function reportFfmpegResolution() {
+    if (FFMPEG_RESOLVED.source === 'bundled build') {
+        log(`ffmpeg: bundled build (${BUNDLED_FFMPEG})`);
+        return;
+    }
+    if (FFMPEG_RESOLVED.source === 'BRIDGE_FFMPEG override') {
+        log(`ffmpeg: BRIDGE_FFMPEG override (${FFMPEG})`);
+        return;
+    }
+    logError(`ffmpeg: FALLING BACK TO PATH ("${FFMPEG}") — the bundled build is not present at:`);
+    logError(`        ${BUNDLED_FFMPEG}`);
+    logError('        That directory is gitignored, so it exists in the main checkout but NOT in a');
+    logError('        git worktree or a fresh clone. A different ffmpeg build changes encoder output,');
+    logError('        and 8.0 lacks the AV1 RTP depacketizer fix this project depends on. Copy');
+    logError('        ffmpeg_win/ across, or set BRIDGE_FFMPEG to an absolute path, if renditions');
+    logError('        or an AV1/WHIP source misbehave.');
+}
 
 // Overridable so a test (or a second bridge) can use an isolated record instead
 // of the shared per-user temp path, where two bridges would overwrite each other.
@@ -894,6 +936,12 @@ async function main() {
         cleanup();
         return;
     }
+
+    // Before anything else: say which encoder this process will actually use.
+    // The PATH fallback is silent by nature — the binary is simply the first
+    // `ffmpeg` on PATH — so without this line a worktree operator gets a
+    // different transcoder than the main checkout and has no way to tell.
+    reportFfmpegResolution();
 
     let child = null;
     const stop = () => {

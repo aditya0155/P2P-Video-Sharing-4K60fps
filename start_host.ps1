@@ -122,6 +122,29 @@ try {
         throw "Cloudflare tunnel config exists but cloudflared.exe is missing: $cloudflaredPath"
     }
 
+    # The bundled ffmpeg is a WARNING, not a throw, because a plain RTMP H.264
+    # broadcast plays fine without it — the bridge is only needed for the
+    # complementary renditions and for AV1/WHIP sources. It is checked anyway
+    # because ffmpeg_win/ is GITIGNORED: it exists in the main checkout and is
+    # absent from every git worktree and fresh clone, so starting the host from a
+    # worktree silently transcodes with whatever `ffmpeg` is first on PATH instead
+    # of the 8.1 build this project depends on. That divergence looks like
+    # "my change had no effect" or "the AV1 source stalls on the RTSP leg", and
+    # nothing downstream mentions the encoder, so it is named here at startup.
+    $bundledFfmpeg = Join-Path $scriptDir 'ffmpeg_win\ffmpeg-n8.1-latest-win64-gpl-shared-8.1\bin\ffmpeg.exe'
+    if (-not (Test-Path -LiteralPath $bundledFfmpeg -PathType Leaf)) {
+        if ($env:BRIDGE_FFMPEG) {
+            Write-Host "Using BRIDGE_FFMPEG override: $env:BRIDGE_FFMPEG" -ForegroundColor Yellow
+        } else {
+            Write-Host 'WARNING: the bundled ffmpeg is missing, so renditions will fall back to' -ForegroundColor Yellow
+            Write-Host "         whatever 'ffmpeg' is first on PATH: $bundledFfmpeg" -ForegroundColor Yellow
+            Write-Host '         ffmpeg_win/ is gitignored, so it is present in the main checkout but' -ForegroundColor Yellow
+            Write-Host '         NOT in a git worktree or a fresh clone. A different ffmpeg build changes' -ForegroundColor Yellow
+            Write-Host '         encoder output, and 8.0 lacks the AV1 RTP depacketizer fix this project needs.' -ForegroundColor Yellow
+            Write-Host '         Copy ffmpeg_win/ across, or set BRIDGE_FFMPEG, if renditions or an AV1 source misbehave.' -ForegroundColor Yellow
+        }
+    }
+
     # Optional Cloudflare TURN credentials (written by setup_cloudflared.ps1).
     # The file keeps the API token on this laptop; browsers only ever receive
     # short-lived, server-minted ICE credentials from /stream-api/turn.

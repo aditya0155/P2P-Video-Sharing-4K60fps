@@ -2011,6 +2011,37 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertIn("function resolveFfmpegBinary(", bridge, "bundled-ffmpeg resolver missing")
         self.assertIn("ffmpeg_win", bridge, "bundled ffmpeg path missing")
         self.assertIn("process.env.BRIDGE_FFMPEG", bridge, "BRIDGE_FFMPEG override missing")
+
+        # The PATH fallback must be ANNOUNCED, not taken silently.
+        #
+        # `ffmpeg_win/` is gitignored, so it is present in the main checkout and
+        # absent from every git worktree and every fresh clone — which is exactly
+        # where code gets edited. The resolver used to return a bare `'ffmpeg'`
+        # with no diagnostic, so a worktree operator silently transcoded with
+        # whatever ffmpeg was first on PATH: a different build, without the AV1
+        # RTP depacketizer fix (d12791ef) that the bridge exists to rely on. The
+        # host starts, the local page plays, and the symptom is that edits appear
+        # to do nothing — or an AV1/WHIP source stalls on the RTSP leg — neither
+        # of which points at the encoder. `FFMPEG` must also stay a plain string,
+        # because the ffprobe sibling derivation branches on `!== 'ffmpeg'`.
+        self.assertIn("reportFfmpegResolution", bridge,
+                      "the resolved ffmpeg must be reported at startup")
+        self.assertIn("reportFfmpegResolution();", bridge,
+                      "the startup report must actually be called")
+        self.assertIn("PATH fallback", bridge,
+                      "the resolver must record that it fell back to PATH")
+        self.assertIn("FALLING BACK TO PATH", bridge,
+                      "a PATH fallback must be announced loudly, naming the missing path")
+        self.assertIn("gitignored", bridge,
+                      "the fallback must explain the gitignore/worktree cause, not just the symptom")
+        self.assertIn("const FFMPEG = FFMPEG_RESOLVED.binary;", bridge,
+                      "FFMPEG must stay a plain string for the ffprobe sibling derivation")
+        # The launcher must surface the same condition before the stream starts.
+        launcher = read_text(LAUNCHER_PATH)
+        self.assertIn("ffmpeg_win", launcher,
+                      "the launcher must check for the gitignored bundled ffmpeg")
+        self.assertIn("BRIDGE_FFMPEG", launcher,
+                      "the launcher must name the override that bypasses the check")
         # The tunable env defaults are load-bearing for the mediamtx wiring test.
         self.assertIn("process.env.BRIDGE_RTMP_PORT || '1935'", bridge)
         self.assertIn("process.env.RTSP_PORT || '8554'", bridge)
