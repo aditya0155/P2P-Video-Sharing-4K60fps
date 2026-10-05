@@ -1306,17 +1306,33 @@ document.addEventListener('DOMContentLoaded', () => {
         // Honour the same exclusions as the rest of the supervisor: a hidden
         // tab suspends presentation (the measurement is meaningless and the
         // rate would drain a buffer nobody is watching), and a paused viewer is
-        // not drifting.
-        if (!isConnected || document.hidden || player.paused) return false;
+        // not drifting. Each of these abandons the current probe as well: the
+        // probe baseline is only meaningful while readings are continuous, and
+        // returning without clearing it lets a baseline taken minutes ago be
+        // compared against a fresh reading below, which reads as a failed drain
+        // and latches the controller off on a verdict it never earned.
+        if (!isConnected || document.hidden || player.paused) {
+            catchUpProbeAt = 0;
+            catchUpProbeDelayMs = null;
+            return false;
+        }
         // A measuring/null reading must not move the rate. Rewriting
         // playbackRate resets the media pipeline's audio/video sync state, so
         // a controller that churns it is worse than one that does nothing.
-        if (avgPlayoutDelayMs === null || !Number.isFinite(avgPlayoutDelayMs)) return false;
+        if (avgPlayoutDelayMs === null || !Number.isFinite(avgPlayoutDelayMs)) {
+            catchUpProbeAt = 0;
+            catchUpProbeDelayMs = null;
+            return false;
+        }
         // Only a FRESH reading. avgPlayoutDelayMs latches through a quiet
         // window (see the drift supervisor), so acting on a stale value would
         // speed the stream up on the strength of a measurement from a minute
         // ago.
-        if (performance.now() - avgPlayoutDelayAt > 3000) return false;
+        if (performance.now() - avgPlayoutDelayAt > 3000) {
+            catchUpProbeAt = 0;
+            catchUpProbeDelayMs = null;
+            return false;
+        }
 
         const wanted = catchUpPlaybackRate(avgPlayoutDelayMs, baseBufferTargetMs(), catchUpRate, CATCHUP_MAX_RATE);
         if (wanted !== catchUpRate) {
@@ -1357,10 +1373,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 catchUpProbeDelayMs = avgPlayoutDelayMs;
             } else if (now - catchUpProbeAt > 5000
                 && avgPlayoutDelayMs > catchUpProbeDelayMs - 50) {
-                catchUpProvenUseless = true;
+                // Give the element back before latching off. The rate IS the
+                // thing this verdict is about: updateLiveEdgeCatchUp() is the
+                // only code that lowers player.playbackRate, and the caller's
+                // `!catchUpProvenUseless &&` guard stops calling it the moment
+                // this flag is set. Latching alone therefore pinned the viewer
+                // at 1.08x for the rest of the session -- exactly the
+                // "permanently sped-up stream" this branch exists to prevent --
+                // and the hard rejoin that was supposed to follow only fires
+                // above 3100ms, so any delay between the base target and that
+                // cap had no way back at all. Reset first, then re-assert the
+                // flag (resetLiveEdgeCatchUp clears it) so the mechanism stays
+                // disabled and the rejoin path can take over.
                 console.warn(`[AdaptiveBuffer] Catch-up saturated at ${catchUpRate}x and did not `
                     + `drain the buffer (${catchUpProbeDelayMs.toFixed(0)}ms -> `
-                    + `${avgPlayoutDelayMs.toFixed(0)}ms); falling back to a hard rejoin.`);
+                    + `${avgPlayoutDelayMs.toFixed(0)}ms); returning to 1.0x and falling back to a hard rejoin.`);
+                resetLiveEdgeCatchUp();
+                catchUpProvenUseless = true;
+                return false;
             }
         } else {
             // Not saturated: the controller has not asked for everything it can

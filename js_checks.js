@@ -1470,6 +1470,162 @@ Object.assign(cases, {
     // 4-tick confirmation never fires and the viewer stays seconds behind
     // live. The visibility-return hook must arm the stepwise catch-up at
     // once — and stay idle when there is no real drift.
+    'catchup-latch-returns-the-element-to-1x'() {
+        // The self-verification latch must never outlive the rate it justified.
+        //
+        // `superviseAdaptiveBuffer` guards the controller with
+        // `!catchUpProvenUseless && updateLiveEdgeCatchUp()`, and that function
+        // is the ONLY code that lowers player.playbackRate. So when the
+        // self-check declared the mechanism useless, the old code set the flag
+        // and stopped -- leaving the element pinned at 1.08x for the rest of
+        // the session. That is the precise outcome the branch's own comment
+        // says it exists to prevent ("permanently sped-up stream while the real
+        // problem went untreated"), and the hard rejoin that was supposed to
+        // follow only trips above 3100ms, so any delay between the base target
+        // and that cap had no way back at all.
+        //
+        // This runs the REAL function against a mutable sandbox, so the whole
+        // sequence -- ramp, saturate, fail to drain, latch off -- is exercised
+        // rather than a restatement of the source text.
+        const make = ({ delayMs = 1500, nowMs = 0 } = {}) => {
+            const player = { paused: false, playbackRate: 1 };
+            const sandbox = {
+                isConnected: true,
+                player,
+                document: { hidden: false },
+                performance: { now: () => nowMs },
+                avgPlayoutDelayMs: delayMs,
+                avgPlayoutDelayAt: nowMs,      // a fresh reading
+                catchUpRate: 1,
+                catchUpProbeAt: 0,
+                catchUpProbeDelayMs: null,
+                catchUpProvenUseless: false,
+                CATCHUP_MAX_RATE: 1.08,
+                baseBufferTargetMs: () => 1000,
+                catchUpPlaybackRate: (delay, base, prev, max) =>
+                    Math.min(max, prev + 0.01),   // saturates after 8 ticks
+                console: quietConsole(),
+            };
+            // The real resetLiveEdgeCatchUp, so the ORDERING fix is what is
+            // under test rather than a stub that always succeeds.
+            sandbox.resetLiveEdgeCatchUp = compileFunction('resetLiveEdgeCatchUp', sandbox).fn;
+            const { fn } = compileFunction('updateLiveEdgeCatchUp', sandbox);
+            return { sandbox, player, run: fn };
+        };
+
+        // Ramp to saturation: 8 ticks of +0.01 reaches the 1.08x cap.
+        const s = make({ nowMs: 1000 });
+        for (let i = 0; i < 8; i++) {
+            s.sandbox.avgPlayoutDelayMs = 1500;
+            s.sandbox.avgPlayoutDelayAt = 1000;
+            s.run();
+        }
+        assertEqual(s.player.playbackRate, 1.08,
+            'a sustained 500ms overshoot must ramp the element to the 1.08x cap');
+
+        // Now hold the delay flat and let more than 5s pass: the mechanism is
+        // saturated and NOT draining, which is exactly the trigger. The ramp
+        // loop above already opened the probe at t=1000, so this single call is
+        // the verdict. Assert immediately after it -- in the real supervisor the
+        // very next call is short-circuited by the flag, so calling again here
+        // would re-ramp and prove nothing.
+        s.sandbox.avgPlayoutDelayMs = 1500;
+        s.sandbox.avgPlayoutDelayAt = 20000;
+        s.sandbox.performance = { now: () => 20000 };
+        s.run();  // >5s after the probe opened, delay unchanged -> "proven useless"
+
+        assertEqual(s.sandbox.catchUpProvenUseless, true,
+            'a saturated controller that does not drain must disable itself');
+        assertEqual(
+            s.player.playbackRate, 1,
+            'disabling catch-up must hand the element back at 1.0x. Leaving it ' +
+            'at 1.08x is the exact "permanently sped-up stream" this branch exists ' +
+            'to prevent, and nothing else in the session lowers the rate again.');
+    },
+
+    'catchup-probe-is-abandoned-when-measurement-stops'() {
+        // A probe opened before a pause/hide must not be judged against a
+        // reading taken minutes later. The early returns used to leave
+        // catchUpProbeAt set, so a fresh reading met the ">5s later" test
+        // against a stale baseline and latched the controller off on a verdict
+        // it never earned.
+        const make = ({ paused = false, hidden = false, isConnected = true,
+                        delayMs = 1500, nowMs = 0 } = {}) => {
+            const player = { paused, playbackRate: 1 };
+            const sandbox = {
+                isConnected, player,
+                document: { hidden },
+                performance: { now: () => nowMs },
+                avgPlayoutDelayMs: delayMs,
+                avgPlayoutDelayAt: nowMs,
+                catchUpRate: 1.08,               // already saturated
+                catchUpProbeAt: 0,
+                catchUpProbeDelayMs: null,
+                catchUpProvenUseless: false,
+                CATCHUP_MAX_RATE: 1.08,
+                baseBufferTargetMs: () => 1000,
+                catchUpPlaybackRate: (d, b, prev, max) => Math.min(max, prev + 0.01),
+                console: quietConsole(),
+            };
+            sandbox.resetLiveEdgeCatchUp = compileFunction('resetLiveEdgeCatchUp', sandbox).fn;
+            const { fn } = compileFunction('updateLiveEdgeCatchUp', sandbox);
+            return { sandbox, player, run: fn };
+        };
+
+        // Each case must first OPEN a probe, then have the gate taken away, then
+        // assert the baseline was abandoned. A brand-new sandbox already has
+        // catchUpProbeAt === 0, so running the gated tick first asserts nothing
+        // -- the test has to put something there to lose.
+        const openProbe = () => {
+            const s = make({ nowMs: 1000 });
+            s.run();
+            assertEqual(s.sandbox.catchUpProbeDelayMs, 1500,
+                'a saturated controller must open a probe and record its baseline');
+            assertEqual(s.sandbox.catchUpProbeAt, 1000,
+                'the probe baseline is stamped with the opening tick');
+            return s;
+        };
+
+        // Sanity: with no gate the probe is still open, so the assertions below
+        // are about the gate and not about a probe that never existed.
+        const ungated = openProbe();
+        ungated.run();
+        assert(ungated.sandbox.catchUpProbeAt > 0,
+            'an ungated tick must leave the probe open, or these tests prove nothing');
+
+        // The viewer pauses / the tab hides / the session drops: the reading is
+        // meaningless and must be abandoned. These must be set on the OBJECTS
+        // the function reads (player.paused, document.hidden), not as bare
+        // context variables -- `updateLiveEdgeCatchUp` tests `player.paused`,
+        // so a top-level `paused` would be dead and every case would pass for
+        // the wrong reason.
+        const gates = [
+            ['the viewer paused', (s) => { s.player.paused = true; }],
+            ['the tab was hidden', (s) => { s.document.hidden = true; }],
+            ['the session dropped', (s) => { s.isConnected = false; }],
+        ];
+        for (const [label, apply] of gates) {
+            const g = openProbe();
+            apply(g.sandbox);
+            g.run();
+            assertEqual(g.sandbox.catchUpProbeAt, 0,
+                `the probe baseline must be abandoned when ${label}`);
+            assertEqual(g.sandbox.catchUpProbeDelayMs, null,
+                `the probe measurement must be abandoned when ${label}`);
+        }
+
+        // A stale reading (>3s old) is equally disqualifying, and must not be
+        // allowed to keep a baseline it cannot legitimately compare against.
+        const stale = openProbe();
+        stale.sandbox.avgPlayoutDelayAt = 0;   // reading is 1s old...
+        stale.sandbox.performance = { now: () => 5000 };  // ...but 4s have passed
+        stale.run();
+        assertEqual(stale.sandbox.catchUpProbeAt, 0,
+            'a stale reading must abandon the probe baseline');
+        assertEqual(stale.sandbox.catchUpProbeDelayMs, null,
+            'a stale reading must abandon the probe measurement too');
+    },
+
     'catch-up-arms-on-visibility-return'() {
         // The stats loop is stopped while the tab is hidden, so the retained
         // avgPlayoutDelayMs still holds the PRE-HIDE value — useless for the
