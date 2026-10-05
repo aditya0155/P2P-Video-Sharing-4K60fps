@@ -2215,8 +2215,8 @@ class ReceiverLagFixChecks(unittest.TestCase):
         Both are now attempt-owned and released only under an identity check.
         """
         app = read_text(APP_PATH)
-        code = self._strip_comments(app, "js")
-        connect = self._js_function_body(code, "connectStream")
+        code = ViewerSmoothnessRegressionChecks._strip_comments(app, "js")
+        connect = ViewerSmoothnessRegressionChecks._js_function_body(code, "connectStream")
         self.assertIsNotNone(connect, "connectStream not found")
 
         # The WHEP POST bound.
@@ -3630,8 +3630,23 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         # the 1s stats tick is never the only thing keeping the two in step.
         self.assertIn("applyPlayoutDelay(event.receiver, event.track.kind)",
                       code, "ontrack must target both kinds as they arrive")
-        self.assertRegex(code, r"(?s)latencyModeBtn\.addEventListener\('click'.*?if \(r\.track\) \{\s*applyPlayoutDelay\(r, r\.track\.kind\);",
-                         "the latency-mode switch must retarget both receivers immediately")
+        # The latency-mode switch must retarget EVERY receiver, immediately, with
+        # the SAME target for both kinds -- an override argument here would
+        # re-introduce exactly the lip-sync offset this test exists to prevent.
+        #
+        # This asserts the property, not one spelling of the call. The call is
+        # currently written `if (r.track && applyPlayoutDelay(r, r.track.kind))`
+        # so the boolean return can drive the latch rule; an earlier form was
+        # `if (r.track) { applyPlayoutDelay(...); }`. Both satisfy the invariant,
+        # and pinning either one turns this into a change-detector.
+        switch_at = code.find("latencyModeBtn.addEventListener('click'")
+        self.assertGreater(switch_at, 0, "the latency-mode switch must exist at all")
+        switch_body = code[switch_at:switch_at + 2000]
+        self.assertIn("getReceivers()", switch_body,
+                      "the latency-mode switch must walk every receiver, not just one")
+        self.assertIn("applyPlayoutDelay(r, r.track.kind)", switch_body,
+                      "the latency-mode switch must retarget both receivers immediately, "
+                      "with the same target for audio and video")
 
     def test_stress_raise_releases_on_a_clock_not_a_quiet_streak(self):
         """The raise must not latch.

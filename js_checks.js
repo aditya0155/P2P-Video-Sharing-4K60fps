@@ -1922,7 +1922,7 @@ Object.assign(cases, {
                 // `baseBufferTargetMs` name left both undefined, so the sandbox
                 // threw before the ordering/latch behaviour was ever reached.
                 // Both are provided here so the case tests what it claims to.
-                currentBufferTargetMs: () => 1000,
+                currentBufferTargetMs: () => 99999,
                 grantedTargetMs: 0,
                 catchUpPlaybackRate: (delay, base, prev, max) =>
                     Math.min(max, prev + 0.01),   // saturates after 8 ticks
@@ -1988,7 +1988,7 @@ Object.assign(cases, {
                 // Same as the sibling case: the function under test calls
                 // `currentBufferTargetMs()` and reads `grantedTargetMs`, so the
                 // older `baseBufferTargetMs` stub alone leaves both undefined.
-                currentBufferTargetMs: () => 1000,
+                currentBufferTargetMs: () => 99999,
                 grantedTargetMs: 0,
                 catchUpPlaybackRate: (d, b, prev, max) => Math.min(max, prev + 0.01),
                 console: quietConsole(),
