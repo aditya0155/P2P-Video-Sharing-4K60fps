@@ -93,6 +93,37 @@ function resolveFfmpegBinary() {
     ffmpegResolvedFrom = 'system PATH (bundled build missing)';
     return 'ffmpeg';
 }
+
+// WHY THE FALLBACK MUST BE LOUD. `ffmpeg_win/` is in .gitignore ("heavy local
+// binaries, re-downloadable"), so it exists in the MAIN checkout and in NONE of
+// the ~40 git worktrees this repo has. A bridge started from a worktree
+// therefore took the PATH fallback SILENTLY, and the PATH ffmpeg on this host is
+// 8.0 — the exact version the comment above says cannot bridge a WHIP AV1
+// source. The failure then presented as a mysterious circuit-breaker trip
+// minutes later, with nothing in the log connecting it to a missing directory.
+//
+// So the fallback reports itself, and names the version it actually found,
+// because "which ffmpeg am I really running" is the single fact needed to
+// diagnose every AV1 sync failure on this host.
+(function reportFfmpegResolution() {
+    const resolved = resolveFfmpegBinary();
+    if (process.env.BRIDGE_FFMPEG) return;                 // deliberate override
+    if (resolved !== 'ffmpeg') return;                      // bundled build present
+    logError(`Bundled ffmpeg NOT found at: ${BUNDLED_FFMPEG}`);
+    logError('Falling back to the ffmpeg on PATH. This is only safe for H.264 '
+        + 'sources: an AV1 WHIP source needs ffmpeg 8.1+ (commit d12791ef) or it '
+        + 'loops forever on "Unexpected fragment continuation".');
+    logError('ffmpeg_win/ is gitignored, so it is absent from every git worktree. '
+        + 'Run the host from the MAIN checkout, or set BRIDGE_FFMPEG to an 8.1+ build.');
+    try {
+        const banner = execSync('ffmpeg -hide_banner -version',
+            { encoding: 'utf8', timeout: 5000, windowsHide: true });
+        const line = String(banner).split(/\r?\n/).find((l) => l.startsWith('ffmpeg version'));
+        logError(`PATH ffmpeg reports: ${line ? line.trim() : 'unknown version'}`);
+    } catch (err) {
+        logError('No ffmpeg on PATH either — the bridge cannot start.');
+    }
+})();
 const FFMPEG = resolveFfmpegBinary();
 
 // Printed once per start so an operator can see WHICH binary is transcoding.

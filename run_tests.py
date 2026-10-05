@@ -875,6 +875,28 @@ class JsLogicChecks(unittest.TestCase):
         ViewerSmoothnessRegressionChecks for the full rationale."""
         run_js_check(self, "spec-freeze-threshold")
 
+    def test_loss_accounting_excludes_retransmissions(self):
+        """`packetsReceived` includes retransmissions, so the old
+        dLost/(dRx+dLost) ratio reported a fully RTX-repaired link as 0% loss
+        and could not see an SFU queue overflow at all."""
+        run_js_check(self, "network-loss-accounting")
+
+    def test_loss_metric_scale_matches_controller_thresholds(self):
+        """Dividing by the loss alone turns a smooth 0.5%-loss link into a 33%
+        reading, which permanently pins it to 3000k and makes the upgrade-back
+        unreachable. Ties the metric to the real 5/2.5/2% thresholds."""
+        run_js_check(self, "loss-metric-scale-matches-controller-thresholds")
+
+    def test_picture_loss_ratio_is_reported(self):
+        """The standard broadcast QoE metric was never computed even though
+        framesReceived and framesDecoded were both already being read."""
+        run_js_check(self, "picture-loss-ratio")
+
+    def test_freeze_watchdog_judges_decode_progress_as_a_rate(self):
+        """`decodedDelta === 0` was blind to a partially-wedged decoder and
+        could false-fire on a sampling artefact."""
+        run_js_check(self, "decoder-stall-detection")
+
 
     def test_abr_switching_state_machine(self):
         run_js_check(self, "abr-switching-state-machine")
@@ -2268,6 +2290,73 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertIn("process.env.BRIDGE_RTMP_PORT || '1935'", bridge)
         self.assertIn("process.env.RTSP_PORT || '8554'", bridge)
         self.assertIn("process.env.BRIDGE_API_BASE || 'http://127.0.0.1:8888'", bridge)
+
+    def test_silent_ffmpeg_fallback_is_reported(self):
+        """`ffmpeg_win/` is gitignored, so it exists in the MAIN checkout and in
+        NONE of this repo's ~40 git worktrees. A bridge started from a worktree
+        therefore took the PATH fallback SILENTLY, and the PATH ffmpeg on this
+        host is 8.0 -- the exact version that cannot bridge a WHIP AV1 source
+        (it loops forever on "Unexpected fragment continuation"). The failure
+        presented minutes later as a mystery circuit-breaker trip with nothing
+        in the log tying it to a missing directory. The fallback must announce
+        itself and name the version it found."""
+        bridge = read_text(BRIDGE_PATH)
+        self.assertIn("Bundled ffmpeg NOT found at:", bridge,
+                      "a missing bundled ffmpeg must be reported, not taken silently")
+        self.assertIn("PATH ffmpeg reports:", bridge,
+                      "the fallback must name the ffmpeg it actually resolved")
+        # The report must fire on the PATH fallback specifically, and must NOT
+        # fire when an explicit override or the bundled build is in use.
+        self.assertIn("process.env.BRIDGE_FFMPEG", bridge)
+        reporter = re.search(
+            r"if \(process\.env\.BRIDGE_FFMPEG\) return;.*?if \(resolved !== 'ffmpeg'\) return;",
+            bridge, re.S)
+        self.assertIsNotNone(reporter,
+                             "the ffmpeg report must be skipped for an override or a bundled build")
+        # The warning has to name the worktree cause, or it reads as a generic
+        # "not installed" message and the real fix stays hidden.
+        self.assertIn("gitignored", bridge,
+                      "the ffmpeg warning must explain that git worktrees lack ffmpeg_win/")
+
+    def test_host_identifies_the_checkout_it_starts(self):
+        """This repo has ~40 git worktrees plus a main checkout, each with its
+        own copy of app.js/server.js, and every port in mediamtx.yml is fixed
+        (3000/8888/1935/8554/8889/8189). So "my edit did nothing" is almost
+        always the OTHER checkout still serving. Both ends of that confusion
+        must now name themselves."""
+        launcher = read_text(LAUNCHER_PATH)
+        server = read_text(SERVER_PATH)
+
+        # The launcher prints which directory it is starting.
+        self.assertIn("Starting host from:", launcher,
+                      "start_host.ps1 must name the checkout it starts")
+        # ...and says so when that checkout is a worktree rather than the main
+        # one, since a worktree is missing the gitignored machine-local assets.
+        self.assertIn("WORKTREE", launcher,
+                      "start_host.ps1 must flag that it is running from a worktree")
+        # The two assets that make a worktree a strictly worse place to run:
+        # the AV1-capable ffmpeg, and the public tunnel.
+        self.assertIn("ffmpeg_win", launcher,
+                      "start_host.ps1 must warn when the bundled ffmpeg is absent")
+        self.assertIn("cloudflared_config.yml", launcher,
+                      "start_host.ps1 must warn when the tunnel config is absent")
+
+        # A port conflict must name the holder rather than just the port, since
+        # the actionable fact is WHICH checkout holds it.
+        self.assertIn("already held by", launcher,
+                      "a port conflict must name the process holding the port")
+        self.assertIn("CHECKOUT", launcher,
+                      "the port-conflict message must connect the conflict to this repo's checkouts")
+        # `OwningProcess` is a property of the connection, not of Win32_Process.
+        # Reading it off the process is what produced "node.exe (pid )" -- an
+        # empty pid in the one message whose entire purpose is identification.
+        self.assertIn("$holderPid = $conn.OwningProcess", launcher,
+                      "the pid must be read from the connection, not the process")
+
+        # The server serves __dirname, so it must say which directory that is.
+        self.assertIn("Serving from:", server,
+                      "server.js must name the directory it serves from")
+        self.assertIn("STATIC_DIR", server)
 
     def test_player_selects_path_by_decode_quality_and_warns_av1_only(self):
         # RTCRtpReceiver.getCapabilities lists software decoders too: a viewer

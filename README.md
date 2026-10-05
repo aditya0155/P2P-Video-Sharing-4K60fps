@@ -522,3 +522,244 @@ Two supporting facts, both measured rather than assumed:
 - **The readiness probe's per-attempt budget sat on top of the median cold start.** A cold `server.js` answers its first request in ~0.52 s (median of 25 boots on this host, max 1.05 s) while every later request takes 3–25 ms, and each attempt was allowed **0.5 s** — so the probe discarded its first attempt on most boots and only ever succeeded on a retry. The attempt budget is now 2 s inside a 15 s overall deadline.
 
 Pinned by `test_a_taken_port_is_retried_and_then_reported_with_the_childs_words` (a real listening socket holds the port; the suite must retry it *and* surface `already in use`) and `test_the_readiness_probe_outlasts_a_cold_first_response` (a server that takes 1.2 s to answer must still be recognised as ready). The blocker in the first test deliberately does **not** set `SO_REUSEADDR`: on Windows that would let `server.js` bind the same port anyway, so the collision would never occur and the test would pass for the wrong reason. It also accepts-and-drops in a thread, so each retry fails in milliseconds instead of sitting out the full per-attempt timeout five times over.
+
+## Sixth-pass audit — the freeze watchdog waited twice, and the loss metric had the wrong denominator
+
+Five earlier passes fixed the *controllers*. This pass found that two of the
+instruments they are driven by were themselves wrong, so the fixes could not be
+observed — and in one case made things worse.
+
+### The freeze watchdog spent ~6 s of black screen confirming a freeze
+
+`FREEZE_THRESHOLD_MS` (3000) was used as **both** the staleness detection bound
+and the confirmation window: three seconds to notice, then another three to
+believe it. The stats spec defines a freeze as
+`Max(3 * avg_frame_duration_ms, avg_frame_duration_ms + 150)` — about 167 ms at
+60 fps, 192 ms at 24 fps — so the 3 s constant was 12–18× the point at which a
+viewer would already call it a freeze, and it was charged twice.
+`specFreezeThresholdMs()` already computed the right bound but only *reported*
+it.
+
+Detection now uses the spec-derived threshold (falling back to 3 s when rVFC is
+unavailable, since it is the callback that keeps the staleness reading fresh),
+and confirmation is a separate `FREEZE_CONFIRM_MS`. That value has to be a whole
+number of the 1500 ms poll: **any value in (0, 1500] behaves identically**, so a
+"1200 ms" window reads as a deliberate margin while actually confirming on the
+very next poll. 3000 ms is two confirming polls — the smallest value that
+genuinely discriminates — and still recovers a real freeze in ~4.5 s against the
+old 6.0 s.
+
+### `decodedDelta === 0` was blind to the worst case, and could fire on a healthy stream
+
+An exact equality across a 1.5 s poll of a 1 s snapshot is wrong in both
+directions. It can fire on a sampling artefact during healthy playback (a
+2–4 s black screen for a stream that was never frozen), and it never fires on a
+decoder decoding a 60 fps stream at 2 fps — the single worst viewer experience
+there is, which reads `decodedDelta` of ~3 and looks "healthy" to `=== 0`.
+
+`isDecoderStalled(bytesDelta, decodedDelta, fps, elapsedSec)` now judges decode
+progress as a *rate* against what the stream is supposed to deliver. Two details
+are load-bearing and both were wrong in a first attempt:
+
+- **`elapsedSec` is required, not cosmetic.** `fps` is a per-second rate while
+  `decodedDelta` counts the window, so omitting the span compares 90 delivered
+  frames against an expectation of 15 and would tear down a healthy 60 fps
+  session.
+- **`fps` must be the stream's NOMINAL rate, never the decode rate**, and so
+  must the bound the watchdog compares against. Two first attempts got this
+  wrong in the same direction, and both had to be caught:
+  - Deriving `fps` from the same `framesDecoded` counter the watchdog judges
+    made the test self-defeating. At a 2 fps decode the published rate collapses
+    to 2, the expected minimum becomes `2 × 1.5 × 0.25 = 0.75` (floored to 1),
+    and the 3 frames that did arrive sail past it — the test returned *false*
+    for the exact slideshow it was written to catch, while passing a unit test
+    that hand-fed it `fps=60`.
+  - The staleness bound had the same defect from the other end.
+    `specFreezeThresholdMs(1000/R)` is by construction at least 3× the frame
+    duration at rate R, so sourcing it from the live rate means it inflates
+    *with* the collapse and the gap it caused can never cross it. Measured:
+    2 fps → 500 ms gap vs 1500 ms bound; 5 fps → 200 vs 600; 24 fps → 42 vs 192.
+    `isFrameStale` was false at **every** rate, and because the watchdog ANDs
+    it with the rate test, a correct rate-test verdict was discarded one line
+    later.
+
+  Both now read from a **peak-hold** (`stallReferenceFps`, rising immediately on
+  a genuine rate change, decaying 2 %/tick). The watchdog's acting bound
+  (`stallDetectMs`) comes from the peak-hold; the reported `specFreezeMs` stays
+  on the live rate, because the diagnostic report shows it beside `frameRate`
+  and the two must describe the same thing. Simulated: a 60 → 2 fps collapse now
+  recovers, while a genuine 60 → 24 fps source change with a healthy decoder
+  never fires (36 frames against a 9-frame minimum — 4× margin).
+
+### The emergency dwell was disabled exactly when it was needed
+
+`lateFrameEvidence` counts frames that *arrived* but never left the jitter
+buffer — a stronger signal than `droppedDelta`, on which the decoder's own drop
+counter reads clean while the viewer watches frames disappear. The
+accommodation gate already treated the two as equivalent, but `recentDropAt`
+(which lets a protective raise skip the 3 s dwell) was set only on
+`droppedDelta > 0`. So on a link where loss is absorbed by the buffer rather
+than the decoder — precisely the marginal case accommodation exists for — the
+gate opened, the target was raised, and the raise then sat behind the full
+dwell anyway. The 1200 ms emergency path was dead in exactly its intended
+scenario.
+
+### `lastLossPct` counted a repair rate, not a loss rate
+
+`packetsReceived` is defined to **include retransmissions**, so
+`dLost / (dRx + dLost)` reported a link losing 20 % of its packets and repairing
+all of them by RTX as ~0 % — and a MediaMTX write-queue overflow (a real,
+unrepairable drop) was invisible as a separate cause.
+
+`networkLossPct(dLost, dRetx, dDiscarded, dReceived)` nets retransmissions out
+of the numerator and charges local jitter-buffer discards to the denominator
+only. **The denominator must include `dReceived`.** An intermediate version of
+this fix divided by the loss alone, which measures "the share of lost packets
+RTX failed to repair" — a repair rate, and off by a factor of ~200 at
+realistic volumes: 3 lost with 2 repaired reads 33.3 % that way and 0.16 %
+this way. Since 33 % is above both the 5 % ABR threshold and the 2.5 % stress
+threshold, that version pinned a viewer whose picture was *fine* to the 3000 k
+rendition, held their buffer at 350 ms, and made the upgrade-back unreachable
+(it needs loss < 2 % for 20 consecutive ticks) for the rest of the session. A
+dedicated test now ties the metric to those three real thresholds rather than to
+its own output, which is what let the wrong units pass review in the first
+place.
+
+Picture-loss ratio — the standard broadcast QoE metric — is now computed and
+exported, along with the RTX repair rate, which separates "RTX is dead" from
+"RTX is arriving too late"; those two are indistinguishable from `packetsLost`
+alone. Every input was already being read.
+
+### Three ABR defects, two of them latches
+
+- **`lastLossPct` latched.** Written only on windows that had loss, so a clean
+  window — the one that skips the write — left the last bad reading standing
+  forever. The assignment is now unconditional.
+- **The two ABR predicates left a dead band.** Stress fired above 120 ms jitter
+  while calm required below 40 ms, so any link in between was neither and *both*
+  accumulators froze permanently: a struggling viewer never stepped down, and
+  one that had never came back. Both thresholds are now derived from one set of
+  constants, and `abrCalm` is an explicit relaxation of `abrStressed`. The
+  remaining 90–120 ms span is genuinely ambiguous rather than dead: it advances
+  the calm counter by `0.05` per tick instead of holding at zero. Holding is
+  what made the original 40–120 ms band terminal, but a *fast* fraction is
+  nearly as bad — at 0.25 the 20-second threshold arrives in 80 ticks, which
+  outlasts the 60 s switch cooldown, so a hovering link would upgrade to full
+  bitrate, stress again, and downgrade, trading a 2–4 s black screen every
+  ~80 s forever. 0.05 needs 400 ticks, so it terminates but cannot outrun the
+  cooldown.
+
+### Decode pressure and ABR ping-ponged the same viewer
+
+Both branches share the 60 s switch cooldown but did not exclude each other: a
+viewer ABR-downgraded to `live-av1` for a *network* reason could be moved back
+to full bitrate by the decode-pressure branch, the link would stress again 60 s
+later, and the pair traded two 2–4 s WHEP teardowns per minute forever. A new
+`abrDowngradedForLink` flag records which controller moved the viewer, cleared
+only on a genuine 20-second recovery or a fresh session. Relatedly,
+`decodeLagSec` now decays when there is no safe target, instead of sitting
+pinned and firing an unrequested switch the moment a rescue rendition became
+ready.
+
+### Catch-up was handed the wrong settle point, and latched at 1.08×
+
+`updateLiveEdgeCatchUp` compared the measured delay against
+`baseBufferTargetMs()`, which deliberately **excludes** the accommodation term.
+That exclusion is correct for the accommodation controller's own threshold and
+wrong here: Chrome's measured `jitterBufferDelay` converges on the target it was
+*granted*, so whenever accommodation is active the delay sits at the grant
+while catch-up saw a permanent ~1.1 s phantom excess. It ramped to its 1.08×
+cap and stayed there — visibly sped-up motion, with the browser's
+time-stretcher on the audio — and the self-verification then concluded the
+device "could not" catch up and handed the session to the hard 2–4 s rejoin.
+The mechanism degraded into exactly the teardown it exists to avoid. The
+settle point is now the granted target.
+
+### Which checkout is actually running
+
+This repo has **~40 git worktrees plus a main checkout**, each holding its own
+copy of `app.js`/`server.js`, and **every port in `mediamtx.yml` is fixed**
+(3000 / 8888 / 1935 / 8554 / 8889 / 8189). So the classic failure is silent:
+the host is already running from the main checkout, you double-click
+`start_host.bat` in a worktree, the second instance cannot bind, and the page
+you are looking at is the *other* checkout's code — presenting as "my edit did
+nothing" rather than as a port conflict.
+
+Three things now make that visible instead:
+
+- `start_host.ps1` prints `Starting host from: <absolute path>` as its first
+  line, and flags `this is a git WORKTREE` when `.git` is a file rather than a
+  directory.
+- `server.js` prints `Serving from: <absolute path>`, because `STATIC_DIR` is
+  `__dirname` — so it serves whichever copy it was launched from.
+- A port conflict now **names the holder** (process, pid, and full command line)
+  and connects it to the cause, instead of saying only that the port is busy.
+  (`OwningProcess` is a property of the *connection*, not of `Win32_Process`;
+  reading it off the process is what produced an empty pid in the one message
+  whose entire purpose is identification.)
+
+### The worktree is a strictly worse place to run from — and said nothing
+
+`ffmpeg_win/` and `cloudflared_config.yml` are in `.gitignore`, so by design they
+exist **only in the main checkout**. A host started from a worktree therefore
+degraded in two ways, silently:
+
+- **The AV1 leg.** `resolveFfmpegBinary()` fell back to the ffmpeg on `PATH`,
+  and on this host that is **8.0** — the version whose own comment says it cannot
+  bridge a WHIP AV1 source (it loops forever on `Unexpected fragment
+  continuation`). The fallback now announces itself, names the version it
+  actually resolved, and explains that worktrees lack `ffmpeg_win/`. A silence
+  here surfaced minutes later as a mysterious circuit-breaker trip with nothing
+  tying it to a missing directory.
+- **The tunnel.** No `cloudflared_config.yml` meant no public tunnel, so remote
+  viewers could not connect while `127.0.0.1` worked fine — the kind of split
+  that looks like a viewer-side bug.
+
+`start_host.ps1` warns about both at startup. Neither is fatal (an H.264 host
+with no tunnel still serves locally), but both are now named rather than
+discovered later.
+
+### Smaller items
+
+- The audio transceiver was added and then left entirely to the UA's codec
+  enumeration order, inside a function whose entire purpose is deterministic
+  ordering. `configureCodecPreferences(transceiver, kind)` now covers both
+  m-lines.
+- **Deliberately not changed:** the bridge emits H.264 **Main** while MediaMTX
+  advertises only `42e01f` (Constrained Baseline, level 3.1). Measured on this
+  host at 1080p60: the shipped block already produces level 42, and forcing
+  Constrained Baseline costs 0.3 % of bitrate (6063960 → 6046111 bytes over 8 s).
+  Since Main is a strict superset of Constrained Baseline, decoding is already
+  safe; the change was left alone rather than made for tidiness.
+
+### Known limitation, unchanged by this pass
+
+The watchdog still ANDs a **staleness** test with the **rate** test, and the
+staleness bound is the spec's (at least 3× the frame duration). So a decoder
+slowing to roughly **6–15 fps on a 60 fps source** remains structurally
+undetectable: at 10 fps the largest possible frame gap is 100 ms against a
+167 ms bound, so `isFrameStale` can never be true however broken the decoder
+is. This pass widened the detectable envelope from "nothing below 15 fps" to
+"everything below ~5.5 fps" (verified in simulation: a 60 → 2 fps collapse now
+recovers, and a genuine 60 → 24 fps source change never false-fires), but it did
+not close the middle band. Closing it means making the staleness half relative
+to the decode rate too, or turning the AND into an OR with a much longer
+confirmation on the rate test alone — both larger changes than this pass, and
+neither is a regression: the old code missed everything below 15 fps as well.
+
+
+- **Eco Mode measured its own catch-up.** The drop window's comment promised to
+  exclude ticks inside a live-edge catch-up and there was no guard. Draining at
+  1.08× makes the UA discard buffered frames, which is exactly what
+  `framesDropped` counts, so a viewer who drifted behind the live edge got a
+  spurious "reduced decorative effects" notice and permanent CSS degradation
+  for a decoder that was never under pressure.
+
+accommodation gate already treated the two as equivalent, but `recentDropAt`
+(which lets a protective raise skip the 3 s dwell) was set only on
+`droppedDelta > 0`. So on a link where loss is absorbed by the buffer rather
+than the decoder — precisely the marginal case accommodation exists for — the
+gate opened, the target was raised, and the raise then sat behind the full
+dwell anyway. The 1200 ms emergency path was dead in exactly its intended
+scenario.
+

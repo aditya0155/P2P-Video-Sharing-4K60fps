@@ -1256,6 +1256,17 @@ server.headersTimeout = 66000;
 
 server.listen(PORT, '127.0.0.1', () => {
     console.log('Rydius Stream host is running on this laptop.');
+    // WHICH CHECKOUT IS SERVING. `STATIC_DIR` is `__dirname`, so this process
+    // serves whichever copy of index.html/app.js it was launched from — and this
+    // repo has ~40 git worktrees plus a main checkout. Running the host from
+    // the main checkout while editing a worktree serves stale code with no
+    // symptom other than "my change did nothing", and every port in
+    // mediamtx.yml (3000/8888/1935/8554/8889/8189) is fixed, so the second
+    // instance fails to bind instead of replacing the first. Printing the
+    // absolute path makes a wrong-checkout run self-evident in the first line of
+    // output, and it doubles as a cross-check against the banner start_host.ps1
+    // prints for the same process tree.
+    console.log(`Serving from:    ${STATIC_DIR}`);
     console.log(`Local page:    http://127.0.0.1:${PORT}/streaming/`);
     console.log(`WebRTC signal: http://127.0.0.1:${MEDIAMTX_PORT} (proxied at /stream-api/**)`);
     console.log(`MediaMTX API:  http://127.0.0.1:${MEDIAMTX_API_PORT} (proxied at /stream-api/v3/**)`);
