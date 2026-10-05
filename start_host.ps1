@@ -204,6 +204,12 @@ try {
         }
         throw "Port $webPort is already in use. Stop the other site server or set PORT to a free port before starting."
     }
+
+    Write-Host 'Validating MediaMTX configuration...' -ForegroundColor Cyan
+    & $mediamtxPath --validate-conf $configPath
+    if ($LASTEXITCODE -ne 0) { throw 'MediaMTX configuration validation failed.' }
+
+    if (Test-LocalTcpPort 8889) {
         $listener = Get-NetTCPConnection -LocalPort 8889 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
         $existing = if ($listener) { Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" } else { $null }
         $expectedExe = (Resolve-Path -LiteralPath $mediamtxPath).Path
