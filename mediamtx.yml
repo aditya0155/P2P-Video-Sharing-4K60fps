@@ -80,9 +80,35 @@ writeTimeout: 20s
 ###############################################
 
 # RTSP exists only so codec_bridge.js can read the source back (RTMP cannot
-# serve AV1; RTSP can). Bound to loopback: nothing outside this laptop uses it.
+# serve AV1; RTSP can).
+#
+# `rtspAddress` pins ONLY the TCP/RTSP listener. It does not scope the UDP
+# transports. With `rtspTransports` left at the MediaMTX default
+# ([udp, multicast, tcp]) the server ALSO binds rtpAddress/rtcpAddress
+# (:8000 / :8001) on EVERY interface -- which is precisely what the "bound
+# to loopback" claim that used to sit on this line asserted did not happen.
+# Verified against the bundled v1.21.1 with this exact config:
+#   INF [RTSP] started with listeners on 127.0.0.1:8554 (TCP/RTSP),
+#                                        :8000 (UDP/RTP), :8001 (UDP/RTCP)
+# and Get-NetUDPEndpoint reports LocalAddress "::" for both UDP ports.
+#
+# That cost twice over. Anyone on the LAN or the Tailscale interface could
+# publish and read over unauthenticated RTSP (the default `any` user grants
+# publish+read+playback on every path), and because that bind is FATAL, any
+# other process already holding UDP 8000 -- a second MediaMTX, a leftover
+# from a crashed run, an unrelated tool -- aborts the WHOLE process: the
+# API, WebRTC, RTMP and SRT listeners never come up, so an RTSP-only
+# mistake takes the entire broadcast down rather than degrading RTSP.
+# start_host.ps1 pre-flights TCP 8889 and UDP 8189 but never 8000, so this
+# surfaced only as a generic "MediaMTX exited during startup with code N".
+#
+# TCP-only is safe here: RTSP always performs its handshake over TCP, and
+# codec_bridge.js passes `-rtsp_transport tcp` at BOTH of its RTSP call
+# sites (the GOP ffprobe and the transcode). Nothing else in this project
+# speaks RTSP, and the WebRTC/WHEP path does not read this key at all.
 rtsp: yes
 rtspAddress: 127.0.0.1:8554
+rtspTransports: [tcp]
 hls: no
 moq: no
 

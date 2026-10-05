@@ -537,6 +537,32 @@ class LaptopHostChecks(unittest.TestCase):
         self.assertIsNotNone(rtsp, "missing rtspAddress in mediamtx.yml")
         self.assertTrue(rtsp.group(1).startswith("127.0.0.1:"),
                         "RTSP must bind loopback only, got {}".format(rtsp.group(1)))
+        # ...but rtspAddress ALONE does not achieve that. It pins only the
+        # TCP/RTSP listener; with rtspTransports left at the MediaMTX default
+        # ([udp, multicast, tcp]) the server also binds rtpAddress/rtcpAddress
+        # (:8000/:8001) on EVERY interface. Verified against the bundled
+        # v1.21.1: "[RTSP] started with listeners on 127.0.0.1:8554
+        # (TCP/RTSP), :8000 (UDP/RTP), :8001 (UDP/RTCP)" and Get-NetUDPEndpoint
+        # reports LocalAddress "::" for both.
+        #
+        # That is a broadcast-wide outage, not an RTSP-only one: the bind is
+        # FATAL, so anything already holding UDP 8000 aborts the whole
+        # MediaMTX process and the API/WebRTC/RTMP/SRT listeners never come
+        # up. start_host.ps1 pre-flights TCP 8889 and UDP 8189 but never 8000,
+        # so it surfaced only as a generic "MediaMTX exited during startup".
+        transports = re.search(r"^rtspTransports:\s*\[(.*?)\]\s*$", self.config, re.MULTILINE)
+        self.assertIsNotNone(transports,
+                             "missing rtspTransports in mediamtx.yml; without it MediaMTX "
+                             "binds UDP 8000/8001 on every interface, not loopback")
+        enabled = {t.strip().lower() for t in transports.group(1).split(",") if t.strip()}
+        self.assertNotIn("udp", enabled,
+                         "rtspTransports enables udp, so RTSP RTP binds :8000 on all "
+                         "interfaces; the bridge only ever reads RTSP over TCP")
+        self.assertNotIn("multicast", enabled,
+                         "rtspTransports enables multicast, binding an all-interface socket")
+        self.assertEqual(enabled, {"tcp"},
+                         "this project only ever speaks RTSP over TCP "
+                         "(codec_bridge.js passes -rtsp_transport tcp)")
         self.assertIn('runOnAvailable: node "codec_bridge.js"', self.config)
         self.assertIn('runOnUnavailable: node "codec_bridge.js" --cleanup', self.config)
         self.assertIn("  live-av1:", self.config)
