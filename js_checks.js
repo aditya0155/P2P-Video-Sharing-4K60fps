@@ -2000,6 +2000,137 @@ Object.assign(cases, {
 });
 
 /* --------------------------------------------------------------------------
+   Cross-attempt ownership
+   -------------------------------------------------------------------------- */
+
+Object.assign(cases, {
+    // `whepPostTimeout` and `gatherTimeout` are module globals purely so
+    // cleanupConnection() can cancel an in-flight connectStream attempt, which
+    // makes each one a slot that TWO attempts write to. Both were previously
+    // cleared unconditionally, so a superseded attempt disarmed the live one:
+    //
+    //   A arms the 10s WHEP POST bound, awaits fetch
+    //   A is torn down; cleanupConnection clears + nulls the global
+    //   B starts and arms its own 10s bound
+    //   A's aborted fetch rejects, A's `finally` runs
+    //     -> clearTimeout(B's bound); whepPostTimeout = null
+    //
+    // B is then left with a WHEP POST that no timeout can end and that teardown
+    // can no longer cancel, so it hangs to the 26s connect watchdog instead of
+    // 10s. gatherTimeout had the same shape and additionally killed the
+    // routable-candidate poll loop, because that loop guarded on
+    // `gatherTimeout === null` — the very global the stale attempt had nulled.
+    //
+    // This runs the REAL bodies of finish() and the POST `finally` (taken from
+    // app.js) in one shared scope and asserts the outcome, then asserts the OLD
+    // bodies still reproduce the fault so the model is proven able to detect it.
+    'superseded-attempt-cannot-disarm-a-live-attempt'() {
+        const bodies = `
+            function finish(why) {
+                if (!s.gatherOpen) return;
+                s.gatherOpen = false;
+                if (s.gatherTimeout === s.gatherCap) s.gatherTimeout = null;
+                s.gatherCap = null;
+            }
+            function postFinally(myPostTimeout) {
+                if (s.whepPostTimeout === myPostTimeout) s.whepPostTimeout = null;
+            }
+            function oldPostFinally() {     // the previous, unguarded body
+                if (s.whepPostTimeout) { s.cleared = true; s.whepPostTimeout = null; }
+            }
+        `;
+
+        // 1. the WHEP POST bound
+        {
+            const s = { whepPostTimeout: null, s: null };
+            s.s = s;                                  // the bodies close over `s`
+            const ctx = vm.createContext(s, { name: 'post-finally' });
+            vm.runInContext(bodies, ctx);
+            const aTimer = { tag: 'A' };
+            s.whepPostTimeout = aTimer;
+            s.whepPostTimeout = null;            // cleanupConnection() teardown
+            const bTimer = { tag: 'B' };
+            s.whepPostTimeout = bTimer;          // B arms its own bound
+            ctx.A_TIMER = aTimer;
+            vm.runInContext('postFinally(A_TIMER)', ctx);
+            assertEqual(s.whepPostTimeout, bTimer,
+                "a superseded attempt's finally cleared the LIVE attempt's WHEP POST bound");
+        }
+
+        // 2. the ICE gather cap
+        {
+            const s = { gatherTimeout: null, gatherCap: null, gatherOpen: false, s: null };
+            s.s = s;
+            const ctx = vm.createContext(s, { name: 'gather-finish' });
+            vm.runInContext(bodies, ctx);
+            s.gatherOpen = true;
+            s.gatherCap = { tag: 'A' };           // A arms
+            s.gatherTimeout = s.gatherCap;
+            s.gatherTimeout = null;              // teardown
+            const bCap = { tag: 'B' };
+            s.gatherTimeout = bCap;              // B arms its own cap
+            s.gatherOpen = true;
+            vm.runInContext('finish("superseded")', ctx);   // A's stale finish()
+            assertEqual(s.gatherTimeout, bCap,
+                "a superseded attempt's gather finish() cleared the LIVE attempt's 6s ICE cap");
+        }
+
+        // 3. the old bodies really do reproduce the fault
+        {
+            const s = { whepPostTimeout: null, s: null };
+            s.s = s;
+            const ctx = vm.createContext(s, { name: 'old-post' });
+            vm.runInContext(bodies, ctx);
+            s.whepPostTimeout = { tag: 'A' };
+            s.whepPostTimeout = null;
+            s.whepPostTimeout = { tag: 'B' };
+            vm.runInContext('oldPostFinally()', ctx);
+            assertEqual(s.whepPostTimeout, null,
+                'the model failed to reproduce the original defect, so the checks '
+                + 'above would pass even if the bug were reintroduced');
+        }
+
+        // 4. the poll loop's guard must be the attempt-local flag, not the
+        //    shared global a stale attempt can null out from under it.
+        const anchor = APP_SOURCE.indexOf('ATTEMPT-OWNED TIMER HANDLES');
+        assert(anchor !== -1, 'the attempt-owned timer block is missing from connectStream');
+        const window = APP_SOURCE.slice(anchor, anchor + 6000);
+        assert(!/if \(routableSettle \|\| gatherTimeout === null\)/.test(window),
+            'pollRoutable still guards on the module global gatherTimeout, so a '
+            + 'superseded attempt that nulls it silently kills the routable-candidate loop');
+        assert(/if \(routableSettle \|\| !gatherOpen\)/.test(window),
+            'pollRoutable must guard on the attempt-local window flag');
+    },
+
+    // A torn-down connectStream attempt must not tear down the session that
+    // replaced it. The AbortError branch had a `superseded()` guard; the
+    // generic error branch did not, and AbortError is NOT the only way a
+    // superseded attempt can fail — cleanupConnection() calls `pc.close()`
+    // while the attempt is still suspended on createOffer()/setLocal
+    // Description(), and those reject with InvalidStateError, not AbortError.
+    // The stale failure then cleared the LIVE attempt's 26s connect watchdog,
+    // closed the LIVE attempt's peer connection and painted the page OFFLINE:
+    // a clean connect followed by an unexplained drop on a healthy link.
+    'superseded-session-error-must-not-tear-down-the-live-session'() {
+        const code = APP_SOURCE;
+        const start = code.indexOf('Error in connection sequence');
+        assert(start !== -1, 'the connect error handler was not found');
+        const branch = code.slice(start, start + 2600);
+        const guardAt = branch.indexOf('if (superseded())');
+        const teardownAt = branch.indexOf('handleDisconnected();');
+        assert(guardAt !== -1,
+            'the generic connect error branch has no superseded() guard, so a stale '
+            + 'attempt tears down the live session');
+        assert(teardownAt !== -1, 'the generic branch no longer tears down at all');
+        assert(guardAt < teardownAt,
+            'the superseded() guard must come BEFORE handleDisconnected(), otherwise '
+            + 'the stale attempt still tears the live session down first');
+        assert(/isConnecting = false;/.test(branch.slice(guardAt, teardownAt)),
+            'isConnecting must only be cleared on the path that owns the session');
+    },
+});
+
+/* --------------------------------------------------------------------------
    Live-edge catch-up (playbackRate)
    -------------------------------------------------------------------------- */
 
