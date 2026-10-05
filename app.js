@@ -209,7 +209,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // drifted from the live edge. superviseAdaptiveBuffer() runs every stats tick.
     let lastPacketsReceived = 0;        // RX baseline for interval loss calculation
     let lastPacketsLost = 0;            // Lost baseline for interval loss calculation
+    let lastRetransmittedPackets = 0;   // RTX baseline (packetsReceived includes retransmits)
+    let lastPacketsDiscarded = 0;       // Baseline for SFU-side drop detection
     let lastFramesDropped = 0;          // Baseline for frame-drop pressure detection
+    let lastPlrPct = null;              // Picture-loss ratio over the last stats window (%)
+    let lastRepairRatePct = null;       // Share of loss repaired by RTX in the last window (%)
     let dropWindow = [];                // rolling per-tick frame-drop counts (last 3 stats ticks)
     let dropTickPending = true;         // first tick after beginStatsLoop only re-baselines
     let stressRunSec = 0;               // Consecutive seconds of jitter/loss stress
@@ -283,6 +287,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let specFreezeMs = null;            // Spec freeze threshold at the current frame rate (ms)
     let abrBadSec = 0;                  // Consecutive seconds of measured network stress (rendition switching)
     let abrCalmSec = 0;                 // Consecutive calm seconds (rendition upgrade)
+    let abrDowngradedForLink = false;   // ABR moved this viewer down (not decode pressure)
     let lastRenditionSwitchAt = -60000; // ABR switch cooldown anchor (performance.now ms)
     let renditionPathsItems = null;     // Latest /v3/paths/list snapshot while connected (ABR ladder)
     let renditionPollInterval = null;   // Slow paths poll that keeps the ladder fresh while connected
@@ -322,11 +327,43 @@ document.addEventListener('DOMContentLoaded', () => {
     let freezeCheckInterval = null;       // Interval timer for the watchdog poller
     let lastDecodedFrames = 0;            // Last framesDecoded value from getStats()
     let lastBytesCount = 0;              // Last bytesReceived value from getStats()
+    let lastFreezeCheckAt = 0;           // performance.now() of the previous watchdog poll
+    // PEAK-HOLD of the stream's nominal frame rate, used as the freeze
+    // watchdog's expectation. It must be something the DECODER cannot drag
+    // down with it — deriving it from the decode counter made the stall test
+    // vacuous. See the inboundSnapshot publish site and isDecoderStalled.
+    let stallReferenceFps = null;
+    // Staleness bound the watchdog ACTS on, derived from `stallReferenceFps`
+    // (the peak-hold) rather than the live frame rate. Distinct from
+    // `specFreezeMs`, which is the live-rate bound reported to diagnostics:
+    // a collapsing decoder inflates the live bound past the very gap it caused,
+    // so the watchdog needs a bound that does not move with the fault.
+    let stallDetectMs = null;
     let frozenSince = 0;                  // When freeze was first detected (0 = not frozen)
     let isRecovering = false;             // Guard to prevent recovery storms
     let recoveryCount = 0;                // How many auto-recoveries we've done this session
     let healthyPlaybackSeconds = 0;      // Consecutive healthy playback seconds (resets recovery counter)
-    const FREEZE_THRESHOLD_MS = 3000;     // 3.0s without frame progression when network packets are flowing
+    // Watchdog timing. These are TWO different jobs and were one constant.
+    //
+    // FREEZE_THRESHOLD_MS is the FALLBACK staleness bound, used only when the
+    // spec threshold cannot be computed (no measured frame rate yet) or when
+    // rVFC is unavailable to keep the staleness reading fresh. The spec-derived
+    // bound is ~167ms at 60fps — see specFreezeThresholdMs().
+    //
+    // FREEZE_CONFIRM_MS is how long a detected stall must persist before the
+    // session is torn down. It stays generous on purpose: recovery costs 2-4s
+    // of black, which is worse than the short freeze it would fix, so a
+    // transient glitch must clear itself before the session is rebuilt.
+    //
+    // It must be a whole number of POLL intervals. The watchdog polls every
+    // 1500ms, so ANY value in (0, 1500] behaves identically to 1500 — a
+    // "1200ms" confirmation window reads as a deliberate safety margin while
+    // actually confirming on the very next poll, one poll and nothing more.
+    // 3000 is two consecutive confirming polls, which is the smallest value
+    // that genuinely discriminates, and it still recovers a real freeze in
+    // ~4.5s against the old 6.0s.
+    const FREEZE_THRESHOLD_MS = 3000;     // Fallback staleness bound (no rVFC / no measured rate)
+    const FREEZE_CONFIRM_MS = 3000;       // Sustained-stall confirmation (2 x the 1500ms poll)
     const MAX_RECOVERIES = 10;            // Allow up to 10 recoveries (with decay back to 0)
     let stallTimeout = null;
     let disconnectGraceTimer = null;      // Grace window before treating an ICE 'disconnected' blip as a real drop
@@ -666,14 +703,39 @@ document.addEventListener('DOMContentLoaded', () => {
         return rebuilt.join('\r\n');
     }
 
-    // Configure hardware codec preference if supported by browser
-    function configureCodecPreferences(transceiver) {
+    // Configure hardware codec preference if supported by browser.
+    // `kind` selects the m-line's capability set, so the same ordering rule
+    // governs video and audio rather than video having an opinion and audio
+    // being left to whatever order the UA happened to enumerate.
+    function configureCodecPreferences(transceiver, kind = 'video') {
         if (!('setCodecPreferences' in transceiver) || !('RTCRtpReceiver' in window) || !('getCapabilities' in RTCRtpReceiver)) {
             return;
         }
         try {
-            const capabilities = RTCRtpReceiver.getCapabilities('video');
+            const capabilities = RTCRtpReceiver.getCapabilities(kind);
             if (!capabilities || !capabilities.codecs) return;
+
+            if (kind === 'audio') {
+                // Opus first, and specifically the low-delay configuration. The
+                // publisher side already encodes with `-application lowdelay`
+                // (codec_bridge.js), and an Opus DTX/CELT mode mismatch shows
+                // up as periodic concealment clicks on an otherwise clean link.
+                // Everything else (G.711, telephone-EVS variants) is a
+                // last-resort fallback, not a first choice.
+                const prioritizedAudio = capabilities.codecs.slice().sort((a, b) => {
+                    const score = (c) => {
+                        const mime = (c.mimeType || '').toLowerCase();
+                        if (mime.includes('opus')) return 100;
+                        if (mime.includes('red')) return 90;      // audio RED, i.e. repair
+                        if (mime.includes('ulpfec')) return 90;
+                        return 10;
+                    };
+                    return score(b) - score(a);
+                });
+                transceiver.setCodecPreferences(prioritizedAudio);
+                console.log("[WebRTC] Audio codec preferences set (Opus first).");
+                return;
+            }
 
             // Prioritize H.264 High Profile (NVENC hardware decode), then HEVC, then AV1
             const prioritizedCodecs = capabilities.codecs.slice().sort((a, b) => {
@@ -845,6 +907,130 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!Number.isFinite(samplesDurationDeltaSec) || !Number.isFinite(wallSec)) return null;
         if (wallSec <= 0 || samplesDurationDeltaSec <= 0) return null;
         return ((samplesDurationDeltaSec - wallSec) / wallSec) * 1e6;
+    }
+
+    // True network loss, as opposed to the raw `dLost / (dRx + dLost)` ratio the
+    // stats loop used to publish.
+    //
+    // Two spec facts make that ratio wrong in both directions:
+    //   1. `packetsReceived` is defined to INCLUDE retransmissions, so a link
+    //      that loses 20% of its packets and repairs 100% of them by RTX reads
+    //      ~0% loss. RTX is negotiated and working, so the viewer is smooth and
+    //      must NOT be told it is stressed.
+    //   2. `packetsLost` is the count of packets the receiver never got, which
+    //      already excludes repaired ones, so the ratio is not "loss", it is
+    //      "unrecovered loss" — but the retransmission is double-counted in the
+    //      denominator's favour.
+    //
+    // Meanwhile `packetsDiscarded` is the packet the JITTER BUFFER threw away
+    // locally, and MediaMTX's reader queue overflow (documented in
+    // _research/bwe.md: "a circular buffer that stores outgoing packets and
+    // drops packets if full") shows up as a burst of loss that no amount of
+    // receiver-side buffering can repair. Treating it separately lets the ABR
+    // ladder tell "the link is thin" (loss, which a lower rendition fixes) from
+    // "the buffer is too small" (discard, which a larger target fixes).
+    //
+    // Returns NET loss as a fraction of everything the link OFFERED, so the
+    // number keeps the same physical meaning the ABR thresholds were tuned
+    // against: "what fraction of the link did we fail to receive?"
+    //
+    // The denominator MUST include `dReceived`. An earlier version of this
+    // function divided by `lost + discarded` alone, which measures "the share
+    // of lost packets that RTX failed to repair" — a repair-rate, not a loss
+    // rate — and it is off by one to two orders of magnitude at realistic
+    // volumes. Measured at ~625 packets/s: 3 lost with 2 repaired reads 33.3%
+    // under that denominator and 0.16% under this one. Since 33% is above the
+    // 5% ABR threshold and the 2.5% stress threshold, a viewer on a link whose
+    // picture is perfectly fine would be pinned to the 3000k rendition, held at
+    // the 350ms buffer, and — because `abrCalm` needs loss < 2% for 20
+    // CONSECUTIVE ticks and such a link never dips that low — never allowed to
+    // upgrade back for the rest of the session. The whole point of netting out
+    // retransmissions is to stop punishing a viewer for loss the transport
+    // already repaired; dividing by the loss alone threw that away.
+    //
+    // `dReceived` is the received count for the window, which per spec
+    // INCLUDES retransmissions — and that is exactly what makes the ratio
+    // correct: repaired packets land in the numerator's absence and the
+    // denominator, which is what "arrived" should mean.
+    // (Pure — unit-tested in js_checks.js `network-loss-accounting`.)
+    function networkLossPct(dLost, dRetransmitted, dDiscarded, dReceived) {
+        const lost = Number.isFinite(dLost) ? Math.max(0, dLost) : 0;
+        const retx = Number.isFinite(dRetransmitted) ? Math.max(0, dRetransmitted) : 0;
+        // A retransmission can only repair a loss, never exceed it. Clamping
+        // keeps a counter that resets/wraps on stream restart (RTX counts are
+        // per-SSRC and drop to 0 when the source re-keys) from producing a
+        // negative numerator and a nonsense negative loss percentage.
+        const netLost = Math.max(0, lost - retx);
+        const discarded = Number.isFinite(dDiscarded) ? Math.max(0, dDiscarded) : 0;
+        const received = Number.isFinite(dReceived) ? Math.max(0, dReceived) : 0;
+        // Everything the link put on the wire this window: what arrived, plus
+        // what did not, plus what arrived and was then discarded locally. A
+        // local discard is still a picture the viewer did not get, so it has to
+        // be in the offered total even though it never appears in packetsLost.
+        const offered = received + lost + discarded;
+        if (offered <= 0) return 0;
+        return Math.min(100, (netLost / offered) * 100);
+    }
+
+    // Picture-loss ratio — the standard broadcast QoE metric, and the one number
+    // a viewer or broadcaster actually asks for ("how much of the stream actually
+    // arrived?"). Every input was already being read into the stats loop
+    // (`framesReceived` / `framesDecoded`); nothing combined them. Deliberately
+    // measured as a RATE over a window rather than as a cumulative ratio, so a
+    // mid-session source change or a decode restart does not permanently bias it.
+    // (Pure — unit-tested in js_checks.js `picture-loss-ratio`.)
+    function pictureLossRatioPct(dReceived, dDecoded) {
+        const received = Number.isFinite(dReceived) ? Math.max(0, dReceived) : 0;
+        const decoded = Number.isFinite(dDecoded) ? Math.max(0, dDecoded) : 0;
+        if (received <= 0) return null;              // no frames: undefined, not 0%
+        return Math.min(100, Math.max(0, ((received - decoded) / received) * 100));
+    }
+
+    // Is the decoder actually STALLED, as opposed to merely slow?
+    //
+    // The watchdog used to ask `decodedDelta === 0`, which is wrong twice over.
+    //
+    //  - It is an exact equality across a 1.5s poll of a 1s snapshot, so it can
+    //    fire on a sub-poll sampling artefact during perfectly healthy playback:
+    //    two consecutive 1s snapshots that happen to land inside the same 1.5s
+    //    poll window legitimately report the same count. That is a 2-4s black
+    //    screen for a stream that was never frozen.
+    //  - It is blind in the other direction, which is the one that matters. A
+    //    decoder that is decoding at 2fps while the stream is 60fps is a total
+    //    slideshow — the worst possible viewer experience — and it reports
+    //    `decodedDelta` of ~3 over the window, never 0. The viewer sees
+    //    near-constant freezing, and the watchdog that exists to catch exactly
+    //    that never fires.
+    //
+    // So: packets are arriving (bytesDelta proves the transport is alive) AND
+    // the decoder is producing far fewer frames than the stream's own rate says
+    // it should. The 25% floor tolerates a coarse poll: a healthy decoder
+    // produces `fps * elapsed` frames in the window and cannot plausibly fall
+    // below a quarter of that, while a wedged one produces a handful.
+    //
+    // `elapsedSec` is REQUIRED and is not optional sugar. The stats loop ticks
+    // every 1s and this watchdog every 1.5s, so `decodedDelta` spans the
+    // watchdog's window while `fps` is a per-second rate: comparing the two
+    // without the span compares a 1.5-second count against a 1-second
+    // expectation and flags a perfectly healthy 60fps stream (90 frames
+    // delivered against an expectation of 15). The span has to be multiplied in
+    // or the test is simply wrong.
+    //
+    // `fps` is the stream's own measured rate; passing null (rate not yet
+    // established) falls back to requiring a hard zero, which is the one case
+    // where "no baseline" cannot be evidence of a stall.
+    // (Pure — unit-tested in js_checks.js `decoder-stall-detection`.)
+    function isDecoderStalled(bytesDelta, decodedDelta, fps, elapsedSec, stallFraction = 0.25) {
+        if (!(bytesDelta > 5000)) return false;          // transport is not alive
+        if (!(decodedDelta >= 0)) return false;          // counter reset: no evidence
+        if (decodedDelta === 0) return true;             // hard stop, rate or not
+        if (!Number.isFinite(fps) || fps <= 0) return false; // no baseline to judge against
+        if (!Number.isFinite(elapsedSec) || elapsedSec <= 0) return false;
+        // Frames the decoder should have produced in THIS window at the stream's
+        // own rate, floored at 1 so a sub-1fps nominal rate cannot demand less
+        // than the single frame we already observed.
+        const expectedMin = Math.max(1, fps * elapsedSec * stallFraction);
+        return decodedDelta < expectedMin;
     }
 
     // The spec's definition of a video freeze, used to separate a REAL stall
@@ -1318,7 +1504,29 @@ document.addEventListener('DOMContentLoaded', () => {
         // ago.
         if (performance.now() - avgPlayoutDelayAt > 3000) return false;
 
-        const wanted = catchUpPlaybackRate(avgPlayoutDelayMs, baseBufferTargetMs(), catchUpRate, CATCHUP_MAX_RATE);
+        // The settle point MUST be the target that was actually GRANTED to the
+        // receiver, not the bare base.
+        //
+        // `baseBufferTargetMs()` deliberately EXCLUDES `accommodationTargetMs`
+        // (see its own comment) — which is correct for the accommodation
+        // controller's own threshold but wrong here. Chrome's measured
+        // `jitterBufferDelay` converges to whatever target it was given, so
+        // whenever accommodation is active the measured delay sits AT the grant
+        // (say 1300ms) while catch-up was comparing it against the 180ms base.
+        // That is a permanent ~1100ms phantom "excess", so catch-up ramps to its
+        // 1.08x cap and STAYS there for the rest of the session: the viewer
+        // watches visibly sped-up motion, and with no `preservesPitch` set the
+        // browser runs its time-stretcher over the audio too. Worse, the
+        // self-verification below then reads "saturated AND the delay is not
+        // falling", concludes catch-up is useless on this device, disables it —
+        // and the session falls through to the hard rejoin and its 2-4s black
+        // screen. The mechanism degraded into exactly the teardown it exists to
+        // avoid.
+        //
+        // Using the current target makes the excess zero while accommodation is
+        // holding the buffer, so the rate returns to 1.0 and stays there.
+        const settlePointMs = Math.max(currentBufferTargetMs(), grantedTargetMs || 0);
+        const wanted = catchUpPlaybackRate(avgPlayoutDelayMs, settlePointMs, catchUpRate, CATCHUP_MAX_RATE);
         if (wanted !== catchUpRate) {
             try {
                 player.playbackRate = wanted;
@@ -1427,15 +1635,62 @@ document.addEventListener('DOMContentLoaded', () => {
         // every switch waits out a 60s cooldown so a flapping link cannot
         // produce reconnect storms. Applies only to H264 sources with a ready
         // live-av1 rendition — AV1-source viewers already play the native path.
-        const abrStressed = (lastLossPct !== null && lastLossPct > 5)
-            || (lastNetJitterMs !== null && lastNetJitterMs > 120);
-        const abrCalm = (lastLossPct === null || lastLossPct < 2)
-            && (lastNetJitterMs === null || lastNetJitterMs < 40);
+        // Both thresholds are derived from ONE pair of constants so the calm
+        // predicate can never again drift away from the stress predicate and
+        // re-open a band where neither fires. The band is the whole bug: with
+        // stress above 120ms and calm below 40ms, any link between them was
+        // NEITHER, so `abrBadSec` froze below its 8s threshold (a struggling
+        // viewer never stepped down) and `abrCalmSec` froze below its 20s
+        // threshold (a viewer that HAD stepped down never came back). That is
+        // the accumulator freeze the "no else" comment below was written to
+        // prevent, reintroduced one level up in the predicates.
+        const ABR_JITTER_STRESS_MS = 120;   // above this the link cannot carry full bitrate
+        const ABR_JITTER_CALM_MS = 90;      // below this the link is comfortably clear of it
+        const ABR_LOSS_STRESS_PCT = 5;
+        const ABR_LOSS_CALM_PCT = 2;
+        const abrStressed = (lastLossPct !== null && lastLossPct > ABR_LOSS_STRESS_PCT)
+            || (lastNetJitterMs !== null && lastNetJitterMs > ABR_JITTER_STRESS_MS);
+        // `abrCalm` is a strict RELAXATION of `abrStressed` in the dimension that
+        // matters: the `!abrStressed` term guarantees the calm branch is
+        // REACHABLE on every tick the stress branch is not. The 90-120ms span
+        // is genuinely not a good link, so it is not counted as calm — but it
+        // must not be counted as AMBIGUOUS either, because "ambiguous" that
+        // holds BOTH counters still is the original bug in a narrower band: a
+        // link pinned at 100ms would never accumulate the 20 calm seconds that
+        // return it to full quality, so one downgrade would be permanent. The
+        // jitter reading is a doubly-smoothed EWMA that hovers, so a link
+        // sitting at 100ms is a link whose jitter is FALLING, not one stuck.
+        //
+        // So the ambiguous band advances the calm counter by a fraction rather
+        // than not at all. It cannot upgrade as fast as a clean link, and it
+        // cannot be terminal. `lastNetJitterMs` hovering just under the stress
+        // bound earns slow progress, which is exactly the right weighting.
+        const abrCalm = !abrStressed
+            && (lastLossPct === null || lastLossPct < ABR_LOSS_CALM_PCT)
+            && (lastNetJitterMs === null || lastNetJitterMs < ABR_JITTER_CALM_MS);
+        // Between the calm and stress bounds: ambiguous, not calm, not stressed.
+        // Counts at 1/4 rate so it still terminates.
+        const abrAmbiguous = !abrStressed && !abrCalm
+            && (lastLossPct === null || lastLossPct < ABR_LOSS_STRESS_PCT);
         if (abrStressed) {
             abrBadSec += 1;
             abrCalmSec = 0;
         } else if (abrCalm) {
             abrCalmSec += 1;
+            abrBadSec = 0;
+        } else if (abrAmbiguous) {
+            // Fractional accumulation rather than a reset: a marginal link
+            // drifts toward recovery instead of being pinned forever.
+            //
+            // The rate is deliberately LOW. At 0.25 the 20-second threshold is
+            // reached in 80 ticks, which OUTLASTS the 60s switch cooldown — so
+            // a link that hovers in the ambiguous band would upgrade to full
+            // bitrate, stress again a minute later, and downgrade, trading a
+            // 2-4s black screen every ~80s forever. 0.05 needs 400 ticks (~7
+            // minutes) of sustained ambiguity, which is longer than any
+            // plausible recovery but still terminates, so a link that genuinely
+            // settles downward is never permanently stuck.
+            abrCalmSec += 0.05;
             abrBadSec = 0;
         }
         // No else, for the same reason as the stress/calm runs above: a
@@ -1465,12 +1720,30 @@ document.addEventListener('DOMContentLoaded', () => {
             // stress floor still protect them from the rough link.
             if (abrBadSec >= 8 && onFullBitratePath && !sourceIsAv1 && rendReady
                 && browserSupportsAv1() && av1DecodeSmooth !== false) {
+                // Record WHY this viewer is leaving full quality, so the
+                // decode-pressure loop below knows not to walk them back up it.
+                abrDowngradedForLink = true;
                 switchRendition('live-av1',
                     'Your connection is struggling with the full-quality stream — '
                     + 'switched to the lighter rendition to stop frame drops.');
                 return;
             }
-            if (abrCalmSec >= 20 && activeStreamPath === 'live-av1'
+            // The accumulator is deliberately kept live even in the ambiguous
+            // band (see the 0.05 credit above): zeroing it there is what made
+            // the original 40-120ms band terminal. But "the counter reached 20"
+            // is not by itself permission to climb — the ambiguous band can
+            // reach it while the link is still measurably bad, and 3% real loss
+            // is a congested link, not a recovering one. The loss guard is
+            // therefore applied HERE, at the point of action, rather than by
+            // freezing the counter: the accumulator keeps running (no freeze)
+            // while the switch is refused for as long as loss stays above the
+            // calm bound. The two axes are not symmetric — jitter is a smoothed
+            // EWMA that hovers and trends down, loss is a level over a
+            // completed window — so loss is the axis worth gating on.
+            const lossAllowsUpgrade = lastLossPct === null
+                || lastLossPct < ABR_LOSS_CALM_PCT;
+            if (abrCalmSec >= 20 && lossAllowsUpgrade
+                && activeStreamPath === 'live-av1'
                 && ladderSource && (ladderSource.ready === true || ladderSource.online === true)
                 && !sourceIsAv1) {
                 // The upgrade target is whatever the path matrix wants when the
@@ -1486,6 +1759,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     browserSupportsH265()
                 );
                 if (upgradeTarget && upgradeTarget !== 'live-av1') {
+                    // Back at full quality on a link that has held calm for 20s,
+                    // so the decode-pressure guard must stand down again.
+                    abrDowngradedForLink = false;
                     switchRendition(upgradeTarget,
                         'Connection recovered — back to the full-quality rendition.');
                     return;
@@ -1518,7 +1794,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 // audio-rescue video-copy rendition (full quality + sound)
                 // when it is ready, and only fall back to 'live' when the
                 // source audio already reaches WebRTC readers.
-                const dpTracksUpper = dpTracks.map((t) => typeof t === 'string' ? t.toUpperCase() : '');
+                //
+                // UNLESS the ABR ladder is what put them here. This branch is
+                // the "my decoder cannot keep up" response, but a viewer sitting
+                // on live-av1 after a network-stress downgrade is here because
+                // the LINK could not carry full bitrate, not because AV1 decode
+                // is slow. Sending them back to `live` undoes the downgrade on a
+                // link already measured as unable to carry it: 60s later the link
+                // is stressed again, ABR steps down once more, and the pair
+                // ping-pongs forever at two full 2-4s WHEP teardowns per minute.
+                // Only let decode pressure move a viewer UP the ladder when
+                // they got there by a decode decision rather than a network one.
+                if (abrDowngradedForLink) {
+                    hwPath = null;
+                } else {
+                    const dpTracksUpper = dpTracks.map((t) => typeof t === 'string' ? t.toUpperCase() : '');
                 const dpHasOpus = dpTracksUpper.includes('OPUS');
                 const dpHasAudio = dpTracksUpper.some((t) => t && !['AV1', 'H264', 'H265', 'HEVC', 'VP8', 'VP9'].includes(t));
                 if (dpHasOpus || !dpHasAudio) {
@@ -1534,9 +1824,20 @@ document.addEventListener('DOMContentLoaded', () => {
                     const rescueReady = renditionPathsItems.some((item) => item && item.name === 'live-h264'
                         && (item.ready === true || item.online === true));
                     hwPath = rescueReady ? 'live-h264' : null;
+                    }
                 }
             }
-            if (hwPath && hwPath !== activeStreamPath) {
+            // F5: when there is genuinely NO safe target — a viewer already on
+            // the bottom rung, a rescue rendition that is not ready yet, or the
+            // ABR-guarded case above — `decodeLagSec` was left sitting at 30+
+            // forever. It then re-evaluated the whole branch on every single
+            // tick for the rest of the session, and the moment a rescue
+            // rendition DID become ready it fired an unrequested switch to
+            // something the viewer never asked for. Let it decay back toward
+            // the threshold so re-arming always requires fresh evidence.
+            if (!hwPath || hwPath === activeStreamPath) {
+                decodeLagSec = Math.max(0, decodeLagSec - 1);
+            } else {
                 decodeLagSec = 0;
                 switchRendition(hwPath,
                     "This device's decoder can't keep up with AV1 — switched to the hardware-decodable path for smooth playback.");
@@ -1940,9 +2241,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // Add receive-only transceivers
             const videoTransceiver = peerConnection.addTransceiver('video', { direction: 'recvonly' });
-            peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+            const audioTransceiver = peerConnection.addTransceiver('audio', { direction: 'recvonly' });
 
-            configureCodecPreferences(videoTransceiver);
+            configureCodecPreferences(videoTransceiver, 'video');
+            // The audio m-line gets the same treatment. It used to be added and
+            // then left entirely to the UA's enumeration order, in a function
+            // whose whole purpose is deterministic ordering — an asymmetry that
+            // read as an oversight and would let a browser that happens to list
+            // a legacy codec first negotiate it.
+            configureCodecPreferences(audioTransceiver, 'audio');
 
             // Handle incoming track event robustly
             peerConnection.ontrack = (event) => {
@@ -3268,7 +3575,15 @@ document.addEventListener('DOMContentLoaded', () => {
         // previous connection must never influence the new one).
         lastPacketsReceived = 0;
         lastPacketsLost = 0;
+        // Same reason: RTX/discard counters are per-SSRC and restart with the
+        // source, so a stale baseline would make the first tick's delta a
+        // multi-hundred-million packet "repair" and pin loss at a negative or
+        // clamped-zero reading.
+        lastRetransmittedPackets = 0;
+        lastPacketsDiscarded = 0;
         lastFramesDropped = 0;
+        lastPlrPct = null;
+        lastRepairRatePct = null;
         dropWindow = [];
         dropTickPending = true;
         decodeLagSec = 0;
@@ -3331,6 +3646,10 @@ document.addEventListener('DOMContentLoaded', () => {
         jitterFloorEmaMs = 0;
         abrBadSec = 0;
         abrCalmSec = 0;
+        // A fresh session is a fresh judgement: the new link has neither been
+        // downgraded for network stress nor recovered from one, so the
+        // decode-pressure guard must not inherit the previous session's verdict.
+        abrDowngradedForLink = false;
         // lastRenditionSwitchAt is deliberately NOT reset here. It is a rate limit
         // on switch ACTIONS, not a measurement baseline. switchRendition() and
         // maybeRejoinOnReturn() stamp it and then reconnect through this function
@@ -3472,10 +3791,46 @@ document.addEventListener('DOMContentLoaded', () => {
                         ? videoStats.framesDiscarded : 0;
                     // Publish for the freeze watchdog (one getStats walk per
                     // second, shared) — see inboundSnapshot above.
+                    //
+                    // `fps` rides along so the watchdog can judge decode progress
+                    // as a RATE against the stream's rate instead of testing
+                    // `decodedDelta === 0` (see isDecoderStalled).
+                    //
+                    // It MUST be the stream's NOMINAL rate, not the current decode
+                    // rate. A first attempt derived it from this same tick's
+                    // `framesDecoded` delta, which made the test self-defeating:
+                    // when a 60fps stream decodes at 2fps, the published rate
+                    // collapses to 2, the expected minimum becomes
+                    // 2 * 1.5 * 0.25 = 0.75 (floored to 1), and the 3 frames
+                    // actually decoded comfortably clear it — so the test
+                    // returned false for the exact slideshow it was written to
+                    // catch, while passing a unit test that hand-fed it fps=60.
+                    // The expectation has to come from something the decoder
+                    // cannot drag down with it.
+                    //
+                    // `framesPerSecond` is the UA's view of the incoming frame
+                    // rate and is the primary source. It is a short window too,
+                    // so a PEAK HOLD over recent ticks is used as the reference:
+                    // it rises immediately on a genuine rate change and decays
+                    // slowly, so a transient decode collapse cannot redefine
+                    // "normal" for the very window in which it must be detected.
+                    const snapTime = performance.now();
+                    const nominalFps = Number.isFinite(videoStats.framesPerSecond)
+                        ? videoStats.framesPerSecond
+                        : (currentFrameRate !== null && Number.isFinite(currentFrameRate)
+                            ? currentFrameRate : null);
+                    // A long, slow tail is the point: a decode stall lasts
+                    // seconds, so the reference must not halve inside it.
+                    if (nominalFps !== null && nominalFps > 0) {
+                        stallReferenceFps = stallReferenceFps === null
+                            ? nominalFps
+                            : Math.max(nominalFps, stallReferenceFps * 0.98);
+                    }
                     inboundSnapshot = {
                         decoded,
                         bytes: videoStats.bytesReceived || 0,
-                        at: performance.now()
+                        fps: stallReferenceFps,
+                        at: snapTime
                     };
                     if (hudFrames) hudFrames.innerText = `${decoded} / ${dropped} (Recv:${received})`;
 
@@ -3509,6 +3864,17 @@ document.addEventListener('DOMContentLoaded', () => {
                     // already made an explicit choice).
                     const droppedDelta = dropped - lastFramesDropped;
                     lastFramesDropped = dropped;
+
+                    // Picture-loss ratio over this window. The standard broadcast
+                    // QoE metric, and the answer to the only question a viewer or
+                    // broadcaster actually asks about a rough stream: "how much
+                    // of the picture never made it to the screen?". Both counters
+                    // were already being read here for other reasons, so this
+                    // costs nothing and turns two debug fields into one number
+                    // that can be compared across sessions and against a target.
+                    const dReceived = received - lastFramesReceived;
+                    const dDecoded = decoded - lastFramesDecodedCount;
+                    if (dReceived > 0) lastPlrPct = pictureLossRatioPct(dReceived, dDecoded);
                     // Rolling 3-tick window replaces the old strictly-consecutive
                     // counter (>=3 drops on 3 back-to-back ticks), which never
                     // fired for keyframe-periodic bursts — drops once per GOP
@@ -3530,21 +3896,100 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (dropTickPending) {
                         dropTickPending = false;
                     } else {
-                        dropWindow.push(Math.max(0, droppedDelta));
+                        // Exclude ticks the app is deliberately draining at above
+                        // real time. The comment above promised this and there
+                        // was no guard, so the promise was never kept: when
+                        // updateLiveEdgeCatchUp() is running (catchUpRate > 1),
+                        // the UA reaches the new, lower jitter-buffer target by
+                        // ACCELERATING playout and by DISCARDING buffered frames
+                        // — which is exactly what `framesDropped` counts. The
+                        // app was therefore manufacturing the very frame-drop
+                        // pressure this window is meant to detect, and a viewer
+                        // who drifted behind the live edge for a few seconds
+                        // would get a spurious "reduced decorative effects"
+                        // notice and permanent CSS degradation for a session
+                        // whose decoder was never under any pressure at all.
+                        // The window is still pruned on a catch-up tick (below)
+                        // so entries age out at the normal rate.
+                        if (catchUpRate <= 1) {
+                            dropWindow.push(Math.max(0, droppedDelta));
+                        }
                         if (dropWindow.length > 3) dropWindow.shift();
                         if (dropWindow.reduce((sum, value) => sum + value, 0) >= 9) maybeAutoPerfMode();
                     }
 
                     // Interval packet loss feeds the adaptive buffer supervisor.
+                    //
+                    // The old reading was `dLost / (dRx + dLost)`, which is wrong
+                    // in the one direction that matters most: `packetsReceived`
+                    // is defined by the stats spec to INCLUDE retransmissions,
+                    // so a link dropping 20% of its packets that RTX then repairs
+                    // reads ~0% loss. RTX is negotiated and working, that viewer is
+                    // genuinely smooth, and the ABR ladder must not tear its
+                    // rendition down for a problem it does not have. Meanwhile a
+                    // MediaMTX reader-queue overflow — a real, unrepairable drop —
+                    // was invisible as a separate cause. networkLossPct() nets
+                    // retransmissions out of the loss term and charges local
+                    // jitter-buffer discards to the same denominator, so what the
+                    // supervisor sees is the loss that actually reached the
+                    // decoder. See networkLossPct() for the full derivation.
                     const rxNow = videoStats.packetsReceived || 0;
                     const lostNow = videoStats.packetsLost || 0;
-                    const dRx = rxNow - lastPacketsReceived;
+                    const retxNow = Number.isFinite(videoStats.retransmittedPacketsReceived)
+                        ? videoStats.retransmittedPacketsReceived : 0;
+                    const discardNow = Number.isFinite(videoStats.packetsDiscarded)
+                        ? videoStats.packetsDiscarded : 0;
                     const dLost = lostNow - lastPacketsLost;
-                    if (lastPacketsReceived > 0 && (dRx + dLost) > 0) {
-                        lastLossPct = Math.max(0, (dLost / (dRx + dLost)) * 100);
+                    const dRetx = retxNow - lastRetransmittedPackets;
+                    const dDiscarded = discardNow - lastPacketsDiscarded;
+                    // `dRx` is the denominator's received term. It must be the
+                    // RAW delta, not a clamped one: it is a count of packets that
+                    // actually arrived, and clamping it to 0 on a counter reset
+                    // would silently make the whole window look like 100% loss.
+                    // A negative delta (reset) is handled inside networkLossPct,
+                    // which treats it as 0 rather than as negative volume.
+                    const dRx = rxNow - lastPacketsReceived;
+                    //
+                    // The assignment is UNCONDITIONAL on purpose. Gating it on
+                    // "did this window have any loss?" — the obvious-looking
+                    // form — makes `lastLossPct` LATCH at its last non-zero
+                    // reading forever, because a clean window is precisely the
+                    // window that skips the write. The consumers treat it as a
+                    // live per-tick level: the ABR calm predicate needs it below
+                    // 2% to start counting calm seconds and eventually switch
+                    // back to full quality, and the stress branch needs it below
+                    // 2.5% to release the 350ms hold. A single lossy second
+                    // would then pin the viewer to the 3000k rendition for the
+                    // rest of the session on a link that had already recovered,
+                    // and the stress raise would never release. A clean window
+                    // is genuinely 0% loss, so it must write 0.
+                    if (lastPacketsReceived > 0 || lastPacketsLost > 0) {
+                        const lostDelta = Math.max(0, dLost);
+                        const discardDelta = Math.max(0, dDiscarded);
+                        lastLossPct = networkLossPct(lostDelta, dRetx, discardDelta, dRx);
+                        // NACK effectiveness. `dRetx` is how much of the loss the
+                        // retransmission path actually repaired in this window.
+                        // Two failure modes look identical from `packetsLost`
+                        // alone and are separated by this number:
+                        //   - a low rate with high loss  => RTX is dead (no
+                        //     retransmissions arriving), so the loss is real and
+                        //     the only fix is a smaller rendition or more buffer;
+                        //   - a high rate with high loss => retransmissions are
+                        //     arriving but too late for playout, which is a
+                        //     latency problem the buffer target fixes.
+                        // Reported rather than acted on: the correct response
+                        // differs per case and both are already covered by the
+                        // existing loss/jitter controllers, so this is an
+                        // observability fix, not a control change.
+                        const retxDelta = Math.max(0, dRetx);
+                        lastRepairRatePct = lostDelta > 0
+                            ? Math.min(100, (retxDelta / lostDelta) * 100)
+                            : null;
                     }
                     lastPacketsReceived = rxNow;
                     lastPacketsLost = lostNow;
+                    lastRetransmittedPackets = retxNow;
+                    lastPacketsDiscarded = discardNow;
 
                     // Smoothed inbound network jitter (stats report it in seconds).
                     if (Number.isFinite(videoStats.jitter)) {
@@ -3632,7 +4077,28 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (rebaseThisTick) {
                             accommodationCalmTicks = 0;
                         } else {
-                            if (droppedDelta > 0) {
+                            // `lateFrameEvidence` counts frames that physically
+                            // arrived but never left the jitter buffer. That is a
+                            // STRONGER signal than `droppedDelta` — the decoder
+                            // reported zero losses, so the decoder's own drop
+                            // counter reads clean while the viewer watches frames
+                            // disappear. The accommodation gate below already
+                            // treats the two as equivalent (`droppedDelta > 0 ||
+                            // lateFrameEvidence`), and reapplyBufferTargets()
+                            // reads `recentDropAt` to decide whether a protective
+                            // raise may skip the 3s dwell.
+                            //
+                            // Those two used to disagree: `recentDropAt` was set
+                            // ONLY on `droppedDelta > 0`. So on a link where the
+                            // loss is absorbed by the buffer rather than by the
+                            // decoder — precisely the marginal case the
+                            // accommodation exists for — the gate opened, the
+                            // target was raised, and then the raise sat behind the
+                            // full 3-second dwell anyway, because the one signal
+                            // that would have shortened it was the one signal that
+                            // never fired. The 1200ms emergency path was disabled
+                            // exactly when it was needed.
+                            if (droppedDelta > 0 || lateFrameEvidence) {
                                 // Marks the current window as one where late
                                 // frames are genuinely being discarded, which is
                                 // what lets reapplyBufferTargets() skip its dwell
@@ -3671,6 +4137,35 @@ document.addEventListener('DOMContentLoaded', () => {
                     const rateForFreeze = reportedFps ?? measuredFps;
                     if (Number.isFinite(rateForFreeze) && rateForFreeze > 0) {
                         specFreezeMs = specFreezeThresholdMs(1000 / rateForFreeze);
+                        // The bound the WATCHDOG acts on is derived from the
+                        // peak-hold, not from the live reading. Sourcing it from
+                        // `rateForFreeze` made the detector structurally blind to
+                        // exactly the case the rate test exists to catch:
+                        // `specFreezeThresholdMs(1000/R)` is by construction at
+                        // least 3x the frame duration at rate R, so when decode
+                        // collapses the bound inflates WITH the collapse and the
+                        // observed gap never crosses it.
+                        //
+                        // Measured, for a sustained reduced decode rate:
+                        //   2fps  -> gap 500ms vs bound 1500ms  (never stale)
+                        //   5fps  -> gap 200ms vs bound  600ms  (never stale)
+                        //  24fps  -> gap  42ms vs bound  192ms  (never stale)
+                        //  60fps  -> gap  17ms vs bound  167ms  (never stale)
+                        // So `isFrameStale` was false at EVERY rate, and since the
+                        // watchdog ANDs it with the (correct) rate test, the rate
+                        // test's verdict was discarded one line later and a 60fps
+                        // stream decoding at 2fps played out indefinitely.
+                        //
+                        // `stallReferenceFps` is the high-water mark, so a genuine
+                        // 60->24 source change decays toward the new rate over
+                        // ~50 ticks while the delivered frame count is already at
+                        // the new rate — the bound stays wide enough not to fire.
+                        // `specFreezeMs` itself is left sourced from the live rate
+                        // because the diagnostic report shows it beside
+                        // `frameRate`, and the two must describe the same thing.
+                        stallDetectMs = stallReferenceFps !== null
+                            ? specFreezeThresholdMs(1000 / stallReferenceFps)
+                            : specFreezeMs;
                     }
 
                     // Decode-pressure detection: packets arrive, packetsLost
@@ -3814,6 +4309,19 @@ document.addEventListener('DOMContentLoaded', () => {
                     frameRate: currentFrameRate === null ? 'unavailable' : Number(currentFrameRate.toFixed(2)),
                     presentedFps: lastPresentedFps === null ? 'unavailable' : Number(lastPresentedFps.toFixed(2))
                 },
+                // End-to-end quality, measured. `pictureLossPct` is the standard
+                // broadcast metric (frames received but never decoded, as a
+                // share of frames received) and is the single number that
+                // answers "was this session actually smooth?". `netLossPct` is
+                // the loss that reached the decoder AFTER retransmission, which
+                // is what the ABR ladder acts on; `repairRatePct` says where
+                // the packets went, separating "RTX is dead" from "RTX is too
+                // late", which are otherwise indistinguishable here.
+                quality: {
+                    pictureLossPct: lastPlrPct === null ? 'unavailable' : Number(lastPlrPct.toFixed(2)),
+                    netLossPct: lastLossPct === null ? 'unavailable' : Number(lastLossPct.toFixed(2)),
+                    rtxRepairRatePct: lastRepairRatePct === null ? 'no loss in this window' : Number(lastRepairRatePct.toFixed(1))
+                },
                 bitrateHistory: bitrateHistory.slice(-10)
             };
             const jsonText = JSON.stringify(report, null, 2);
@@ -3891,7 +4399,12 @@ document.addEventListener('DOMContentLoaded', () => {
         isRecovering = false;
         lastDecodedFrames = 0;
         lastBytesCount = 0;
+        lastFreezeCheckAt = performance.now();
         lastFrameTime = performance.now();
+        // A new session may publish at a completely different frame rate, so
+        // the previous session's peak-hold must not become this one's bar.
+        stallReferenceFps = null;
+        stallDetectMs = null;
 
         ensureVideoFrameCallback();
 
@@ -3920,6 +4433,14 @@ document.addEventListener('DOMContentLoaded', () => {
             const bytesDelta = currentBytes - lastBytesCount;
             lastDecodedFrames = currentDecoded;
             lastBytesCount = currentBytes;
+            // The span `decodedDelta` actually covers. It is NOT the 1.5s poll
+            // period: this loop can return early (paused, hidden, stale
+            // snapshot) and still count that window against the previous
+            // reading, so the real span is measured, not assumed. The rate test
+            // needs it because `snapshot.fps` is a per-second rate while
+            // `decodedDelta` is a count over this span — see isDecoderStalled.
+            const elapsedSec = (now - lastFreezeCheckAt) / 1000;
+            lastFreezeCheckAt = now;
 
             // Health counter recovery decay
             if (decodedDelta > 0) {
@@ -3936,15 +4457,49 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // Real Freeze Detection:
-            // Frame is stale AND network packets ARE flowing (not just a static screen), but decoder is stalled!
-            const isFrameStale = frameStaleness > FREEZE_THRESHOLD_MS;
-            const isActualDecoderStall = bytesDelta > 5000 && decodedDelta === 0 && currentDecoded > 0;
+            // Frame is stale AND network packets ARE flowing (not just a static
+            // screen), but decoder is stalled!
+            //
+            // The bound is the SPEC's freeze threshold for the stream's own
+            // measured frame rate (~167ms at 60fps, ~192ms at 24fps), not the
+            // 3s constant it used to use for both halves of the test. A fixed
+            // 3000ms is 12-18x the point at which a viewer would already have
+            // called this a freeze, and it was ALSO the confirmation window, so
+            // the worst case was 3s to notice plus another 3s to believe it:
+            // ~6s of black screen before recovery could even start, on a
+            // problem the whole watchdog exists to shorten.
+            //
+            // Splitting the two is what makes this safe to tighten. DETECTION is
+            // now spec-accurate and cheap; CONFIRMATION stays deliberately
+            // conservative because triggerFreezeRecovery() costs 2-4s of black
+            // and is strictly worse than the short freeze it would "fix" — so a
+            // glitch has to persist for a full second across multiple polls
+            // before the session is torn down. See specFreezeThresholdMs().
+            //
+            // The spec bound is only trusted while rVFC is actually running: it
+            // is the callback that keeps `lastFrameTime` fresh, so in a browser
+            // without requestVideoFrameCallback the staleness reading is pinned
+            // at the session start and every threshold is crossed forever. That
+            // is a false freeze on every single tick, so those browsers keep the
+            // conservative bound and the decoder-rate test carries the decision.
+            const hasFrameCallback = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+            // `stallDetectMs` (peak-hold derived) rather than `specFreezeMs`
+            // (live-rate derived). See the publish site: a bound computed from
+            // the current rate inflates as the decoder slows and can never be
+            // crossed by the gap that slowing produced, which made the rate
+            // test's verdict unreachable.
+            const detectMs = (hasFrameCallback && stallDetectMs !== null)
+                ? stallDetectMs
+                : FREEZE_THRESHOLD_MS;
+            const isFrameStale = frameStaleness > detectMs;
+            const isActualDecoderStall = currentDecoded > 0
+                && isDecoderStalled(bytesDelta, decodedDelta, snapshot.fps, elapsedSec);
 
             if (isFrameStale && isActualDecoderStall) {
                 if (frozenSince === 0) {
                     frozenSince = now;
-                    console.warn(`[FreezeGuard] Potential freeze detected. Staleness: ${Math.round(frameStaleness)}ms, bytesDelta: ${bytesDelta}.`);
-                } else if (now - frozenSince > FREEZE_THRESHOLD_MS) {
+                    console.warn(`[FreezeGuard] Potential freeze detected. Staleness: ${Math.round(frameStaleness)}ms, bytesDelta: ${bytesDelta}, decodedDelta: ${decodedDelta}, fps: ${snapshot.fps === null ? '--' : snapshot.fps.toFixed(1)}.`);
+                } else if (now - frozenSince >= FREEZE_CONFIRM_MS) {
                     console.error(`[FreezeGuard] CONFIRMED FREEZE for ${Math.round(now - frozenSince)}ms. Triggering staged recovery...`);
                     triggerFreezeRecovery('decoder_stall');
                 }

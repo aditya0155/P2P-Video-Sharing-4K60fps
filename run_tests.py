@@ -843,6 +843,28 @@ class JsLogicChecks(unittest.TestCase):
         ViewerSmoothnessRegressionChecks for the full rationale."""
         run_js_check(self, "spec-freeze-threshold")
 
+    def test_loss_accounting_excludes_retransmissions(self):
+        """`packetsReceived` includes retransmissions, so the old
+        dLost/(dRx+dLost) ratio reported a fully RTX-repaired link as 0% loss
+        and could not see an SFU queue overflow at all."""
+        run_js_check(self, "network-loss-accounting")
+
+    def test_loss_metric_scale_matches_controller_thresholds(self):
+        """Dividing by the loss alone turns a smooth 0.5%-loss link into a 33%
+        reading, which permanently pins it to 3000k and makes the upgrade-back
+        unreachable. Ties the metric to the real 5/2.5/2% thresholds."""
+        run_js_check(self, "loss-metric-scale-matches-controller-thresholds")
+
+    def test_picture_loss_ratio_is_reported(self):
+        """The standard broadcast QoE metric was never computed even though
+        framesReceived and framesDecoded were both already being read."""
+        run_js_check(self, "picture-loss-ratio")
+
+    def test_freeze_watchdog_judges_decode_progress_as_a_rate(self):
+        """`decodedDelta === 0` was blind to a partially-wedged decoder and
+        could false-fire on a sampling artefact."""
+        run_js_check(self, "decoder-stall-detection")
+
 
     def test_abr_switching_state_machine(self):
         run_js_check(self, "abr-switching-state-machine")

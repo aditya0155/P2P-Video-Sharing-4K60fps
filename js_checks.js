@@ -1173,6 +1173,296 @@ Object.assign(cases, {
         assertEqual(fn(NaN), null, 'a NaN frame duration is not measurable');
         assertEqual(fn(-5), null, 'a negative frame duration is not measurable');
     },
+    // `lastLossPct` used to be dLost/(dRx+dLost). packetsReceived INCLUDES
+    // retransmissions per the stats spec, so a link that loses 20% of its
+    // packets and repairs 100% of them by RTX reads ~0% loss — the ABR ladder
+    // then never steps a genuinely-smooth-but-lossy viewer down, and a
+    // MediaMTX queue overflow (a real, unrepairable drop) was invisible as a
+    // separate cause. These pin the corrected accounting.
+    'network-loss-accounting'() {
+        const { fn } = compileFunction('networkLossPct', {});
+        // ~625 packets/s is a realistic window for a 6Mbps stream, which is the
+        // volume these percentages have to stay meaningful at.
+        const RX = 620;
+
+        // THE SCALE TRAP. The denominator is everything the link OFFERED, not
+        // just the loss. Dividing by the loss alone measures "the share of lost
+        // packets RTX failed to repair" — a repair rate — and inflates the
+        // reading by 1-2 orders of magnitude: 3 lost with 2 repaired reads 33%
+        // that way and 0.16% this way. Since 33% is above the 5% ABR threshold
+        // AND the 2.5% stress threshold, the repair-rate version pins a
+        // perfectly smooth viewer to 3000k and to the 350ms buffer, and
+        // `abrCalm` (loss < 2% for 20 consecutive ticks) can never be satisfied
+        // so they never come back. These three assertions exist to stop that.
+        assert(fn(3, 2, 0, RX) < 1, 'a 0.5%-loss, 80%-repaired link must read as well under 1%');
+        assert(fn(1, 0, 0, RX) < 1, 'one unrepaired packet in 620 must not read as stressed');
+        assert(fn(6, 0, 0, RX) < 1, 'a ~1% real loss rate must read near 1%, not near 100%');
+
+        // The headline behaviour the whole function exists for: RTX-repaired
+        // loss is NOT net loss. 0 is right because the retransmissions were
+        // subtracted, not because they inflated the denominator.
+        assertEqual(fn(20, 20, 0, RX), 0, 'a fully RTX-repaired window is not net loss');
+
+        // Half repaired: of 20 lost, 10 came back. 10 of 640 offered = 1.56%.
+        assertEqual(Math.round(fn(20, 10, 0, RX) * 100) / 100, 1.56,
+            'half-repaired loss reports the unrecovered share of the link');
+
+        // Nothing repaired: 20 of 640 offered = 3.13%, which is what the
+        // un-repaired 20-packet window actually is as a link-loss rate.
+        assertEqual(Math.round(fn(20, 0, 0, RX) * 100) / 100, 3.13,
+            'an unrepaired window reports its true link-loss share');
+
+        // Monotonicity: more unrepaired loss can never read as LESS loss, and
+        // repairing packets can never INCREASE it.
+        assert(fn(10, 0, 0, RX) < fn(20, 0, 0, RX), 'loss must be monotonic in unrepaired count');
+        assert(fn(20, 0, 0, RX) > fn(20, 20, 0, RX), 'repair must strictly reduce reported loss');
+        assert(fn(20, 5, 0, RX) < fn(20, 0, 0, RX), 'some repair must still reduce reported loss');
+        assert(fn(20, 20, 0, RX) < fn(20, 0, 0, RX), 'full repair must beat no repair');
+
+        // A genuine link failure still reads as failure: if the receiver gets
+        // almost nothing, the metric must say so and let the ABR ladder act.
+        assertEqual(fn(200, 0, 0, 0), 100, 'a link delivering nothing is 100% net loss');
+        assert(fn(100, 0, 0, 50) > 50, 'a link losing two thirds of its packets reads as catastrophic');
+
+        // Local discards widen the denominator but must NOT become the
+        // numerator: a packet the jitter buffer dropped after it arrived is not
+        // network loss, and the ABR ladder must not treat it as a thin link.
+        // It does, however, have to be visible as a share of offered volume,
+        // which is what makes an over-tight buffer distinguishable from a
+        // congested one in the diagnostics.
+        assertEqual(fn(0, 0, 10, RX), 0, 'pure discard is not net network loss');
+        assertEqual(Math.round(fn(0, 0, 10, RX) * 100) / 100, 0,
+            'discard alone contributes nothing to net loss (0 of 640)');
+        // Combined with real loss, the discard only enlarges the denominator,
+        // so it can never make the reported rate look WORSE per unit of loss.
+        assert(fn(20, 0, 0, RX) > fn(20, 0, 10, RX), 'discard dilutes the loss rate, never inflates it');
+
+        // A retransmission count can never exceed the loss it repairs: RTX
+        // counters are per-SSRC and reset to 0 when the source re-keys, so a
+        // stale baseline can produce retx > lost. That must clamp to 0, not go
+        // negative and poison the controller.
+        assertEqual(fn(5, 50, 0, RX), 0, 'retx beyond loss clamps to zero, never negative');
+        assertEqual(fn(0, 50, 0, RX), 0, 'retx with no loss is clamped, not negative');
+
+        // A window with no loss at all must not hand the supervisor a NaN from
+        // a 0/0 division.
+        assertEqual(fn(0, 0, 0, 0), 0, 'a fully empty window is 0%, not NaN');
+        assertEqual(fn(0, 0, 0, RX), 0, 'a clean window is 0%, not NaN');
+
+        // Counter reset on a stream restart produces negative deltas upstream;
+        // the function must not propagate them, and must not read a reset as a
+        // total link failure.
+        assertEqual(fn(-30, -15, 0, RX), 0, 'negative loss deltas clamp to zero');
+        assertEqual(fn(0, 0, 0, -50), 0, 'a negative received delta is treated as zero, not as loss');
+
+        assert(fn(10, 0, 0, RX) <= 100, 'loss is capped at 100%');
+    },
+    // The scale bug in `network-loss-accounting` above was invisible in
+    // isolation because the function's own unit tests were written to whatever
+    // it returned. These tie the METRIC to the two real thresholds the app
+    // actually compares it against, which is the only way a unit change in the
+    // denominator gets caught: >5% is the ABR downgrade, >2.5% is the 350ms
+    // buffer hold, and <2% for 20 consecutive ticks is the only route back to
+    // full quality.
+    'loss-metric-scale-matches-controller-thresholds'() {
+        const { fn } = compileFunction('networkLossPct', {});
+        const ABR_DOWNGRADE_PCT = 5;
+        const STRESS_HOLD_PCT = 2.5;
+        const ABR_CALM_PCT = 2;
+        const RX = 620;   // ~625 packets/s, a 6Mbps stream
+
+        // A link losing 0.5% where RTX repairs 80% of it. The picture is FINE.
+        // Under the repair-rate denominator this reads 33% and pins the viewer
+        // to 3000k, holds their buffer at 350ms, and makes the upgrade-back
+        // unreachable (loss < 2% for 20 consecutive ticks) for the whole
+        // session — a permanent quality downgrade on a healthy link.
+        const smooth = fn(3, 2, 0, RX);
+        assert(smooth < ABR_CALM_PCT,
+            `a 0.5%-loss, 80%-repaired link must read under the ${ABR_CALM_PCT}% calm bound, got ${smooth.toFixed(2)}%`);
+        assert(smooth < STRESS_HOLD_PCT,
+            'a smooth repaired link must not trip the buffer-stress hold');
+        assert(smooth < ABR_DOWNGRADE_PCT,
+            'a smooth repaired link must not trip the ABR downgrade');
+
+        // A genuinely marginal link must be allowed to reach the hold, or the
+        // metric is now too insensitive and the controllers never act.
+        // 13 lost of 633 offered = 2.05%, i.e. just over the 2% calm bound.
+        const marginal = fn(13, 0, 0, RX);
+        assert(marginal > ABR_CALM_PCT,
+            `an unrepaired ~2% link must exceed the ${ABR_CALM_PCT}% calm bound, got ${marginal.toFixed(2)}%`);
+        assert(marginal < ABR_DOWNGRADE_PCT,
+            'a ~2% link must NOT trigger the ABR downgrade — that needs sustained stress');
+        // ...and it must be able to reach the 2.5% stress hold too, which is
+        // what widens the jitter buffer on a marginal link.
+        const atHold = fn(16, 0, 0, RX);
+        assert(atHold > STRESS_HOLD_PCT,
+            'an unrepaired ~2.5% link must reach the buffer-stress hold');
+
+        // A clearly broken link must trip both, or the fix went too far and
+        // silently disabled the ladder.
+        const broken = fn(120, 0, 0, RX);
+        assert(broken > ABR_DOWNGRADE_PCT,
+            'a link losing ~16% of its packets must trigger the ABR downgrade');
+        assert(broken > STRESS_HOLD_PCT, 'a broken link must trigger the buffer hold');
+
+        // Recovery must actually be reachable. Carried through the REAL ABR
+        // state machine rather than re-evaluating a constant 30 times (which
+        // would only restate the assertion above): the supervisor's own
+        // accumulators must cross the 20-second upgrade-back threshold on a
+        // link whose loss reads calm, or that branch is dead code.
+        const recovery = compileFunction('superviseAdaptiveBuffer', (() => {
+            const base = {
+                isConnected: true, isConnecting: false, currentLatencyMode: 'balanced',
+                LATENCY_MODES: {
+                    ultra: { ms: 80, driftLimitMs: 1200 },
+                    balanced: { ms: 180, driftLimitMs: 2500 },
+                    smooth: { ms: 350, driftLimitMs: 3000 }
+                },
+                rejoinDriftSec: 0, decodeLagSec: 0, lastFramesReceived: 0,
+                adaptiveRaiseLevelMs: 0, stressRunSec: 0, calmRunSec: 0,
+                bufferNoticeState: '', accommodationTargetMs: 0,
+                avgPlayoutDelayMs: 150, avgPlayoutDelayAt: 100000,
+                lastNetJitterMs: 10,
+                // The smooth-but-lossy link this guards: 0.16% net loss.
+                lastLossPct: fn(3, 2, 0, RX),
+                lastAppliedTargetMs: null, jitterFloorEmaMs: 0,
+                abrBadSec: 0, abrCalmSec: 0, abrDowngradedForLink: false, catchUpRate: 1,
+                lastRenditionSwitchAt: -60000, renditionPathsItems: null,
+                activeStreamPath: 'live-av1', av1DecodeSmooth: true,
+                browserSupportsAv1() { return true; },
+                browserSupportsH265() { return true; },
+                chooseStreamPath() { return 'live'; },
+                player: { paused: false }, document: { hidden: false },
+                performance: { now: () => 100000 },
+                RTCRtpReceiver: { getCapabilities: () => ({ codecs: [] }) },
+                console: quietConsole(),
+                reapplyBufferTargets() { return true; }, updateBufferHud() {},
+                addSystemMessage() {},
+                // The stress-hold level the supervisor's raise/release state
+                // machine compares against; it is a module-level const in
+                // app.js and must exist in the sandbox or the release branch
+                // throws. See the other ABR sandbox above.
+                ADAPTIVE_RAISE_MS: 350,
+                switchRendition(path) { recoverySandbox.switchedTo = path; },
+                catchUpProvenUseless: true,
+                updateLiveEdgeCatchUp() { return false; },
+                resetLiveEdgeCatchUp() {}
+            };
+            return base;
+        })());
+        const recoverySandbox = recovery.sandbox;
+        recoverySandbox.renditionPathsItems = [
+            { name: 'live', ready: true, online: true, tracks: ['H264', 'Opus'] },
+            { name: 'live-av1', ready: true, online: true, tracks: ['AV1', 'Opus'] }
+        ];
+        let recoveryTicks = 0;
+        while (recoverySandbox.abrCalmSec < 20 && recoveryTicks < 60) {
+            recovery.fn();
+            recoveryTicks += 1;
+        }
+        assert(recoverySandbox.abrCalmSec >= 20,
+            'a link whose net loss reads calm must be able to reach the 20s upgrade-back threshold');
+        assert(recoverySandbox.switchedTo === 'live',
+            'a smooth-but-lossy link must actually be upgraded back to full quality');
+    },
+    // PLR is the standard broadcast QoE metric. Both counters were already being
+    // read for other purposes, so this was free — and the app reported no way to
+    // answer "was this session actually smooth?".
+    'picture-loss-ratio'() {
+        const { fn } = compileFunction('pictureLossRatioPct', {});
+
+        assertEqual(fn(100, 100), 0, 'a fully decoded window is 0% PLR');
+        assertEqual(fn(100, 90), 10, '10 of 100 received-but-undecoded is 10%');
+        assertEqual(fn(1000, 995), 0.5, 'sub-percent PLR is preserved, not rounded away');
+
+        // More decoded than received within a window is a counter artefact
+        // (reordering, or a framesReceived baseline lagging), not a negative
+        // quality metric. Clamp, do not report nonsense.
+        assertEqual(fn(100, 110), 0, 'decoded>received clamps to 0%');
+
+        // A window with no received frames is UNDEFINED, not "0% loss": a 0/0
+        // would be NaN and the HUD would render "NaN%".
+        assertEqual(fn(0, 0), null, 'no frames received is undefined, not 0%');
+        assertEqual(fn(0, 5), null, 'no frames received is undefined even if decoded>0');
+
+        assertEqual(fn(100, 0), 100, 'nothing decoded is 100% PLR');
+        assertEqual(fn(-10, 0), null, 'negative received is undefined');
+    },
+    // The watchdog used to test `decodedDelta === 0`, which is blind to a
+    // partially-wedged decoder (the worst viewer experience there is: a 60fps
+    // stream decoding at 2fps) and can false-fire on a sub-poll sampling
+    // artefact, costing a 2-4s black screen on healthy playback.
+    'decoder-stall-detection'() {
+        const { fn } = compileFunction('isDecoderStalled', {});
+        // The watchdog polls every 1.5s; these use that window unless noted.
+        const W = 1.5;
+
+        // Hard stop with the transport alive: the original case. Still detected.
+        assertEqual(fn(20000, 0, 60, W), true, 'a decoder producing nothing is stalled');
+        // ...and detected even with no rate baseline, because a hard zero is
+        // unambiguous on its own.
+        assertEqual(fn(20000, 0, null, W), true, 'a hard zero is a stall even with no fps baseline');
+
+        // The blind spot this fixes: 60fps stream, ~3 frames in the window. The
+        // old `=== 0` test called this HEALTHY while the viewer watched a
+        // slideshow.
+        assertEqual(fn(20000, 3, 60, W), true, 'a partially-wedged decoder is a stall');
+
+        // Healthy playback must never be flagged. 60fps over a 1.5s window is
+        // ~90 frames and the floor is 60 * 1.5 * 0.25 = 22.5, so a healthy
+        // stream clears it with 4x headroom.
+        assertEqual(fn(20000, 90, 60, W), false, 'a healthy 60fps decoder is not a stall');
+        // The floor is 22.5, so 23 clears it and 22 does not. Pinning both
+        // sides stops the comparison drifting from strict back to <=.
+        assertEqual(fn(20000, 23, 60, W), false, 'just above the 25% floor is not a stall');
+        assertEqual(fn(20000, 22, 60, W), true, 'just below the 25% floor is a stall');
+        assertEqual(fn(20000, 24, 60, W), false, 'a quarter of nominal is comfortably clear');
+
+        // THE UNIT TRAP this function has to get right: `fps` is a per-second
+        // rate but `decodedDelta` is a count over the window. Ignoring the span
+        // compares 90 delivered against an expectation of 15 and tears down a
+        // perfectly healthy 60fps session — a 2-4s black screen, repeatedly.
+        assertEqual(fn(20000, 90, 60, 1.0), false, 'a healthy 60fps decoder over a 1s window is fine');
+        // 3.0s of a 60fps stream delivers ~180 frames, and the floor there is
+        // 60 * 3 * 0.25 = 45. 150 is comfortably clear of it. Picking a value
+        // just above the floor (46 vs 45) is what actually proves the span is
+        // multiplied in rather than assumed to be 1s: under a 1s assumption the
+        // floor would be 15 and 46 would wrongly read as a stall.
+        assertEqual(fn(20000, 150, 60, 3.0), false, 'a healthy 60fps decoder over a 3s window is fine');
+        assertEqual(fn(20000, 46, 60, 3.0), false, 'the span is honoured, not assumed to be 1s');
+        // ...and a clearly-short count over a 1s span IS a stall. 10 frames in
+        // 1s against a floor of 15 is a decoder delivering a sixth of nominal;
+        // over the 3s span the same 10 would be far worse still.
+        assertEqual(fn(20000, 10, 60, 1.0), true, 'a clearly short count over a 1s span is a stall');
+        assertEqual(fn(20000, 10, 60, 3.0), true, 'the same count over a longer span is judged against it');
+        // 46 over 1s is ~77% of nominal, which is healthy: the floor is 15, so
+        // it must clear. (An earlier version of this check expected a stall
+        // here and was simply wrong about the arithmetic.)
+        assertEqual(fn(20000, 46, 60, 1.0), false, '46 frames in 1s is ~77% of nominal and is healthy');
+
+        // No transport -> not a decoder stall. That is a network problem, and
+        // the recovery for it is completely different.
+        assertEqual(fn(0, 0, 60, W), false, 'no bytes means no decoder stall');
+        assertEqual(fn(500, 0, 60, W), false, 'a trickle of bytes is not a live transport');
+
+        // A low-rate source: 5fps over 1.5s is ~7.5 frames and 25% of nominal
+        // is 1.9, so a normal low-fps decode is never flagged.
+        assertEqual(fn(20000, 7, 5, W), false, 'a healthy 5fps source is not a stall');
+        assertEqual(fn(20000, 0, 5, W), true, 'a hard stop on a 5fps source is a stall');
+
+        // Without a usable baseline the function must not guess, and must not
+        // fire: a missing fps or a missing span is "no evidence", not "stall".
+        assertEqual(fn(20000, 2, null, W), false, 'no fps baseline: only a hard zero fires');
+        assertEqual(fn(20000, 2, 0, W), false, 'a zero fps is not a usable baseline');
+        assertEqual(fn(20000, 2, NaN, W), false, 'a NaN fps is not a usable baseline');
+        assertEqual(fn(20000, 2, 60, 0), false, 'a zero span is not a usable baseline');
+        assertEqual(fn(20000, 2, 60, -1), false, 'a negative span is not a usable baseline');
+        assertEqual(fn(20000, 2, 60, NaN), false, 'a NaN span is not a usable baseline');
+
+        // A counter reset mid-session must read as "no evidence", never as a
+        // stall (which would tear a healthy session down).
+        assertEqual(fn(20000, -5, 60, W), false, 'a negative delta is a counter reset, not a stall');
+    },
     // The accommodation must be drop-gated: the measured jitter-buffer delay
     // always tracks the jitterBufferTarget hint Chrome was given, so a
     // controller that raises to meet the measurement chases its own tail and
@@ -1373,6 +1663,11 @@ Object.assign(cases, {
                 jitterFloorEmaMs: 0,
                 abrBadSec: 0,
                 abrCalmSec: 0,
+                abrDowngradedForLink: false,
+                catchUpRate: 1,
+                // The stress-hold level the supervisor's raise/release machine
+                // compares against (a module-level const in app.js).
+                ADAPTIVE_RAISE_MS: 350,
                 lastRenditionSwitchAt: -60000,
                 renditionPathsItems: ladder.h264Source,
                 activeStreamPath: 'live',
@@ -1457,6 +1752,122 @@ Object.assign(cases, {
         spike.run();
         assertEqual(spike.sandbox.switchedTo, undefined,
             'fewer than 8 stressed seconds must not switch');
+
+        // F2 (accumulator dead band). `abrCalm` used to be an INDEPENDENT test
+        // rather than a relaxation of `abrStressed`: stress fired above 120ms
+        // jitter while calm required under 40ms, so a link sitting anywhere in
+        // between was neither, and BOTH accumulators froze permanently. A
+        // struggling viewer then never stepped down, and a viewer that HAD
+        // stepped down never came back.
+        //
+        // 70ms jitter with no loss sits below the calm bound, so the calm
+        // counter must advance. That is what proves the branch is reachable
+        // and the hysteresis is live.
+        const deadBand = make({ lastNetJitterMs: 70, lastLossPct: 0, abrCalmSec: 0 });
+        deadBand.run();
+        assertEqual(deadBand.sandbox.switchedTo, undefined,
+            'a 70ms-jitter link is not stressed enough to downgrade');
+        assertEqual(deadBand.sandbox.abrCalmSec, 1,
+            'a sub-90ms link must count as calm (accumulator dead band)');
+
+        // The deliberate hysteresis span (90-120ms): neither stressed nor
+        // calm. Holding BOTH counters is what froze a downgraded viewer at
+        // 100ms jitter forever, so the span advances the calm counter at a
+        // FRACTION instead: too slow to upgrade a bad link quickly, but it
+        // terminates, which is the property that matters.
+        const midBand = make({ lastNetJitterMs: 100, lastLossPct: 0, abrCalmSec: 0, abrBadSec: 0 });
+        midBand.run();
+        assertEqual(midBand.sandbox.switchedTo, undefined,
+            'a 100ms-jitter link must not be downgraded');
+        // Fractional, and deliberately SLOW: 0.05 means 400 ticks to the 20s
+        // threshold, which outlasts the 60s switch cooldown. A faster factor
+        // (0.25 = 80 ticks) let a link hovering in the band upgrade to full
+        // bitrate and downgrade again every ~80s, trading a 2-4s black screen
+        // forever. The property that matters is that it terminates at all.
+        assertEqual(midBand.sandbox.abrCalmSec, 0.05,
+            'the ambiguous band must advance calm progress by a small fraction, not zero');
+        assertEqual(midBand.sandbox.abrBadSec, 0,
+            'a 100ms-jitter link is not yet stressed');
+        // Termination, driven through the REAL supervisor: 400 ticks is inside
+        // the bound, so a permanently-ambiguous link still eventually climbs
+        // back rather than being pinned forever. A hold-at-zero counter could
+        // never do this.
+        let ambig = make({
+            lastNetJitterMs: 100, lastLossPct: 0, abrCalmSec: 0, abrBadSec: 0,
+            renditionPathsItems: ladder.h264Source, activeStreamPath: 'live-av1',
+            lastRenditionSwitchAt: -60000
+        });
+        let ticks = 0;
+        while (ambig.sandbox.abrCalmSec < 20 && ticks < 500) { ambig.run(); ticks += 1; }
+        assertEqual(ambig.sandbox.switchedTo, 'live',
+            'a link sitting in the ambiguous band must still be able to climb back to full quality');
+        assert(ticks <= 500, 'the ambiguous band must terminate rather than freeze');
+        // ...but NOT within the switch cooldown, which is what stops the
+        // upgrade/stress/downgrade oscillation.
+        assert(ticks > 60,
+            `ambiguous progress must be slower than the 60s cooldown (took ${ticks} ticks)`);
+        // One tick later, once it settles into the calm band, it must advance at
+        // full rate — proving the fraction is a weighting, not a brake on
+        // recovery.
+        const recovered = make({ lastNetJitterMs: 80, lastLossPct: 0, abrCalmSec: 0, abrBadSec: 0 });
+        recovered.run();
+        assertEqual(recovered.sandbox.abrCalmSec, 1,
+            'a link settling under the calm bound must accumulate at full rate');
+
+        // A genuinely stressed link still takes the stress branch and never the
+        // calm one, so the fix did not invert the predicates.
+        const stillStressed = make({ lastNetJitterMs: 130, lastLossPct: 0, abrCalmSec: 3 });
+        stillStressed.run();
+        assertEqual(stillStressed.sandbox.abrCalmSec, 0,
+            'a 130ms-jitter link must reset the calm counter, not advance it');
+        assertEqual(stillStressed.sandbox.abrBadSec, 1,
+            'a 130ms-jitter link must count as stressed');
+
+        // The same hysteresis must hold on the LOSS axis. 3% loss is between
+        // the 2% calm and 5% stress bounds, so it is ambiguous: not calm, not
+        // stressed. It must NOT count as calm, or the upgrade-back counter would
+        // run on a lossy link — but it must make fractional progress rather
+        // than freeze, for the same reason the jitter band does.
+        const midLoss = make({ lastLossPct: 3, lastNetJitterMs: 10, abrCalmSec: 0 });
+        midLoss.run();
+        assertEqual(midLoss.sandbox.abrCalmSec, 0.05,
+            '3% loss is ambiguous: minimal progress only, never full calm credit');
+        assertEqual(midLoss.sandbox.abrBadSec, 0,
+            '3% loss is below the stress bound');
+        // Below 2% it is unambiguously calm and earns full credit.
+        const lowLoss = make({ lastLossPct: 1, lastNetJitterMs: 10, abrCalmSec: 0 });
+        lowLoss.run();
+        assertEqual(lowLoss.sandbox.abrCalmSec, 1,
+            '1% loss with low jitter is unambiguously calm');
+        // At or above the 5% stress bound it is stressed and both reset.
+        const highLoss = make({ lastLossPct: 6, lastNetJitterMs: 10, abrCalmSec: 5 });
+        highLoss.run();
+        assertEqual(highLoss.sandbox.abrCalmSec, 0,
+            '6% loss must reset the calm counter entirely');
+        assertEqual(highLoss.sandbox.abrBadSec, 1, '6% loss must count as stressed');
+
+        // The ambiguous band keeps the counter alive so a marginal link is never
+        // pinned forever — but a counter that reached 20 while the link is
+        // still measurably lossy must NOT be permission to climb back to full
+        // bitrate. The guard sits at the point of action, not on the
+        // accumulator, so the two concerns stay independent.
+        const lossyUpgrade = make({
+            lastLossPct: 3, lastNetJitterMs: 10, abrCalmSec: 25, abrBadSec: 0,
+            renditionPathsItems: ladder.h264Source, activeStreamPath: 'live-av1',
+            lastRenditionSwitchAt: -60000
+        });
+        lossyUpgrade.run();
+        assertEqual(lossyUpgrade.sandbox.switchedTo, undefined,
+            'a saturated calm counter must not upgrade a link that is still losing 3% of its packets');
+        // Once the loss actually recovers, the very same state must upgrade.
+        const recoveredLoss = make({
+            lastLossPct: 0.5, lastNetJitterMs: 10, abrCalmSec: 25, abrBadSec: 0,
+            renditionPathsItems: ladder.h264Source, activeStreamPath: 'live-av1',
+            lastRenditionSwitchAt: -60000
+        });
+        recoveredLoss.run();
+        assertEqual(recoveredLoss.sandbox.switchedTo, 'live',
+            'with loss back under the calm bound the upgrade must proceed');
     },
 });
 
@@ -1702,6 +2113,14 @@ Object.assign(cases, {
                 jitterFloorEmaMs: 0,
                 abrBadSec: 0,
                 abrCalmSec: 0,
+                // New state: records that the ABR ladder (not decode pressure)
+                // moved this viewer down, so the decode-pressure branch must not
+                // walk them back up the ladder. Defaults to false here, which is
+                // the pre-existing behaviour every other case in this file
+                // assumes, so only the dedicated new assertions set it.
+                abrDowngradedForLink: false,
+                // Live-edge catch-up state, read by the drop-window gate.
+                catchUpRate: 1,
                 lastRenditionSwitchAt: -60000,
                 renditionPathsItems: ladder.av1Source,
                 activeStreamPath: 'live',
@@ -1749,6 +2168,54 @@ Object.assign(cases, {
         short.run();
         assertEqual(short.sandbox.switchedTo, undefined,
             'fewer than 8 lag seconds must not switch');
+
+        // F4 (ping-pong): a viewer the ABR ladder moved DOWN because the link
+        // could not carry full bitrate is on live-av1 for a NETWORK reason, not
+        // a decode reason. Decode pressure must not walk them back to full
+        // quality: that undoes the downgrade, the link stresses again 60s
+        // later, ABR steps down once more, and the pair trade two 2-4s WHEP
+        // teardowns per minute forever.
+        const abrMoved = make({
+            renditionPathsItems: ladder.h264Source,
+            activeStreamPath: 'live-av1',
+            abrDowngradedForLink: true
+        });
+        abrMoved.run();
+        assertEqual(abrMoved.sandbox.switchedTo, undefined,
+            'decode pressure must not undo an ABR network downgrade (ladder ping-pong)');
+
+        // F5: with no safe target, `decodeLagSec` must DECAY rather than sit at
+        // 30+ forever. It used to stay pinned, so the branch re-evaluated every
+        // tick and fired an unrequested switch the moment a rescue rendition
+        // became ready later in the session.
+        //
+        // Driven through the REAL supervisor across repeated ticks, not
+        // simulated: an assertion that just did the arithmetic in the test body
+        // would pass whatever the code did.
+        const noTarget = make({ renditionPathsItems: ladder.av1SourceNoFallback, decodeLagSec: 20 });
+        noTarget.run();
+        assert(noTarget.sandbox.decodeLagSec < 20,
+            'with no safe target, decodeLagSec must decay toward the threshold, not stay pinned');
+        assert(noTarget.sandbox.decodeLagSec >= 0,
+            'decodeLagSec must not decay below zero');
+        // Repeated ticks with nowhere to go must fully disarm the branch, so a
+        // rescue rendition becoming ready later cannot fire an unrequested
+        // switch off a stale reading.
+        let disarmed = make({ renditionPathsItems: ladder.av1SourceNoFallback, decodeLagSec: 20 });
+        let ticks = 0;
+        while (disarmed.sandbox.decodeLagSec > 7 && ticks < 200) { disarmed.run(); ticks += 1; }
+        assertEqual(disarmed.sandbox.decodeLagSec <= 7, true,
+            'repeated no-target ticks must decay decodeLagSec back below the 8s threshold');
+        // ...and once the rescue rendition IS ready, the disarmed viewer must
+        // NOT be switched unprompted.
+        const laterReady = make({
+            renditionPathsItems: ladder.av1SourceNoFallback, decodeLagSec: 20
+        });
+        for (let i = 0; i < 40; i += 1) laterReady.run();
+        laterReady.sandbox.renditionPathsItems = ladder.av1Source;
+        laterReady.run();
+        assertEqual(laterReady.sandbox.switchedTo, undefined,
+            'a viewer whose lag decayed while no target existed must not be switched when one appears later');
 
         // H264 source viewed through live-av1 under decode pressure -> 'live'.
         const h264Up = make({
@@ -2066,6 +2533,37 @@ Object.assign(cases, {
         assert(run.rate > 1, 'the drain must have been engaged, not a no-op');
         console.log(`    catch-up drained 1500ms of drift in ${run.seconds}s `
             + `(no black frame, no renegotiation)`);
+
+        // THE SETTLE-POINT TRAP, which the case above could never see because it
+        // only ever tested a bare base target.
+        //
+        // Chrome's measured jitterBufferDelay converges on the target it was
+        // GRANTED, and the buffer supervisor grants base + accommodation. So
+        // while accommodation is active the measured delay sits at, say, 1300ms
+        // while a settle point taken from the BARE base (180ms) sees a permanent
+        // 1120ms "excess". Catch-up therefore ramps to its cap and latches
+        // there: the viewer watches the stream 8% fast for the rest of the
+        // session, the browser time-stretches the audio with it, and the
+        // self-verification then concludes the device "cannot" catch up and
+        // hands the session to the hard 2-4s rejoin. Feeding the law the
+        // GRANTED target makes the excess zero, so the rate rests at 1.0.
+        const granted = 1300;
+        let held = 1;
+        for (let i = 0; i < 40; i += 1) {
+            // The measured delay has converged to the granted target and stays
+            // there: the app is deliberately holding that much buffer.
+            held = catchUpPlaybackRate(granted, granted, held);
+        }
+        assertEqual(held, 1,
+            'a session parked at its granted target must rest at 1.0x, not latch at the catch-up cap');
+
+        // The old behaviour, kept as an explicit contrast so the regression
+        // cannot come back unnoticed: with the BASE as the settle point and the
+        // delay at the grant, the law happily ramps to the cap.
+        let wrong = 1;
+        for (let i = 0; i < 40; i += 1) wrong = catchUpPlaybackRate(1300, 180, wrong);
+        assertEqual(wrong, 1.08,
+            'using the bare base as the settle point latches at 1.08x (the bug this guards)');
 
         // Convergence must not oscillate: a rate that flips above/below the
         // target every tick is a permanent A/V re-sync, which is the exact
