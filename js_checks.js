@@ -19,6 +19,12 @@ const vm = require('vm');
 const crypto = require('crypto');
 
 const APP_SOURCE = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
+// The browser broadcaster is a separate page with its own logic. Its pure
+// helpers (codec strings, level math, bitrate budget, SDP munging) are held to
+// the same standard as the player's: extracted from the shipped source by name
+// and evaluated against a stub sandbox, so the tests can never drift from the
+// code that actually runs in the browser.
+const BROADCAST_SOURCE = fs.readFileSync(path.join(__dirname, 'broadcast.js'), 'utf8');
 
 /* --------------------------------------------------------------------------
    Assertion helpers
@@ -170,7 +176,144 @@ function quietConsole() {
     return { log() {}, warn() {}, error() {}, info() {} };
 }
 
-module.exports = { APP_SOURCE, assert, assertEqual, countLine, extractFunction, extractConst, evaluateConst, compileFunction, quietConsole };
+module.exports = { APP_SOURCE, BROADCAST_SOURCE, assert, assertEqual, countLine, extractFunction, extractConst, evaluateConst, compileFunction, quietConsole };
+
+/* --------------------------------------------------------------------------
+   Studio (broadcast.js) helpers
+
+   The studio's pure functions close over a few module constants, so they are
+   compiled together into one sandbox rather than one function at a time. The
+   table is passed in explicitly, which also means a change to the level
+   thresholds cannot silently change what the tests assert.
+   -------------------------------------------------------------------------- */
+function compileStudioFns(names, extraGlobals) {
+    const sandbox = Object.assign({
+        console: quietConsole(),
+        Math,
+        Set,
+        Object,
+        Array,
+        JSON,
+        Number,
+        String,
+    }, extraGlobals || {});
+    // vm.createContext() returns the CONTEXTIFIED object, and that is what
+    // runInContext must be handed — passing the original plain object back
+    // throws "must be a vm.Context".
+    const context = vm.createContext(sandbox, { name: 'broadcast.js#studio' });
+    for (const name of names) {
+        const source = extractFunction(name, BROADCAST_SOURCE);
+        vm.runInContext(`globalThis.${name} = (${source});`, context, { filename: `broadcast.js#${name}` });
+    }
+    return context;
+}
+
+// The level table is plain data, so it is evaluated in an empty context and
+// copied back out. `{}` is NOT a context — handing one to runInContext throws
+// "must be a vm.Context" — hence the explicit createContext here.
+function studioLevelTable() {
+    const context = vm.createContext({}, { name: 'broadcast.js#H264_LEVEL_TABLE' });
+    return vm.runInContext(`(${extractConst('H264_LEVEL_TABLE', BROADCAST_SOURCE)})`, context);
+}
+
+// A harness for encodeOnce, the per-frame encode step.
+//
+// This exists because the only alternative was grepping the source for a string
+// like "value: true", which a reviewer showed is satisfied by deleting the very
+// thing it claims to test: lastKeyframeAt is initialised to 0, so the steady
+// state path `now - lastKeyframeAt >= gopMs` forces a keyframe on the very
+// first tick anyway. Running the real function is the only way the "first frame
+// is a keyframe, later frames are not" behaviour is actually pinned.
+//
+// The module-scoped `let`s the function reads and writes (lastKeyframeAt,
+// videoFrameFailures) are declared on the vm context as plain globals. A
+// function expression's free variables resolve against the context, and an
+// assignment to an undeclared-in-scope name writes straight back to it — so
+// the real source runs verbatim with no rewriting.
+// The AudioWorklet processor runs on a real-time audio thread in the browser,
+// where nothing can be diagnosed after the fact: a bad accumulator either plays
+// audio at the wrong rate or hangs the thread outright. So the class is
+// extracted and driven here with synthetic render quanta.
+//
+// This is not a convenience. The version this replaced emitted a full 480-sample
+// (10 ms) frame once per 128-sample (2.67 ms) render quantum on the silence
+// path — 3.75x the correct rate — which played audio fast, underran, and drifted
+// roughly 730 ms against video every second of broadcast. Only a test that
+// actually counts emitted frames catches that.
+function compileWorklet(frameSize, channels) {
+    const posted = [];
+    const workletSource = fs.readFileSync(path.join(__dirname, 'broadcast_audio_worklet.js'), 'utf8');
+    // Take the class body only, then stub the two browser globals it touches.
+    const classBody = workletSource.slice(
+        workletSource.indexOf('class StudioPcmTap'),
+        workletSource.indexOf('registerProcessor')
+    );
+    const sandbox = {
+        Float32Array,
+        Math,
+        registerProcessor: () => {},
+        // The audio clock the processor stamps frames with.
+        currentTime: 0,
+        AudioWorkletProcessor: class {
+            constructor() { this.port = { postMessage: (msg) => posted.push(msg) }; }
+        },
+    };
+    const context = vm.createContext(sandbox, { name: 'broadcast_audio_worklet.js' });
+    // A `class` declaration is lexically scoped to the script, so it is NOT
+    // placed on the context object. It is assigned to a global explicitly so
+    // the test can construct it.
+    vm.runInContext(`${classBody}\nglobalThis.StudioPcmTap = StudioPcmTap;`, context,
+        { filename: 'broadcast_audio_worklet.js' });
+    const instance = new context.StudioPcmTap({
+        processorOptions: { frameSize, channels },
+    });
+    return { instance, posted, context };
+}
+
+// One render quantum of `length` samples, all set to `value`.
+function quantum(length, value) {
+    const buf = new Float32Array(length);
+    if (value !== undefined) buf.fill(value);
+    return [buf];
+}
+
+function compileEncodeOnce(overrides) {
+    const opts = overrides || {};
+    const calls = [];
+
+    const sandbox = {
+        console: quietConsole(),
+        Math,
+        Number,
+        isFinite,
+        // A clock the test drives, so GOP expiry is deterministic.
+        performance: { now: () => (opts.now !== undefined ? opts.now : 0) },
+        state: {
+            videoEncoder: {
+                state: 'configured',
+                encodeQueueSize: (opts.encodeQueueSize !== undefined ? opts.encodeQueueSize : 0),
+                encode: (frame, options) => { calls.push(options); },
+            },
+            lastMediaClockSeconds: 0,
+            audioContext: null,
+            framesDropped: 0,
+        },
+        // `el` is a flat id -> element map; the canvas is all encodeOnce reads.
+        el: { 'studio-canvas': { width: 1920, height: 1080 } },
+        log: () => {},
+        mediaTimestampUs: () => 1000,
+    };
+    sandbox.VideoFrame = opts.videoFrameThrows
+        ? function () { throw new Error('canvas is zero-sized'); }
+        : function () { this.close = () => {}; };
+
+    const context = vm.createContext(sandbox, { name: 'broadcast.js#encodeOnce' });
+    vm.runInContext('var lastKeyframeAt = 0; var videoFrameFailures = 0;'
+        + ' var lastFrameFailureLoggedAt = 0;', context);
+    vm.runInContext(`globalThis.encodeOnce = (${extractFunction('encodeOnce', BROADCAST_SOURCE)});`,
+        context, { filename: 'broadcast.js#encodeOnce' });
+    return { fn: context.encodeOnce, calls, sandbox, context };
+}
 
 /* --------------------------------------------------------------------------
    Shared fixtures
@@ -216,6 +359,43 @@ function compileOptimizeSdp() {
     const { fn } = compileFunction('optimizeSdp', { console: quietConsole() });
     return fn;
 }
+
+// A SENDonly offer as Chrome produces it, for the studio's publishing munger:
+// CRLF, an H.264 payload carrying the browser's own fmtp (packetization-mode=0
+// and a High-profile level, both of which the studio must overwrite), a VP8
+// and an AV1 payload that must keep their own parameters, an audio section with
+// its own fmtp that must never be touched, and a routable host candidate.
+const PUBLISH_SDP = [
+    'v=0',
+    'o=- 8123456789012345678 2 IN IP4 127.0.0.1',
+    's=-',
+    't=0 0',
+    'a=group:BUNDLE 0 1',
+    'm=video 9 UDP/TLS/RTP/SAVPF 96 98 99',
+    'c=IN IP4 0.0.0.0',
+    'a=rtcp:9 IN IP4 0.0.0.0',
+    'a=ice-ufrag:abcd',
+    'a=ice-pwd:password',
+    'a=fingerprint:sha-256 AA:BB:CC',
+    'a=setup:actpass',
+    'a=mid:0',
+    'a=sendonly',
+    'a=rtcp-fb:96 nack',
+    'a=rtpmap:96 H264/90000',
+    'a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=640c1f',
+    'a=rtpmap:98 VP8/90000',
+    'a=rtpmap:99 AV1/90000',
+    'a=fmtp:99 level-idx=5;profile=0;tier=0',
+    'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+    'c=IN IP4 0.0.0.0',
+    'a=mid:1',
+    'a=sendonly',
+    'a=rtpmap:111 opus/48000/2',
+    'a=fmtp:111 minptime=10;useinbandfec=1',
+    'a=candidate:1 1 udp 2130706431 192.168.1.50 54321 typ host',
+    'a=end-of-candidates',
+    ''
+].join('\r\n');
 
 function sectionOf(lines, startMarker, endMarker) {
     const start = lines.findIndex((line) => line.startsWith(startMarker));
@@ -1629,7 +1809,578 @@ Object.assign(cases, {
         };
         compileFunction('syncUnmuteOverlay', nullSandbox).fn();
     },
+
+    /* ==================================================================
+       Studio (broadcast.js) — the browser broadcaster
+       ================================================================== */
+
+    'studio-h264-level-matches-resolution-and-framerate'() {
+        const scope = compileStudioFns(
+            ['macroblocksFor', 'h264LevelIdcFor', 'h264CodecString'],
+            { H264_LEVEL_TABLE: studioLevelTable() }
+        );
+        // Macroblocks are 16x16, so 1920x1080 is 120*68 = 8160 MB.
+        assertEqual(scope.macroblocksFor(1920, 1080), 8160, '1920x1080 macroblock count');
+        assertEqual(scope.macroblocksFor(1280, 720), 3600, '1280x720 macroblock count');
+
+        // 1080p60 = 8160 MB * 60 = 489600 MB/s, which only level 4.2 (522240)
+        // covers. Claiming 4.0/4.1 would under-declare the stream and a decoder
+        // that trusts profile-level-id would refuse it.
+        assertEqual(scope.h264LevelIdcFor(1920, 1080, 60), 0x2a, '1080p60 -> level 4.2');
+        // 1080p30 halves the rate and fits level 4.0.
+        assertEqual(scope.h264LevelIdcFor(1920, 1080, 30), 0x28, '1080p30 -> level 4.0');
+        // 720p30 = 3600 * 30 = 108000 MB/s -> level 3.1.
+        assertEqual(scope.h264LevelIdcFor(1280, 720, 30), 0x1f, '720p30 -> level 3.1');
+        // 2160p60 = 32400 MB * 60 = 1944000 -> level 5.2 (2073600).
+        assertEqual(scope.h264LevelIdcFor(3840, 2160, 60), 0x34, '4K60 -> level 5.2');
+    },
+
+    'studio-h264-codec-string-is-constrained-baseline'() {
+        const scope = compileStudioFns(
+            ['macroblocksFor', 'h264LevelIdcFor', 'h264CodecString', 'profileLevelIdFromCodec'],
+            { H264_LEVEL_TABLE: studioLevelTable() }
+        );
+        // Constrained baseline (42) is the profile MediaMTX documents for
+        // browser publishing, and the only one guaranteed not to emit B-frames.
+        const codec = scope.h264CodecString(1920, 1080, 30);
+        assert(/^avc1\.42e0[0-9a-f]{2}$/.test(codec), `constrained-baseline codec string, got ${codec}`);
+        assertEqual(scope.profileLevelIdFromCodec(codec), '42e028', 'profile-level-id parsed back out');
+
+        // The reverse direction must be a clean 6-digit lowercase hex triple.
+        assertEqual(scope.profileLevelIdFromCodec('avc1.42E02A'), '42e02a', 'uppercase input is normalised');
+    },
+    'studio-av1-level-rises-with-pixel-rate'() {
+        const scope = compileStudioFns(
+            ['macroblocksFor', 'h264LevelIdcFor', 'av1CodecString', 'codecStringFor'],
+            { H264_LEVEL_TABLE: studioLevelTable() }
+        );
+        // av01.P.LLT.DD: P is profile, LL is a two-digit level index, T is tier.
+        assert(/^av01\.0\.\d{2}M\.08$/.test(scope.av1CodecString(1920, 1080, 30)),
+            'AV1 codec string shape');
+
+        const levelOf = (w, h, f) => parseInt(scope.av1CodecString(w, h, f).split('.')[2], 10);
+        // The declared level must be monotonic: a bigger frame or a faster frame
+        // rate can never lower it, or a 4K60 broadcast would announce 4K30's
+        // level and under-declare itself exactly like the H.264 case.
+        const ladder = [
+            levelOf(640, 480, 30),
+            levelOf(1280, 720, 30),
+            levelOf(1920, 1080, 30),
+            levelOf(1920, 1080, 60),
+            levelOf(3840, 2160, 60),
+        ];
+        for (let i = 1; i < ladder.length; i += 1) {
+            assert(ladder[i] >= ladder[i - 1],
+                `AV1 level must not fall as the picture grows: ${ladder.join(' -> ')}`);
+        }
+        assert(ladder[ladder.length - 1] > ladder[0], '4K60 must outrank 480p30');
+        // The family dispatcher must agree with the per-family builders.
+        assertEqual(scope.codecStringFor('av1', 1920, 1080, 30), scope.av1CodecString(1920, 1080, 30),
+            'codecStringFor routes AV1 to the AV1 builder');
+        assertEqual(scope.codecStringFor('vp8', 1920, 1080, 30), 'vp8', 'VP8 has no level suffix');
+    },
+
+    'studio-odd-dimensions-are-forced-even'() {
+        const scope = compileStudioFns(['evenDimensionsFor']);
+        // Chrome's software H.264 encoder rejects odd dimensions outright, and an
+        // odd height also breaks the packetizer's 16-pixel macroblock maths.
+        assertEqual(scope.evenDimensionsFor(1921, 1081), { width: 1920, height: 1080 },
+            'odd dimensions are floored to even');
+        assertEqual(scope.evenDimensionsFor(1920, 1080), { width: 1920, height: 1080 },
+            'even dimensions pass through unchanged');
+        // Degenerate input must still yield something an encoder accepts.
+        assertEqual(scope.evenDimensionsFor(1, 1), { width: 16, height: 16 },
+            'tiny input is raised to the 16x16 macroblock floor');
+    },
+
+    'studio-suggested-bitrate-is-monotonic-and-clamped'() {
+        const scope = compileStudioFns(['suggestedBitrateBps']);
+        const at = (w, h, f, c) => scope.suggestedBitrateBps(w, h, f, c);
+
+        // More pixels or more frames can only cost more.
+        assert(at(1920, 1080, 60, 'h264') > at(1920, 1080, 30, 'h264'), '60fps beats 30fps');
+        assert(at(3840, 2160, 30, 'h264') > at(1920, 1080, 30, 'h264'), '4K beats 1080p');
+        // AV1 is the whole reason to pick it: cheaper per pixel than H.264.
+        assert(at(1920, 1080, 30, 'av1') < at(1920, 1080, 30, 'h264'), 'AV1 suggests less than H.264');
+
+        // Clamped to the band this uplink can actually carry. An unclamped
+        // 4K60 H.264 suggestion would be ~24 Mbps, which this hotspot cannot.
+        assert(at(3840, 2160, 60, 'h264') <= 20000000, 'ceiling is 20 Mbps');
+        assert(at(320, 240, 15, 'h264') >= 250000, 'floor is 250 kbps');
+        // Rounded to whole kbps so the UI slider and the encoder agree exactly.
+        assertEqual(at(1920, 1080, 30, 'h264') % 1000, 0, 'bitrate is a whole number of kbps');
+    },
+    // The codec selector is only real if the OFFER carries exactly one codec.
+    // Re-ordering is not enough: MediaMTX's answerer (Pion) picks the first
+    // family it supports, so leaving VP8/VP9/AV1 in the offer alongside H.264
+    // means "pick AV1" can still be answered with H.264 — a live-looking
+    // broadcast that is quietly the wrong codec, with the bridge then building
+    // renditions for the wrong source.
+    'studio-publish-sdp-prunes-to-the-selected-codec'() {
+        const scope = compileStudioFns(['optimizePublishSdp']);
+
+        // --- AV1 selected: every other video codec must be gone. ---
+        const av1 = scope.optimizePublishSdp(PUBLISH_SDP, { onlyCodecName: 'AV1' });
+        const av1Video = sectionOf(av1.split('\r\n'), 'm=video', 'm=audio');
+        assert(av1Video.lines.some((line) => line === 'a=rtpmap:99 AV1/90000'),
+            'the selected codec survives');
+        assert(!av1Video.lines.some((line) => /^a=rtpmap:\d+ H264\//.test(line)),
+            'H.264 is pruned when AV1 is selected');
+        assert(!av1Video.lines.some((line) => /^a=rtpmap:\d+ VP8\//.test(line)),
+            'VP8 is pruned when AV1 is selected');
+        assert(!av1Video.lines.some((line) => /^a=rtpmap:\d+ VP9\//.test(line)),
+            'VP9 is pruned when AV1 is selected');
+
+        // A payload type left in the m= line after its rtpmap was removed is a
+        // malformed offer: the answerer indexes its format table by that list
+        // and fails the whole handshake.
+        const listedPts = av1Video.lines[0].trim().split(/\s+/).slice(3);
+        assert(listedPts.indexOf('0') === -1, 'the m= line carries no bare 0 placeholder');
+        assert(listedPts.length > 0, 'the m= line still lists the surviving codec');
+        for (const pt of listedPts) {
+            assert(av1Video.lines.indexOf('a=rtpmap:' + pt + ' AV1/90000') !== -1,
+                'payload ' + pt + ' listed in m= has a matching rtpmap');
+        }
+
+        // --- H.264 selected: rtx must follow its apt parent. ---
+        // rtx is loss recovery; dropping it while keeping the media codec is
+        // legal but throws away the cheapest repair there is. rtx is addressed
+        // by `apt=<media pt>`, so it survives exactly when its parent does.
+        //
+        // Built locally rather than reusing PUBLISH_SDP: that fixture carries
+        // no rtx payload at all, and the apt-following rule is the whole point
+        // of this half of the test.
+        const withRtx = [
+            'v=0',
+            'm=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99',
+            'c=IN IP4 0.0.0.0',
+            'a=mid:0',
+            'a=sendonly',
+            'a=rtpmap:96 H264/90000',
+            'a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f',
+            // rtx for the H.264 payload (pt 96)
+            'a=rtpmap:97 rtx/90000',
+            'a=fmtp:97 apt=96',
+            'a=rtpmap:98 VP8/90000',
+            // a rtx whose parent is VP8 — must be dropped even though rtx
+            // itself is "kept", because its apt parent did not survive
+            'a=rtpmap:100 rtx/90000',
+            'a=fmtp:100 apt=98',
+            'a=rtpmap:99 AV1/90000',
+            'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+            'c=IN IP4 0.0.0.0',
+            'a=rtpmap:111 opus/48000/2',
+            'a=fmtp:111 minptime=10;useinbandfec=1',
+        ].join('\r\n');
+        const h264 = scope.optimizePublishSdp(withRtx, {
+            onlyCodecName: 'H264',
+            h264ProfileLevelId: '42e028',
+        });
+        const h264Video = sectionOf(h264.split('\r\n'), 'm=video', 'm=audio');
+        assert(h264Video.lines.some((line) => /^a=rtpmap:\d+ H264\//.test(line)),
+            'H.264 survives when H.264 is selected');
+
+        // The rtx whose apt parent is the surviving H.264 payload is kept.
+        const rtxPt = h264Video.lines
+            .find((line) => line === 'a=rtpmap:97 rtx/90000');
+        assert(rtxPt, 'the RTX payload is kept alongside its H.264 parent');
+        assert(h264Video.lines.indexOf('a=fmtp:97 apt=96') !== -1,
+            'the surviving RTX keeps its apt= line');
+        assert(h264Video.lines.indexOf('a=rtpmap:97 rtx/90000') !== -1,
+            'RTX apt= still points at a payload the offer keeps');
+
+        // The rtx whose apt parent was pruned goes with it. Keeping an rtx
+        // that references a payload type no longer in the offer is a dangling
+        // reference — the answerer cannot resolve apt=96's neighbour and the
+        // retransmission stream is simply broken.
+        assert(h264Video.lines.indexOf('a=rtpmap:100 rtx/90000') === -1,
+            'an RTX whose apt parent was pruned is dropped with it');
+        assert(h264Video.lines.indexOf('a=fmtp:100 apt=98') === -1,
+            "the dropped RTX's apt= line goes with it");
+
+        assert(!h264Video.lines.some((line) => /^a=rtpmap:\d+ (AV1|VP8)\//.test(line)),
+            'non-H.264 codecs are pruned when H.264 is selected');
+
+        // Every payload still listed in the m= line must still have an rtpmap.
+        const h264Pts = h264Video.lines[0].trim().split(/\s+/).slice(3);
+        for (const pt of h264Pts) {
+            assert(h264Video.lines.some((line) => line.startsWith('a=rtpmap:' + pt + ' ')),
+                'payload ' + pt + ' listed in m= has a matching rtpmap');
+        }
+
+        // --- The audio section must be completely untouched. ---
+        // Pruning is scoped to the video m-line; it must never touch the audio
+        // section's Opus parameters, which the packetizer needs.
+        assert(h264.includes('a=rtpmap:111 opus/48000/2'),
+            'the Opus rtpmap survives video pruning');
+        assert(h264.includes('a=fmtp:111 minptime=10;useinbandfec=1'),
+            'the Opus fmtp survives video pruning');
+
+        // --- No pruning when no codec is named (the native engine path). ---
+        assertEqual(scope.optimizePublishSdp(PUBLISH_SDP, {}), PUBLISH_SDP,
+            'without onlyCodecName the offer is passed through unchanged');
+    },
+
+    // Silently accepting a codec the answerer refused is how "I picked AV1"
+    // ends up as H.264 with no indication anything went wrong.
+    'studio-negotiated-codec-is-read-back-from-the-answer'() {
+        const scope = compileStudioFns(['negotiatedVideoCodec', 'sdpCodecNameFor']);
+
+        const answer = [
+            'v=0',
+            'm=video 9 UDP/TLS/RTP/SAVPF 96 97',
+            'c=IN IP4 0.0.0.0',
+            // RTX is listed FIRST on purpose: it is a repair payload and must
+            // never be mistaken for the negotiated media codec.
+            'a=rtpmap:97 rtx/90000',
+            'a=fmtp:97 apt=96',
+            'a=rtpmap:96 AV1/90000',
+            'a=fmtp:96 level-idx=5;profile=0;tier=0',
+            'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+            'a=rtpmap:111 opus/48000/2',
+        ].join('\r\n');
+        assertEqual(scope.negotiatedVideoCodec(answer), 'AV1',
+            'the media codec is found even when rtx is listed before it');
+
+        const audioOnly = ['v=0', 'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=rtpmap:111 opus/48000/2'].join('\r\n');
+        assertEqual(scope.negotiatedVideoCodec(audioOnly), null,
+            'an audio-only answer reports no video codec');
+        assertEqual(scope.negotiatedVideoCodec(''), null, 'an empty answer reports no codec');
+        assertEqual(scope.negotiatedVideoCodec(null), null, 'a missing answer reports no codec');
+
+        // The SDP spelling is what the pruner matches on. Chrome writes
+        // "VP8"/"VP9" in SDP where WebCodecs says "vp8"/"vp09.00.10.08";
+        // pruning on the WebCodecs spelling would silently keep everything and
+        // make the codec selector a no-op.
+        assertEqual(scope.sdpCodecNameFor('vp8'), 'VP8', 'VP8 uses the SDP spelling');
+        assertEqual(scope.sdpCodecNameFor('vp9'), 'VP9', 'VP9 uses the SDP spelling');
+        assertEqual(scope.sdpCodecNameFor('h264'), 'H264', 'H264 uses the SDP spelling');
+        assertEqual(scope.sdpCodecNameFor('av1'), 'AV1', 'AV1 uses the SDP spelling');
+        assertEqual(scope.sdpCodecNameFor('nonsense'), null, 'an unknown codec has no SDP name');
+    },
+
+    // A live screen share that QUEUES under backpressure turns one dropped
+    // frame into unbounded latency ending in a multi-second freeze. The gate
+    // must refuse to write while the previous chunk is unconsumed, and must
+    // still let the stream through once it drains.
+    'studio-chunk-submission-drops-instead-of-queueing'() {
+        const scope = compileStudioFns(['submitChunk']);
+
+        let accepted = 0;
+        const mk = (desiredSize) => ({
+            desiredSize,
+            write() { accepted += 1; return Promise.resolve(); },
+        });
+
+        // Room available: the frame goes straight through.
+        assert(scope.submitChunk(mk(1), { n: 1 }) === true, 'a frame is accepted when there is room');
+        assertEqual(accepted, 1, 'exactly one write for one frame');
+
+        // The packetizer is still busy with the previous frame. desiredSize <= 0
+        // is the backpressure signal, and the frame must be DROPPED, not queued.
+        accepted = 0;
+        assert(scope.submitChunk(mk(0), { n: 2 }) === false,
+            'a frame is dropped while the packetizer is busy');
+        assert(scope.submitChunk(mk(-1), { n: 3 }) === false,
+            'a negative desiredSize also drops');
+        assertEqual(accepted, 0, 'a dropped frame must not reach the writer at all');
+
+        // No writer yet (the transform has not been constructed).
+        assert(scope.submitChunk(null, { n: 4 }) === false, 'no writer means no frame');
+
+        // A writer that throws must not take the encoder's output callback
+        // down with it — a throw here surfaces as an unhandled rejection
+        // inside the VideoEncoder output callback.
+        const exploding = { desiredSize: 1, write() { throw new Error('stream closed'); } };
+        assert(scope.submitChunk(exploding, { n: 5 }) === false, 'a throwing writer is a drop, not a crash');
+
+        // A writer that returns a rejected promise must be handled, or the
+        // rejection escapes as an unhandled rejection.
+        const rejecting = { desiredSize: 1, write() { return Promise.reject(new Error('aborted')); } };
+        assert(scope.submitChunk(rejecting, { n: 6 }) === true, 'a rejected write is not a synchronous failure');
+    },
+
+    // Video and audio used two different clocks (performance.now() vs
+    // AudioContext.currentTime) — different origins and different crystals, so
+    // the offset between the two tracks drifted over a long broadcast. Both
+    // must now come from the AudioContext, and the fallback must stay
+    // monotonic.
+    'studio-av-tracks-share-one-clock'() {
+        const sandbox = {
+            state: { audioContext: { state: 'running', currentTime: 12.345 } },
+            performance: { now: () => 999 },
+        };
+        const scope = compileStudioFns(['mediaTimestampUs'], sandbox);
+
+        const first = scope.mediaTimestampUs();
+        assertEqual(first, 12345000, 'a running AudioContext clock is used, in microseconds');
+
+        // currentTime advances in 128-frame render quanta, so two frames inside
+        // one quantum must not share or reverse a timestamp. The held value
+        // keeps the sequence monotonic for the RTP timestamp mapper.
+        // (compileStudioFns returns the contextified sandbox itself.)
+        scope.state.lastMediaClockSeconds = 12.345;
+        const second = scope.mediaTimestampUs();
+        assertEqual(second, first, 'a quantised clock holds the last value rather than repeating');
+
+        // A held value that is not a usable number must not poison the clock.
+        // NaN reaching `new VideoFrame({timestamp})` throws, and because the
+        // throw is caught per frame the broadcast just silently stops
+        // producing pictures while still reporting "live".
+        scope.state.lastMediaClockSeconds = NaN;
+        const recovered = scope.mediaTimestampUs();
+        assertEqual(recovered, first, 'a NaN held value recovers to the live clock, not NaN');
+
+        // Advancing the audio clock must advance the frame timestamp with it —
+        // this is the property that ties the two tracks to one timeline.
+        scope.state.audioContext.currentTime = 12.400;
+        const third = scope.mediaTimestampUs();
+        assertEqual(third, 12400000, 'the frame clock follows the audio clock');
+        assert(third > second, 'frame timestamps are strictly increasing as the audio clock advances');
+
+        // A suspended or missing context falls back to performance.now(), which
+        // is the only clock available for a video-only broadcast.
+        const suspended = compileStudioFns(['mediaTimestampUs'], {
+            state: { audioContext: { state: 'suspended', currentTime: 5 } },
+            performance: { now: () => 2 },
+        });
+        assertEqual(suspended.mediaTimestampUs(), 2000,
+            'a suspended context falls back to performance.now() in microseconds');
+
+        const noAudio = compileStudioFns(['mediaTimestampUs'], {
+            state: { audioContext: null },
+            performance: { now: () => 3 },
+        });
+        assertEqual(noAudio.mediaTimestampUs(), 3000,
+            'a video-only broadcast uses performance.now()');
+    },
+
+    // A frame rate of zero must not become a zero/infinite period, which would
+    // either spin the timer or stop encoding entirely.
+    'studio-encode-period-matches-the-requested-framerate'() {
+        const period = (fps) => 1000 / Math.max(1, fps);
+        assertEqual(Math.round(period(30)), 33, '30 fps is a ~33 ms period');
+        assertEqual(Math.round(period(60)), 17, '60 fps is a ~17 ms period');
+        // The old loop used periodMs / 2 as the interval and encoded on every
+        // tick, which is why a 30 fps setting actually produced ~59 fps. Guard
+        // the arithmetic that caused it.
+        assert(period(30) / 2 > 16 && period(30) / 2 < 17,
+            'a half-period tick is ~16 ms, i.e. ~59 fps — never use it as the period');
+        assertEqual(1000 / Math.max(1, 0), 1000, 'a zero frame rate is clamped to 1 fps');
+    },
+
+    'studio-publish-sdp-rewrites-only-the-h264-profile'() {
+        const scope = compileStudioFns(['optimizePublishSdp']);
+        const out = scope.optimizePublishSdp(PUBLISH_SDP, { h264ProfileLevelId: '42e028' });
+        const lines = out.split('\r\n');
+        const video = sectionOf(lines, 'm=video', 'm=audio');
+        const audio = sectionOf(lines, 'm=audio', 'a=candidate');
+
+        // The rewritten line must sit inside the video section, beside its own
+        // rtpmap: a fmtp attached anywhere else is silently ignored by the
+        // answerer, which shows up as "publishes but will not decode".
+        countLine(video.lines, 'a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e028', 1,
+            'the H.264 payload carries exactly one rewritten fmtp');
+
+        // The browser's own conflicting fmtp must be GONE, not merely preceded:
+        // two fmtp lines for one payload type is malformed and Pion may take
+        // either, which is a coin flip on the profile we actually send.
+        assert(!out.includes('packetization-mode=0'), 'the browser\'s packetization-mode=0 is replaced');
+        assert(!out.includes('profile-level-id=640c1f'), 'the browser\'s own profile-level-id is replaced');
+
+        // Exactly one fmtp per rewritten payload: the rewrite must not double up.
+        const fmtp96 = lines.filter((line) => line.startsWith('a=fmtp:96 '));
+        assertEqual(fmtp96.length, 1, 'payload 96 has exactly one fmtp line');
+
+        // Non-H.264 payloads keep their own parameters.
+        countLine(video.lines, 'a=fmtp:99 level-idx=5;profile=0;tier=0', 1,
+            'AV1 fmtp is left untouched');
+        countLine(video.lines, 'a=rtpmap:98 VP8/90000', 1, 'VP8 is left untouched');
+
+        // The audio section is never rewritten — Opus minptime is not ours.
+        countLine(audio.lines, 'a=fmtp:111 minptime=10;useinbandfec=1', 1,
+            'the audio fmtp is never touched');
+        assert(!audio.lines.some((line) => line.includes('profile-level-id')),
+            'no H.264 fmtp may leak into the audio section');
+    },
+
+    'studio-publish-sdp-forces-packetization-mode-1'() {
+        const scope = compileStudioFns(['optimizePublishSdp']);
+        // WebCodecs emits AVCC (length-prefixed) NAL units with avc:{format:'avc'},
+        // which is exactly packetization-mode=1. Announcing mode 0 while sending
+        // length-prefixed units is a silent corruption that decodes as noise.
+        const out = scope.optimizePublishSdp(PUBLISH_SDP, { h264ProfileLevelId: '42e02a' });
+        assert(out.includes('a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a'),
+            'packetization-mode is pinned to 1');
+
+        // With no profile to claim (the native engine, where the browser chose
+        // the codec) the SDP must pass through untouched rather than restating a
+        // profile we do not control.
+        const untouched = scope.optimizePublishSdp(PUBLISH_SDP, {});
+        assertEqual(untouched, PUBLISH_SDP, 'a null profile leaves the offer byte-identical');
+    },
+
+    'studio-publish-sdp-rejects-a-malformed-profile'() {
+        const scope = compileStudioFns(['optimizePublishSdp']);
+        // profile-level-id must be exactly 6 hex digits. A malformed value would
+        // be written straight into the SDP and rejected by the answerer.
+        for (const bad of ['', '42e0', '42e02az', null, undefined, 42]) {
+            const out = scope.optimizePublishSdp(PUBLISH_SDP, { h264ProfileLevelId: bad });
+            assertEqual(out, PUBLISH_SDP, `a malformed profile (${JSON.stringify(bad)}) must not be written`);
+        }
+    },
+
+    'studio-routable-candidate-rejects-mdns-obfuscation'() {
+        const scope = compileStudioFns(['hasRoutableCandidate']);
+        // MediaMTX is Pion and resolves no mDNS, so an offer carrying only
+        // <uuid>.local candidates has literally nothing to connect to.
+        assert(!scope.hasRoutableCandidate(PUBLISH_SDP.replace(
+            'a=candidate:1 1 udp 2130706431 192.168.1.50 54321 typ host',
+            'a=candidate:1 1 udp 2130706431 1f2e3d4c-5b6a-7988-9a0b-1c2d3e4f5061.local 54321 typ host'
+        )), 'an mDNS .local candidate is not routable');
+        assert(scope.hasRoutableCandidate(PUBLISH_SDP), 'a plain host candidate is routable');
+        assert(!scope.hasRoutableCandidate(''), 'an empty description has no candidate');
+        assert(!scope.hasRoutableCandidate(null), 'a null description has no candidate');
+    },
+
+    'studio-first-encoded-frame-is-a-keyframe-and-later-ones-are-not'() {
+        // Runs the REAL encodeOnce. A grep for "value: true" cannot distinguish
+        // a working force-keyframe path from a deleted one, because
+        // lastKeyframeAt starts at 0 and the GOP branch would force a keyframe
+        // on the first tick regardless.
+        //
+        // Both frames share ONE context, because lastKeyframeAt is module state:
+        // a second context would reset it to 0 and the GOP branch would fire
+        // again, making the "not a keyframe" assertion pass or fail for the
+        // wrong reason.
+        const { fn, calls, context } = compileEncodeOnce({ now: 1000 });
+        fn(1000, { value: true });
+        assertEqual(calls.length, 1, 'the first frame is encoded');
+        assertEqual(calls[0].keyFrame, true, 'the FIRST frame must be a keyframe');
+
+        // A second frame 100 ms later: still inside the 1 s GOP, so the steady
+        // state path must NOT force a keyframe.
+        calls.length = 0;
+        vm.runInContext('globalThis.__now = 1100;', context);
+        context.performance.now = () => 1100;
+        fn(1000, { value: false });
+        assertEqual(calls.length, 1, 'the second frame is encoded');
+        assertEqual(calls[0].keyFrame, false,
+            'a frame inside the GOP must NOT be a keyframe');
+    },
+
+    'studio-a-new-gop-forces-a-keyframe-again'() {
+        // lastKeyframeAt is seeded to 10_000 and the clock reads 12_000, which is
+        // past a 1 s GOP, so the steady-state branch must force a keyframe even
+        // though forceKeyRef says no.
+        const { fn, calls, context } = compileEncodeOnce({ now: 12000 });
+        vm.runInContext('lastKeyframeAt = 10000;', context);
+        fn(1000, { value: false });
+        assertEqual(calls.length, 1, 'the frame is encoded');
+        assertEqual(calls[0].keyFrame, true, 'the GOP boundary must force a keyframe');
+    },
+
+    'studio-encode-queue-overflow-drops-the-frame'() {
+        // A bounded queue is the difference between losing a frame and building
+        // unbounded latency, so the threshold must actually stop the encode.
+        const { fn, calls, sandbox } = compileEncodeOnce({ now: 500, encodeQueueSize: 4 });
+        fn(1000, { value: false });
+        assertEqual(calls.length, 0, 'no frame may be submitted while the queue is full');
+        assertEqual(sandbox.state.framesDropped, 1, 'the drop must be counted');
+
+        // The boundary: a queue of exactly 3 still encodes.
+        const ok = compileEncodeOnce({ now: 500, encodeQueueSize: 3 });
+        ok.fn(1000, { value: false });
+        assertEqual(ok.calls.length, 1, 'a queue at the limit must still encode');
+    },
+
+    'studio-a-video-frame-failure-is-counted_not_swallowed'() {
+        // A swallowed VideoFrame failure is not a no-op: no frame is encoded, so
+        // the broadcast freezes while the UI still reads LIVE. It must be
+        // counted so the stall is visible rather than invisible.
+        const { fn, calls, sandbox } = compileEncodeOnce({ now: 500, videoFrameThrows: true });
+        fn(1000, { value: false });
+        assertEqual(calls.length, 0, 'nothing is encoded when the frame cannot be built');
+        assertEqual(sandbox.videoFrameFailures, 1,
+            'a VideoFrame failure must be counted, not silently swallowed');
+    },
+
+    'studio-worklet-emits-frames-at-the-correct-rate'() {
+        // 1410 render quanta of 128 samples is 1410 * 128 = 180480 samples, which
+        // at a 480-sample frame size is exactly 376 frames. Anything else means
+        // the accumulator is emitting at the wrong rate.
+        const frameSize = 480;
+        const { instance, posted } = compileWorklet(frameSize, 2);
+        for (let i = 0; i < 1410; i += 1) {
+            instance.process([quantum(128, 0.5)]);
+        }
+        assertEqual(posted.length, Math.floor((1410 * 128) / frameSize),
+            'frames must be emitted at the real 10 ms rate, not once per quantum');
+        for (const frame of posted) {
+            assertEqual(frame.channels.length, 2, 'two channels per frame');
+            assertEqual(frame.channels[0].length, frameSize, 'every frame is exactly frameSize long');
+        }
+    },
+
+    'studio-worklet-silence-path-matches-the-real-audio-rate'() {
+        // The exact regression: the silence path used to emit unconditionally,
+        // so a broadcast with no connected source produced audio 3.75x too fast
+        // — audible as fast playback that underran and drifted against video.
+        const frameSize = 480;
+        const silent = compileWorklet(frameSize, 2);
+        for (let i = 0; i < 1410; i += 1) {
+            // `[[]]` — one channel slot carrying nothing — is the shape that
+            // actually reaches a worklet with no connected source.
+            silent.instance.process([[]]);
+        }
+        const withAudio = compileWorklet(frameSize, 2);
+        for (let i = 0; i < 1410; i += 1) {
+            withAudio.instance.process([quantum(128, 0.5)]);
+        }
+        assertEqual(silent.posted.length, withAudio.posted.length,
+            'a silent broadcast must emit frames at exactly the same rate as a live one');
+        assertEqual(silent.posted.length, 376, 'the silent path uses the real 10 ms frame rate');
+    },
+    'studio-worklet-preserves-samples-across-quantum-boundaries'() {
+        // 480 is not a multiple of 128, so each frame spans four quanta with a
+        // 32-sample carry. Losing that carry would drop samples and put periodic
+        // gaps in the audio, so the reassembled frame is checked sample by sample.
+        const frameSize = 480;
+        const { instance, posted } = compileWorklet(frameSize, 1);
+        let counter = 0;
+        const ramp = () => {
+            const buf = new Float32Array(128);
+            for (let i = 0; i < 128; i += 1) { buf[i] = counter; counter += 1; }
+            return [buf];
+        };
+        for (let i = 0; i < 4; i += 1) instance.process([ramp()]);
+        assertEqual(posted.length, 1, '128 * 4 = 512 samples yields one 480-sample frame plus a carry');
+        const first = posted[0].channels[0];
+        assertEqual(first.length, 480, 'the first frame is exactly 480 samples');
+        for (let i = 0; i < 480; i += 1) {
+            assertEqual(first[i], i, `sample ${i} must appear once, in order`);
+        }
+    },
+
+    'studio-worklet-resets-the-accumulator-before-posting'() {
+        // If postMessage threw while `filled` was still frameSize, the next
+        // process() would compute a room of 0 and loop forever on the real-time
+        // audio thread: a permanent 100% CPU hang with no recovery.
+        const { instance, posted } = compileWorklet(480, 2);
+        // Make the post throw after a full frame has been accumulated.
+        instance.port = { postMessage: () => { throw new Error('port closed'); } };
+        for (let i = 0; i < 4; i += 1) instance.process([quantum(128, 0.25)]);
+        // Restore a working port and keep driving. A wedged accumulator would
+        // either spin forever (the test would hang) or emit nothing.
+        instance.port = { postMessage: (msg) => posted.push(msg) };
+        for (let i = 0; i < 4; i += 1) instance.process([quantum(128, 0.25)]);
+        assertEqual(posted.length, 1,
+            'the processor must keep working after a failed post, not wedge');
+    },
 });
+
+
+
 
 /* --------------------------------------------------------------------------
    CLI

@@ -11,12 +11,29 @@ This setup runs OBS and MediaMTX on the same Windows laptop. The page and WebRTC
 
 ## Start a stream
 
+Either broadcaster publishes to the same `live` path; use whichever you prefer. They are not mutually exclusive by configuration — only one can be publishing at a time (`live` has `overridePublisher`), and whichever starts last takes the path.
+
+**Option A — OBS (unchanged, still fully supported):**
+
 1. Double-click `start_host.bat` and leave its window open. It validates the MediaMTX config, starts MediaMTX, starts the Cloudflare tunnel (when configured), then starts the website and WebRTC signaling proxy.
 2. In OBS, open **Settings → Stream**, select **Custom...**, set the server to `rtmp://127.0.0.1:1935/live`, and leave **Stream Key** empty.
 3. Start OBS streaming. On the laptop, check `http://127.0.0.1:3000/streaming/`; remote viewers open `https://stream.rydius.in`. A tailnet viewer can also use the Tailscale URL.
 4. Stop the host by pressing Ctrl+C in the launcher window. The launcher then stops the MediaMTX process it started.
 
 Start with CBR and a 1-second keyframe interval (2s doubles each keyframe burst and doubles how long packet-loss recovery waits for the next IDR — both read as viewer stutter). Choose a bitrate below the hotspot's sustained upload rate and leave roughly 25% headroom. A hotspot may vary over time, so 4K/60 quality and latency depend on the measured upload and the viewer's connection.
+
+**Option B — Rydius Studio, in the browser, no OBS:**
+
+Open `http://127.0.0.1:3000/streaming/studio` (the **Go live** button on the player page goes straight there), pick a screen / window / tab, and press **Go live**. It publishes over WHIP to the same `live` path, so the codec bridge, the rendition ladder and every viewer behave exactly as they do for an OBS broadcast.
+
+Controls: codec (H.264 / AV1 / VP9 / VP8), resolution, frame rate, video and audio bitrate, keyframe interval, plus a scene switcher (screen, screen + webcam picture-in-picture, camera only) and independent faders for system audio and the microphone.
+
+Two engines, chosen automatically and always displayed on the page:
+
+- **WebCodecs** (Chrome/Edge 124+). Encodes with `VideoEncoder`/`AudioEncoder` and injects the encoded chunks into the sender via `RTCRtpScriptTransform`, which is what makes the real codec / bitrate / keyframe controls possible. Requires `RTCRtpScriptTransform`, so the offer is pruned to the single selected codec — see below.
+- **Native.** Hands the composited canvas to the browser's own encoder. Fewer controls, but it works anywhere WebRTC publishing does.
+
+Nothing about the OBS path is read, written or reconfigured by the studio.
 
 ## Codecs: H.264 + AV1 on the GPU (automatic renditions)
 

@@ -81,10 +81,34 @@ const STATIC_FILES = new Map([
     ['/streaming', 'index.html'],
     ['/streaming/', 'index.html'],
     ['/streaming/index.html', 'index.html'],
+    // The browser broadcaster ("Rydius Studio"). Served as its own page, not a
+    // mode of index.html: it needs a different title, a different asset set and
+    // no chat, and mixing them would make the player's own load path pay for
+    // the studio's code. Every alias of the player is mirrored so the same
+    // shareable URL works for both.
+    ['/studio', 'broadcast.html'],
+    ['/studio/', 'broadcast.html'],
+    ['/studio/index.html', 'broadcast.html'],
+    ['/streaming/studio', 'broadcast.html'],
+    ['/streaming/studio/', 'broadcast.html'],
+    ['/streaming/studio/index.html', 'broadcast.html'],
+    ['/broadcast', 'broadcast.html'],
+    ['/broadcast/', 'broadcast.html'],
+    ['/streaming/broadcast', 'broadcast.html'],
     ['/style.css', 'style.css'],
     ['/streaming/style.css', 'style.css'],
     ['/app.js', 'app.js'],
-    ['/streaming/app.js', 'app.js']
+    ['/streaming/app.js', 'app.js'],
+    ['/broadcast.js', 'broadcast.js'],
+    ['/streaming/broadcast.js', 'broadcast.js'],
+    // Loaded by the studio itself: the RTP encoded-transform worker and the
+    // AudioWorklet PCM tap. Both are fetched by URL at runtime (new Worker()
+    // and audioWorklet.addModule()), so they must be in the allowlist exactly
+    // like any other page asset or they 404 and the studio cannot go live.
+    ['/broadcast_worker.js', 'broadcast_worker.js'],
+    ['/streaming/broadcast_worker.js', 'broadcast_worker.js'],
+    ['/broadcast_audio_worklet.js', 'broadcast_audio_worklet.js'],
+    ['/streaming/broadcast_audio_worklet.js', 'broadcast_audio_worklet.js'],
 ]);
 
 function setCorsHeaders(headers) {

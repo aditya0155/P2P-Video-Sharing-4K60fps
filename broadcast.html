@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#080812">
+    <!-- Same posture as index.html: a broadcast page must never be indexed. -->
+    <meta name="robots" content="noindex, noimageindex">
+    <title>Rydius Studio — Browser Screen Share</title>
+    <meta name="description" content="Broadcast your screen, a window or a camera to the Rydius Stream WebRTC pipeline straight from the browser.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<link rel="stylesheet" href="/streaming/style.css?v=2.24.0">
+</head>
+<body class="studio-body">
+    <div class="app-container studio-container" id="studio-container">
+
+        <header class="app-header studio-header">
+            <div class="header-left">
+                <div class="stream-title-group">
+                    <h1 class="stream-title">Rydius Studio</h1>
+                    <span class="stream-codec" id="studio-subtitle">Browser broadcaster (no OBS required)</span>
+                </div>
+            </div>
+            <div class="header-right">
+                <div class="status-badge offline" id="studio-status-badge" role="status" aria-live="polite">
+                    <span class="status-dot"></span>
+                    <span class="status-text" id="studio-status-text">IDLE</span>
+                </div>
+                <a class="perf-toggle-btn studio-link" id="open-player-link" href="/streaming/">
+                    <i class="fa-solid fa-display"></i>
+                    <span>Open player</span>
+                </a>
+            </div>
+        </header>
+
+        <main class="studio-main">
+
+            <!-- ================= LEFT: preview + sources ================= -->
+            <section class="studio-panel studio-panel-preview">
+                <div class="studio-panel-header">
+                    <i class="fa-solid fa-video"></i>
+                    <h2>Preview &amp; Sources</h2>
+                </div>
+
+                <div class="studio-preview-wrap">
+                    <canvas id="studio-canvas" width="1280" height="720" aria-label="Broadcast preview"></canvas>
+                    <div class="studio-preview-placeholder" id="studio-preview-placeholder">
+                        <i class="fa-solid fa-desktop"></i>
+                        <p>Pick a screen source to see the preview.</p>
+                    </div>
+                    <div class="studio-preview-badge" id="studio-preview-badge">1280x720 &middot; 30 fps</div>
+                </div>
+
+                <div class="studio-scene-row" role="group" aria-label="Scene layout">
+                    <span class="studio-field-label">Scene</span>
+                    <div class="studio-segmented" id="studio-scene-group">
+                        <button type="button" class="studio-seg active" data-scene="screen" title="Screen fills the frame">Screen</button>
+                        <button type="button" class="studio-seg" data-scene="pip" title="Screen with the camera in a corner">Screen + Cam</button>
+                        <button type="button" class="studio-seg" data-scene="camera" title="Camera only">Camera</button>
+                    </div>
+                </div>
+                <div class="studio-source-list">
+                    <div class="studio-source" id="studio-source-screen">
+                        <div class="studio-source-icon"><i class="fa-solid fa-desktop"></i></div>
+                        <div class="studio-source-body">
+                            <div class="studio-source-name" id="studio-screen-name">Screen / window / tab</div>
+                            <div class="studio-source-meta" id="studio-screen-meta">Not selected</div>
+                        </div>
+                        <button type="button" class="studio-btn studio-btn-ghost" id="btn-pick-screen">Choose</button>
+                    </div>
+
+                    <div class="studio-source" id="studio-source-camera">
+                        <div class="studio-source-icon"><i class="fa-solid fa-camera"></i></div>
+                        <div class="studio-source-body">
+                            <div class="studio-source-name">Webcam (picture-in-picture)</div>
+                            <div class="studio-source-meta" id="studio-camera-meta">Off</div>
+                        </div>
+                        <button type="button" class="studio-btn studio-btn-ghost" id="btn-toggle-camera">Enable</button>
+                    </div>
+
+                    <div class="studio-source" id="studio-source-mic">
+                        <div class="studio-source-icon"><i class="fa-solid fa-microphone-lines"></i></div>
+                        <div class="studio-source-body">
+                            <div class="studio-source-name">Microphone</div>
+                            <div class="studio-source-meta" id="studio-mic-meta">Off</div>
+                        </div>
+                        <button type="button" class="studio-btn studio-btn-ghost" id="btn-toggle-mic">Enable</button>
+                    </div>
+                </div>
+
+                <!-- Audio mixer -->
+                <div class="studio-mixer" id="studio-mixer">
+                    <div class="studio-mixer-header">
+                        <h3><i class="fa-solid fa-sliders"></i> Audio mixer</h3>
+                        <div class="studio-master-meter" aria-hidden="true"><div class="studio-master-fill" id="studio-master-fill"></div></div>
+                    </div>
+                    <div class="studio-fader">
+                        <label for="mix-system">System sound</label>
+                        <input type="range" id="mix-system" min="0" max="150" value="100" disabled>
+                        <span class="studio-fader-value" id="mix-system-value">--</span>
+                    </div>
+                    <div class="studio-fader">
+                        <label for="mix-mic">Microphone</label>
+                        <input type="range" id="mix-mic" min="0" max="150" value="100" disabled>
+                        <span class="studio-fader-value" id="mix-mic-value">--</span>
+                    </div>
+                    <p class="studio-hint" id="studio-audio-hint">System audio is only available if you tick <b>Share audio</b> in the browser's screen picker.</p>
+                </div>
+            </section>
+
+            <!-- ================= RIGHT: encoder + telemetry ================= -->
+            <section class="studio-panel studio-panel-encoder">
+                <div class="studio-panel-header">
+                    <i class="fa-solid fa-sliders"></i>
+                    <h2>Encoder</h2>
+                </div>
+
+                <div class="studio-field">
+                    <label for="set-engine">Engine</label>
+                    <select id="set-engine">
+                        <option value="auto">Auto (best available)</option>
+                        <option value="webcodecs">WebCodecs (full control)</option>
+                        <option value="native">Native WebRTC encoder</option>
+                    </select>
+                    <p class="studio-hint" id="engine-hint">Checking browser capabilities...</p>
+                </div>
+
+                <div class="studio-field">
+                    <label for="set-codec">Video codec</label>
+                    <select id="set-codec">
+                        <option value="h264">H.264 (best compatibility)</option>
+                        <option value="av1">AV1 (best quality per bit)</option>
+                        <option value="vp9">VP9</option>
+                        <option value="vp8">VP8</option>
+                    </select>
+                </div>
+
+                <div class="studio-field-row">
+                    <div class="studio-field">
+                        <label for="set-resolution">Resolution</label>
+                        <select id="set-resolution">
+                            <option value="3840x2160">3840x2160 (4K)</option>
+                            <option value="2560x1440">2560x1440 (1440p)</option>
+                            <option value="1920x1080" selected>1920x1080 (1080p)</option>
+                            <option value="1280x720">1280x720 (720p)</option>
+                            <option value="960x540">960x540 (540p)</option>
+                        </select>
+                    </div>
+                    <div class="studio-field">
+                        <label for="set-framerate">Frame rate</label>
+                        <select id="set-framerate">
+                            <option value="60">60 fps</option>
+                            <option value="30" selected>30 fps</option>
+                            <option value="24">24 fps</option>
+                            <option value="15">15 fps</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="studio-field">
+                    <label for="set-bitrate">Bitrate <span class="studio-inline-value" id="bitrate-readout">4500 kbps</span></label>
+                    <input type="range" id="set-bitrate" min="250" max="20000" step="250" value="4500">
+                    <div class="studio-bitrate-presets" id="bitrate-presets">
+                        <button type="button" class="studio-chip" data-mbps="1">1M</button>
+                        <button type="button" class="studio-chip" data-mbps="3">3M</button>
+                        <button type="button" class="studio-chip" data-mbps="6">6M</button>
+                        <button type="button" class="studio-chip" data-mbps="10">10M</button>
+                        <button type="button" class="studio-chip" data-mbps="16">16M</button>
+                    </div>
+                </div>
+                <div class="studio-field-row">
+                    <div class="studio-field">
+                        <label for="set-gop">Keyframe every (s)</label>
+                        <select id="set-gop">
+                            <option value="1" selected>1 s (lowest latency)</option>
+                            <option value="2">2 s (less keyframe bandwidth)</option>
+                            <option value="4">4 s (best for static slides)</option>
+                        </select>
+                    </div>
+                    <div class="studio-field">
+                        <label for="set-audio-bitrate">Audio bitrate</label>
+                        <select id="set-audio-bitrate">
+                            <option value="96000">96 kbps</option>
+                            <option value="128000" selected>128 kbps</option>
+                            <option value="160000">160 kbps</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="studio-field studio-field-inline">
+                    <label for="set-mouse-cursor">Show mouse cursor</label>
+                    <input type="checkbox" id="set-mouse-cursor" checked>
+                </div>
+
+                <div class="studio-actions">
+                    <button type="button" class="studio-btn studio-btn-primary" id="btn-go-live">
+                        <i class="fa-solid fa-broadcast"></i><span id="btn-go-live-label">Go live</span>
+                    </button>
+                    <button type="button" class="studio-btn studio-btn-stop" id="btn-stop" disabled>
+                        <i class="fa-solid fa-stop"></i> Stop
+                    </button>
+                </div>
+
+                <div class="studio-telemetry" id="studio-telemetry">
+                    <div class="studio-tele-grid">
+                        <div class="studio-tele"><span class="studio-tele-label">Uplink</span><span class="studio-tele-value" id="tele-bitrate">--</span></div>
+                        <div class="studio-tele"><span class="studio-tele-label">Encoder fps</span><span class="studio-tele-value" id="tele-fps">--</span></div>
+                        <div class="studio-tele"><span class="studio-tele-label">Outgoing</span><span class="studio-tele-value" id="tele-resolution">--</span></div>
+                        <div class="studio-tele"><span class="studio-tele-label">RTT</span><span class="studio-tele-value" id="tele-rtt">--</span></div>
+                        <div class="studio-tele"><span class="studio-tele-label">Video dropped</span><span class="studio-tele-value" id="tele-dropped">--</span></div>
+                        <div class="studio-tele"><span class="studio-tele-label">Encode queue</span><span class="studio-tele-value" id="tele-queue">--</span></div>
+                        <!-- Audio drops are counted separately from video: a
+                             dropped video frame is a visible glitch, a dropped
+                             10 ms audio frame is a click, and they have
+                             different thresholds before they need investigating.
+                             Reporting only the video total would hide audio
+                             that is audibly breaking up. -->
+                        <div class="studio-tele"><span class="studio-tele-label">Audio dropped</span><span class="studio-tele-value" id="tele-audio-dropped">--</span></div>
+                    </div>
+                    <div class="studio-tele-note" id="tele-note">Idle.</div>
+                </div>
+
+                <div class="studio-log" id="studio-log" role="log" aria-live="polite"></div>
+            </section>
+
+
+        </main>
+    </div>
+
+<script src="/streaming/broadcast.js?v=2.24.0"></script>
+</body>
+</html>

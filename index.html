@@ -56,6 +56,18 @@
                     <span id="perf-toggle-label">Reduce effects</span>
                 </button>
 
+                <!-- Browser broadcaster. Publishes a screen, window or camera to
+                     the SAME "live" path as OBS over WHIP, so the codec bridge,
+                     the rendition ladder and every viewer work unchanged. The
+                     ?v= buster is there because this test-free page URL is
+                     cache-busted like every other asset, so an updated studio
+                     is picked up on the next click. -->
+                <a class="perf-toggle-btn studio-launch-btn" id="studio-launch-btn"
+                   href="/streaming/studio?v=2.24.0" title="Broadcast your screen from this browser (no OBS needed)">
+                    <i class="fa-solid fa-video"></i>
+                    <span>Go live</span>
+                </a>
+
                 <!-- Status Badge -->
                 <div class="status-badge offline" id="status-badge" role="status" aria-live="polite">
                     <span class="status-dot"></span>
@@ -338,6 +350,9 @@
                                 <h3>OBS Studio Settings</h3>
                             </div>
                             <p class="info-description">Select ingest protocol for OBS Studio setup:</p>
+                            <ul class="obs-instructions active">
+                                <li><span class="obs-key">No OBS?</span><span class="obs-val">Use the built-in <a class="studio-inline-link" id="studio-inline-link" href="/streaming/studio?v=2.24.0">Rydius Studio broadcaster</a>. It publishes to the same <code>live</code> path over WHIP, with codec, bitrate, resolution, frame rate and keyframe controls, screen/window/tab capture, webcam picture-in-picture and system audio + mic mixing. OBS keeps working exactly as before — pick whichever you prefer.</span></li>
+                            </ul>
                             <div class="ingest-selector">
                                 <button class="ingest-tab active" id="ingest-tab-whip">RTMP (this laptop)</button>
                                 <button class="ingest-tab" id="ingest-tab-srt">SRT / WHIP options</button>
