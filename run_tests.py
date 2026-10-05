@@ -4505,6 +4505,47 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertIn("$configVerified", self.launcher,
                       "the launcher must distinguish a verified config from an unverified one")
 
+    def test_launcher_refuses_to_broadcast_from_a_linked_worktree(self):
+        """The launcher must refuse to serve from a throwaway checkout.
+
+        This is not hypothetical: the live site on port 3000 was being served
+        by a git worktree whose copy of `app.js` had already diverged from the
+        real project folder. `server.js` resolves `STATIC_DIR` from its own
+        `__dirname` and the launcher starts MediaMTX with the config sitting
+        beside it, so a sandbox checkout silently becomes what every viewer
+        is served -- while the operator edits a different folder entirely.
+
+        Nothing in the logs says so. The failure mode is a fix that "did
+        nothing", or a config change that never takes effect, which is far
+        harder to diagnose than a refusal is to accept.
+
+        A linked worktree is identified structurally, not by its path: its
+        `.git` is a FILE (a pointer into the real repo's worktree directory),
+        whereas the real project's `.git` is a DIRECTORY. Keying on that means
+        a worktree at ANY location is caught, and the real project is never
+        blocked -- which a path check or a hard-coded folder name would not
+        guarantee.
+        """
+        self.assertIn("Refusing to start from a linked git worktree", self.launcher,
+                      "the launcher must refuse to serve a throwaway checkout")
+        marker = self.launcher.find("Refusing to start from a linked git worktree")
+        window = self.launcher[max(0, marker - 1200): marker]
+        self.assertIn(".PSIsContainer", window,
+                      "the check must distinguish a worktree (.git is a FILE) from the "
+                      "real project (.git is a DIRECTORY); matching on the path or a "
+                      "hard-coded folder name would miss every other worktree location")
+        # The refusal has to be placed BEFORE anything real is started, or the
+        # host would come up and then abort half-way through, leaving MediaMTX
+        # or cloudflared orphaned behind it.
+        server_at = self.launcher.find("Join-Path $scriptDir 'server.js'")
+        guard_at = self.launcher.find("Refusing to start from a linked git worktree")
+        self.assertLess(guard_at, server_at,
+                        "the worktree refusal must come before the host starts anything")
+        mediamtx_at = self.launcher.find("mediamtx_win")
+        self.assertLess(guard_at, mediamtx_at,
+                        "the worktree refusal must come before MediaMTX is launched, "
+                        "or a refused start leaves an orphaned process holding its ports")
+
     def test_write_queue_comment_arithmetic(self):
         """The comment claimed 2048 packets x 1200 B = 3.3s at 6 Mbps. It is
         2.46 MB, which is ~0.41s — the claim was 8x high, and anyone sizing a
