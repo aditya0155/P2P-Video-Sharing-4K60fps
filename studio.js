@@ -122,6 +122,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const bitrateValue = document.getElementById('bitrate-value');
     const audioBitrateSelect = document.getElementById('sel-audio-bitrate');
     const cbrCheckbox = document.getElementById('chk-cbr');
+    const contentHintSelect = document.getElementById('sel-content-hint');
 
     const meters = document.getElementById('studio-meters');
     const meterBitrate = document.getElementById('meter-bitrate');
@@ -600,11 +601,13 @@ document.addEventListener('DOMContentLoaded', () => {
             peerConnection = pc;
 
             const videoTrack = displayStream.getVideoTracks()[0];
-            // A screen is text far more often than it is motion, and this is
-            // the hint that keeps the encoder from spending bits on motion it
-            // does not have. 'detail' is a MediaStreamTrack attribute, not a
-            // getDisplayMedia constraint, so it is set after capture.
-            if ('contentHint' in videoTrack) videoTrack.contentHint = 'detail';
+            // 'detail' biases the encoder toward SPATIAL detail at the expense of
+            // temporal detail, so it is a control rather than a constant — a
+            // game or a video stream wants the opposite trade. Set from the
+            // control on BOTH assignment sites: this one runs after
+            // pickSource(), so hardcoding it here silently reverted the
+            // operator's choice for every broadcast started from the button.
+            if ('contentHint' in videoTrack) videoTrack.contentHint = currentContentHint();
 
             try {
                 videoSender = pc.addTrack(videoTrack, new MediaStream([videoTrack]));
@@ -987,16 +990,22 @@ document.addEventListener('DOMContentLoaded', () => {
             updateSourceUi();
         }
 
-        // Only `ideal` values. `min` and `exact` throw a TypeError inside
-        // getDisplayMedia (they are legal in applyConstraints but rejected at
-        // capture time), and the browser cannot honour an exact capture size.
+        // `ideal` alone is only a REQUEST: a browser is free to ignore it, and
+        // this one routinely does. That made the Frame rate and Resolution
+        // controls purely advisory — selecting 15 fps on a loaded machine still
+        // produced 60, and nothing on screen said otherwise. `max` is the
+        // constraint that actually caps, and unlike `min`/`exact` (which a
+        // display track cannot satisfy, surfacing as OverconstrainedError at
+        // capture time) it is legal here, so both keys are set: `ideal` asks for
+        // the value, `max` guarantees no more than it.
         const width = RESOLUTION_MAP[resolutionSelect.value];
+        const requestedFps = Number(framerateSelect.value) || 30;
         const videoConstraints = {
-            frameRate: { ideal: Number(framerateSelect.value) || 30 }
+            frameRate: { ideal: requestedFps, max: requestedFps }
         };
         if (width) {
-            videoConstraints.width = { ideal: width.width };
-            videoConstraints.height = { ideal: width.height };
+            videoConstraints.width = { ideal: width.width, max: width.width };
+            videoConstraints.height = { ideal: width.height, max: width.height };
         }
 
         // The hints below only bias the picker; the user always chooses. They
@@ -1030,7 +1039,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         displayStream = stream;
         const videoTrack = videoTracks[0];
-        if ('contentHint' in videoTrack) videoTrack.contentHint = 'detail';
+        if ('contentHint' in videoTrack) videoTrack.contentHint = currentContentHint();
 
         // The user can end the share from the browser's own bar without ever
         // touching this page. `ended` is the ONLY signal for that — calling
@@ -1044,6 +1053,9 @@ document.addEventListener('DOMContentLoaded', () => {
         // The picker can hand back a different surface than the mode the user
         // selected, so the label reports the real one.
         describeSource(videoTrack);
+        // The capture rate is the browser's to decide, so report what it
+        // actually settled on rather than what was asked for.
+        reportAchievedFrameRate(videoTrack);
 
         if (preview) {
             preview.srcObject = stream;
@@ -1121,6 +1133,55 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (sourceInfoIcon) sourceInfoIcon.className = 'fa-solid fa-circle-check';
         if (sourceInfo) sourceInfo.classList.remove('is-warning');
+    }
+
+    // Encoder content hint. 'detail' tells the encoder this is screen content
+    // where spatial sharpness (text) matters more than motion smoothness, which
+    // is right for most desktops and wrong for a game or a video. It biases the
+    // encoder AWAY from spending bits on frame rate, so it is exposed as a
+    // control rather than hardcoded. Safe when the control is absent: 'detail'
+    // is the previous behaviour, so an older page keeps working.
+    function currentContentHint() {
+        return contentHintSelect && contentHintSelect.value === 'motion' ? 'motion' : 'detail';
+    }
+
+    // The capture track's real settings, read back from the browser rather than
+    // assumed from the controls. A constraint is a request: when the machine
+    // cannot deliver the requested rate the browser picks its own, and the UI
+    // has to say so rather than keep showing what was ASKED for. This is the
+    // difference between "I set 60 and got 15" and a mystery.
+    //
+    // Measured after a delay, not immediately: right after the picker resolves,
+    // getSettings() tends to echo the constraints that were just applied rather
+    // than a settled capture rate, so a t=0 reading would never detect the
+    // shortfall it exists to report.
+    function reportAchievedFrameRate(videoTrack, delayMs = 1200) {
+        if (!videoTrack || typeof videoTrack.getSettings !== 'function') return;
+        setTimeout(() => {
+            // The track can be replaced or stopped while this is pending.
+            if (!displayStream || !displayStream.getVideoTracks().includes(videoTrack)) return;
+            const settings = videoTrack.getSettings();
+            const achieved = Number(settings.frameRate);
+            if (!Number.isFinite(achieved) || achieved <= 0) return;
+
+            const requested = Number(framerateSelect ? framerateSelect.value : 0);
+            // Only complain about a real shortfall. `max` now caps the rate, so
+            // a large gap means the browser clamped below the request (a busy
+            // machine, or a source that cannot produce that fast), which is
+            // exactly the case that used to be invisible.
+            if (Number.isFinite(requested) && requested > 0 && achieved < requested * 0.9) {
+                console.log(`[Studio] Capture is running at ${achieved}fps, below the requested ${requested}fps.`);
+                showToast(`This source is only capturing at ${Math.round(achieved)} fps, not the ${requested} fps you asked for. `
+                    + 'A busy machine or a mostly-static source is the usual cause — try a lower resolution or frame rate.',
+                'warning');
+            }
+            // Keep the source label truthful about what is really being captured.
+            if (sourceInfoText) {
+                const label = sourceInfoText.textContent.split(' — ')[0];
+                const dims = settings.width && settings.height ? ` — ${settings.width}×${settings.height}` : '';
+                sourceInfoText.textContent = `${label}${dims} @ ${Math.round(achieved)} fps`;
+            }
+        }, delayMs);
     }
 
     // The system-audio checkbox can only be honoured if the picker actually
@@ -1213,8 +1274,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Resolution is a capture constraint, not a sender parameter, so it goes
-    // through applyConstraints on the live track. 'ideal' rather than 'exact'
-    // because a display track may not be able to hit the exact size.
+    // through applyConstraints on the live track. `max` (not just `ideal`) is
+    // what makes the control real — see pickSource for why an ideal-only
+    // constraint is advisory.
     async function applyResolution() {
         if (!displayStream) return;
         const track = displayStream.getVideoTracks()[0];
@@ -1224,8 +1286,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
             await track.applyConstraints({
-                width: { ideal: entry.width },
-                height: { ideal: entry.height }
+                width: { ideal: entry.width, max: entry.width },
+                height: { ideal: entry.height, max: entry.height }
             });
         } catch (err) {
             // Non-fatal: a resolution the capture cannot reach is worth saying
@@ -1573,10 +1635,13 @@ document.addEventListener('DOMContentLoaded', () => {
             framerateSelect.addEventListener('change', () => {
                 applyVideoEncoding();
                 // The capture track has its own frame rate, and the sender cap
-                // alone would let the capture run hotter than the encode.
+                // alone would let the capture run hotter than the encode. `max`
+                // is what actually caps it — see pickSource.
                 if (hasSource()) {
                     const track = displayStream.getVideoTracks()[0];
-                    track.applyConstraints({ frameRate: { ideal: Number(framerateSelect.value) } })
+                    const fps = Number(framerateSelect.value) || 30;
+                    track.applyConstraints({ frameRate: { ideal: fps, max: fps } })
+                        .then(() => reportAchievedFrameRate(track))
                         .catch((err) => console.warn('[Studio] Frame rate constraint rejected:', err));
                 }
             });
@@ -1585,6 +1650,26 @@ document.addEventListener('DOMContentLoaded', () => {
         if (resolutionSelect) {
             resolutionSelect.addEventListener('change', () => {
                 applyResolution();
+            });
+        }
+
+        if (contentHintSelect) {
+            contentHintSelect.addEventListener('change', () => {
+                // contentHint is a MediaStreamTrack attribute, so writing it is
+                // legal at any time. Whether Chrome re-tunes an ALREADY-RUNNING
+                // encoder from it is not something this code can promise, so the
+                // message says "applies on the next broadcast" rather than
+                // claiming a live re-tune it cannot verify.
+                if (isPublishing) {
+                    const track = displayStream && displayStream.getVideoTracks()[0];
+                    if (track && 'contentHint' in track) track.contentHint = currentContentHint();
+                    showToast('Content type applied to the running broadcast. If the encoder was already running, start a new broadcast to be certain it took effect.', 'info');
+                    return;
+                }
+                if (hasSource()) {
+                    const track = displayStream.getVideoTracks()[0];
+                    if (track && 'contentHint' in track) track.contentHint = currentContentHint();
+                }
             });
         }
 

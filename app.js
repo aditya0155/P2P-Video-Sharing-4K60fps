@@ -288,6 +288,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let renditionPollInterval = null;   // Slow paths poll that keeps the ladder fresh while connected
     let lastPresentedFrames = 0;        // rVFC metadata.presentedFrames accumulator (real render count)
     let lastPresentedFps = null;        // Presented-frames delta over the last stats tick
+    let presentedFpsValid = false;      // True only while lastPresentedFps is a FRESH sample
     let lastPresentedFramesAtTick = 0;  // presentedFrames baseline at the previous stats tick
     let lastPresentedTickAt = 0;        // Wall clock of the previous stats tick (the fps denominator)
     let lastRouteText = '--';           // Selected ICE route: direct / relay (TURN)
@@ -2973,9 +2974,8 @@ document.addEventListener('DOMContentLoaded', () => {
     //
     //   source AV1   + AV1 browser        -> live      (native, no transcode)
     //   source AV1   + legacy browser     -> live-h264 if ready, else null (wait)
-    //   source H264  + AV1 browser        -> live-av1 if ready AND AV1 decodes
-    //                                        smoothly on this device, else live
-    //   source H264  + legacy browser     -> live
+    //   source H264  + any browser        -> live      (native; audio rescue applies
+    //                                        only when the source is non-Opus)
     //
     // h265Capable (probed by the caller via RTCRtpReceiver capabilities):
     // a browser WITHOUT H265 receive support must never be sent to the native
@@ -3066,10 +3066,30 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             return ready('live-h264') ? 'live-h264' : null;
         }
-        if (av1Capable && av1Smooth !== false && ready('live-av1')) {
-            if (preference === 'preferTranscode') return 'live-av1';
-            if (preference === 'preferNonTranscode') return 'live';
-            return 'live-av1';
+        // Opus (or audio-less) H264 source: the NATIVE path already carries the
+        // source codec at the source bitrate AND sound reaches WebRTC readers,
+        // so it is strictly better than the bridge's 3000k AV1 re-encode. This
+        // is the browser-publisher case (studio.js publishes H.264 + Opus over
+        // WHIP), and `auto` must return 'live'.
+        //
+        // It used to return 'live-av1' here, which routed every AV1-capable
+        // viewer OFF the full-quality source and onto a 3 Mbit transcode by
+        // default, purely to save bandwidth nobody asked to save. That is the
+        // "OBS looks great, the studio looks soft" report: the studio's
+        // broadcast produced the only rung anyone could ever reach, and the
+        // full-quality source was never played.
+        //
+        // The AAC (OBS/RTMP) case is unaffected — it returns above, on the
+        // audio-rescue branch, where the native path genuinely is muted.
+        //
+        // Bandwidth adaptation is what the ABR supervisor is for: it moves a
+        // viewer onto 'live-av1' after 8 sustained stressed seconds
+        // (`abrBadSec >= 8`) and back after 20 calm ones. A viewer on a link
+        // that cannot carry the source now degrades on evidence, and a viewer on
+        // a healthy link keeps full quality. `preferTranscode` is still honoured
+        // for callers that explicitly want the cheap rung.
+        if (preference === 'preferTranscode') {
+            return (av1Capable && av1Smooth !== false && ready('live-av1')) ? 'live-av1' : 'live';
         }
         return 'live';
     }
@@ -3375,6 +3395,10 @@ document.addEventListener('DOMContentLoaded', () => {
         lastPresentedFrames = 0;
         lastPresentedFramesAtTick = 0;
         lastPresentedTickAt = 0;
+        // A new session has presented nothing yet, so the previous session's
+        // render rate must not be reported as this one's.
+        lastPresentedFps = null;
+        presentedFpsValid = false;
         lastRouteText = '--';
         lastRecoveryCounts = null;
         // Never let the previous session's counters be the watchdog's baseline.
@@ -3449,6 +3473,11 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (presentedDt > 0.5) {
                             lastPresentedFps = Math.max(0,
                                 (lastPresentedFrames - lastPresentedFramesAtTick) / presentedDt);
+                            // Only a sample actually taken THIS tick may drive the
+                            // header. The `else` below leaves the previous value
+                            // in place, so without this flag a latched reading
+                            // would keep being reported as current.
+                            presentedFpsValid = true;
                             stateText = `${lastPresentedFps.toFixed(1)} fps rendered`;
                         }
                     }
@@ -3687,7 +3716,23 @@ document.addEventListener('DOMContentLoaded', () => {
                     const decodedDiff = decoded - lastFramesDecodedCount;
                     const measuredFps = timeDiffSec > 0 && decodedDiff >= 0 ? decodedDiff / timeDiffSec : null;
                     const reportedFps = Number.isFinite(videoStats.framesPerSecond) ? videoStats.framesPerSecond : null;
-                    currentFrameRate = reportedFps ?? measuredFps;
+                    // What the viewer SEES is the presented-frame rate from
+                    // requestVideoFrameCallback, not the decoder's output rate.
+                    // `framesPerSecond` and `framesDecoded` are both derived from
+                    // decode, and a frame can be decoded without ever reaching
+                    // the screen — so on a stream that decodes 60 and presents
+                    // 15, this used to read 60 and hide the exact fault it exists
+                    // to reveal.
+                    //
+                    // Guarded on `presentedFpsValid` rather than on the value:
+                    // `lastPresentedFps` is latched to 0 whenever playback stalls
+                    // (paused, hidden tab, no new frames), and `??` only falls
+                    // through on null/undefined, so 0 would be taken as an
+                    // authoritative "0 fps" and the header would read 0 on every
+                    // paused viewer. An explicit validity flag lets a genuinely
+                    // fresh sample win and a stale or absent one fall back to the
+                    // decode-derived number, which is the lesser evil.
+                    currentFrameRate = presentedFpsValid ? lastPresentedFps : (reportedFps ?? measuredFps);
                     // The spec's freeze bound moves with the frame rate, so it
                     // has to be derived from the rate actually in force rather
                     // than from a constant that is only correct at one rate. In
@@ -3782,6 +3827,8 @@ document.addEventListener('DOMContentLoaded', () => {
         inboundSnapshot = null;
         currentBitrateMbps = null;
         currentFrameRate = null;
+        lastPresentedFps = null;
+        presentedFpsValid = false;
         renderStreamSummary('offline');
     }
 

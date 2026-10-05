@@ -62,25 +62,51 @@ const AUDIO_BITRATE = process.env.BRIDGE_AUDIO_BITRATE || '160k';
 const BUNDLED_FFMPEG = path.join(__dirname,
     'ffmpeg_win', 'ffmpeg-n8.1-latest-win64-gpl-shared-8.1', 'bin', 'ffmpeg.exe');
 
-// The bundled ffmpeg 8.1 build is preferred over the system PATH: its AV1 RTP
-// depacketizer fixes fragmented-keyframe reassembly (ffmpeg commit d12791ef,
-// absent from 8.0), which is what lets OBS WHIP AV1 sources sync on the RTSP
-// leg — ffmpeg 8.0 loops forever on "Unexpected fragment continuation". An
-// explicit BRIDGE_FFMPEG override wins; the system PATH is the last fallback.
+// Why ffmpeg 8.1 specifically: its AV1 RTP depacketizer fixes fragmented-keyframe
+// reassembly (ffmpeg commit d12791ef, absent from 8.0), which is what lets an
+// OBS WHIP AV1 source sync on the RTSP leg — ffmpeg 8.0 loops forever on
+// "Unexpected fragment continuation". An explicit BRIDGE_FFMPEG override wins;
+// the system PATH is the last fallback.
+//
+// THE FALLBACK IS NOT SAFE, and it fails silently. `ffmpeg_win/` is gitignored
+// (a heavy re-downloadable binary), so it exists ONLY in a checkout that ran the
+// one-time setup — NOT in a fresh clone, and NOT in a linked git worktree. In
+// those checkouts this function quietly returns the system `ffmpeg`, which on
+// this host is 8.0: the exact build documented above as broken. The bridge then
+// spins on the RTSP leg or publishes no rendition, and the only symptom is that
+// the companion path never comes up. Reporting the substitution is what turns
+// that into a diagnosable condition instead of a mystery.
+let ffmpegResolvedFrom = null;
 function resolveFfmpegBinary() {
     if (process.env.BRIDGE_FFMPEG) {
+        ffmpegResolvedFrom = 'BRIDGE_FFMPEG override';
         return process.env.BRIDGE_FFMPEG;
     }
     try {
         if (fs.existsSync(BUNDLED_FFMPEG)) {
+            ffmpegResolvedFrom = 'bundled ffmpeg 8.1';
             return BUNDLED_FFMPEG;
         }
     } catch (err) {
         /* stat failure falls through to PATH */
     }
+    ffmpegResolvedFrom = 'system PATH (bundled build missing)';
     return 'ffmpeg';
 }
 const FFMPEG = resolveFfmpegBinary();
+
+// Printed once per start so an operator can see WHICH binary is transcoding.
+// H.264-only sources are fine on 8.0, so the wording is scoped to the case that
+// actually breaks (AV1) rather than crying wolf on every start.
+function reportFfmpegProvenance() {
+    if (FFMPEG === BUNDLED_FFMPEG) return;
+    if (ffmpegResolvedFrom === 'BRIDGE_FFMPEG override') return;
+    logError(`Bundled ffmpeg 8.1 not found at ${BUNDLED_FFMPEG}; using the system ffmpeg on PATH instead. `
+        + 'That build is known-bad for AV1 sources (ffmpeg 8.0 loops forever on "Unexpected fragment '
+        + 'continuation"), so an AV1 broadcast may publish no companion renditions. ffmpeg_win/ is '
+        + 'gitignored, so it is missing from every fresh clone and every git worktree — copy it from '
+        + 'your main checkout, or set BRIDGE_FFMPEG to a full path. H.264 sources are unaffected.');
+}
 
 // Overridable so a test (or a second bridge) can use an isolated record instead
 // of the shared per-user temp path, where two bridges would overwrite each other.
@@ -894,6 +920,11 @@ async function main() {
         cleanup();
         return;
     }
+
+    // Which ffmpeg is actually transcoding is the first thing an operator needs
+    // to know, and the wrong one produces a bridge that looks alive while
+    // publishing nothing. See resolveFfmpegBinary for why the fallback is risky.
+    reportFfmpegProvenance();
 
     let child = null;
     const stop = () => {

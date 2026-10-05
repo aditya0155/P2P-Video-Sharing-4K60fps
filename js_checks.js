@@ -717,8 +717,8 @@ Object.assign(cases, {
             'legacy browser on H264 source plays the source directly');
         assertEqual(fn(h264Source, true), 'live',
             'AV1 browser keeps the source until the rendition is ready');
-        assertEqual(fn(h264SourceRenditionReady, true), 'live-av1',
-            'AV1 browser must prefer the low-bandwidth AV1 rendition');
+        assertEqual(fn(h264SourceRenditionReady, true), 'live',
+            'AV1 browser must start on the full-quality source, not the 3000k transcode');
         assertEqual(fn(offline, true), null, 'offline source selects nothing');
         assertEqual(fn([], false), null, 'empty path list selects nothing');
         assertEqual(fn(null, false), null, 'non-array input selects nothing');
@@ -732,12 +732,12 @@ Object.assign(cases, {
         // supports AV1 only in software would stutter at high resolution, so
         // it stays on the hardware-decodable H264 path even when the AV1
         // rendition is ready.
-        assertEqual(fn(h264SourceRenditionReady, true, true), 'live-av1',
-            'smooth AV1 decode keeps the low-bandwidth rendition');
+        assertEqual(fn(h264SourceRenditionReady, true, true), 'live',
+            'smooth AV1 decode must not move an unstressed viewer off the full-quality source');
         assertEqual(fn(h264SourceRenditionReady, true, false), 'live',
             'non-smooth AV1 decode must stay on the hardware-decodable path');
-        assertEqual(fn(h264SourceRenditionReady, true, null), 'live-av1',
-            'unknown decode quality keeps the previous behavior');
+        assertEqual(fn(h264SourceRenditionReady, true, null), 'live',
+            'unknown decode quality must not move a viewer off the full-quality source');
         assertEqual(fn(h264SourceRenditionReady, true, true, 'preferTranscode'), 'live-av1',
             'ABR downgrade forces the low-bitrate rendition');
         assertEqual(fn(h264SourceRenditionReady, true, false, 'preferTranscode'), 'live',
@@ -826,8 +826,12 @@ Object.assign(cases, {
         });
     },
 
-    // AV1-capable browser on an H264 source with a ready live-av1 rendition
-    // must connect to the rendition (half the bandwidth on a hotspot).
+    // An AV1-capable browser on an H264+Opus source with a ready live-av1
+    // rendition must still connect to the NATIVE path. The transcode is a
+    // bandwidth optimisation the ABR supervisor reaches for on evidence of a
+    // struggling link; routing there by default threw away full quality for
+    // every viewer, which is what made a browser-published broadcast look soft
+    // next to OBS.
     'poll-picks-rendition-path'() {
         const { run, calls, context } = makePollSandbox({
             av1Capable: true,
@@ -842,7 +846,8 @@ Object.assign(cases, {
         });
         return run().then(() => {
             assertEqual(calls.connect, 1, 'must start exactly one connection');
-            assertEqual(context.activeStreamPath, 'live-av1', 'connection must target the AV1 rendition');
+            assertEqual(context.activeStreamPath, 'live',
+                'an unstressed viewer must connect to the full-quality native path');
             assertEqual(calls.ui, [], 'a successful pick must not repaint the UI');
         });
     },
