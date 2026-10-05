@@ -6,6 +6,7 @@ const path = require('path');
 const zlib = require('zlib');
 const { pipeline } = require('stream');
 const { URL } = require('url');
+const { execFileSync } = require('child_process');
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const MEDIAMTX_HOST = '127.0.0.1';
@@ -16,6 +17,56 @@ const MEDIAMTX_PORT = Number.parseInt(process.env.MEDIAMTX_PORT || '8889', 10);
 // listens on a separate port from WebRTC signaling.
 const MEDIAMTX_API_PORT = Number.parseInt(process.env.MEDIAMTX_API_PORT || '8888', 10);
 const STATIC_DIR = __dirname;
+
+// --- Which checkout is this process actually serving? ------------------------
+// STATIC_DIR is __dirname, so every copy of the project serves ITS OWN files.
+// This machine has ~20 sibling `Streaming'` worktrees plus a main checkout, and
+// a linked worktree binds to the same ports: editing one and opening
+// http://127.0.0.1:3000/streaming/ while a DIFFERENT worktree holds port 3000
+// shows the wrong code with no error anywhere. Nothing looks broken - the page
+// renders, chat works, the stream plays - it is simply not the code that was
+// just edited, so every "my fix did nothing" conclusion drawn from that page is
+// wrong. Verified on this machine: port 3000 was held by worktree 06893 while
+// the edits were being made in 96c6b.
+//
+// The answer therefore has to be printed where the operator is already looking
+// (the launcher window) and also exposed to the browser, which is where the
+// "it did not change" observation actually comes from. Best-effort throughout:
+// a non-git directory, a missing git, or a slow repo must never stop the host.
+let checkoutDescription = null;
+function describeCheckout() {
+    // Memoised. This is called once per HTTP response to stamp a header, and
+    // re-running it would spawn `git` TWICE PER REQUEST — a synchronous child
+    // process on the same thread that serves video signaling. The values cannot
+    // change while the process runs: the serving directory is __dirname and the
+    // checked-out branch/SHA are fixed for its lifetime.
+    if (checkoutDescription) return checkoutDescription;
+    let branch = 'unknown';
+    let sha = 'unknown';
+    try {
+        const run = (...gitArgs) => execFileSync('git', gitArgs, {
+            cwd: STATIC_DIR,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 2000,
+        }).trim();
+        branch = run('rev-parse', '--abbrev-ref', 'HEAD');
+        sha = run('rev-parse', '--short', 'HEAD');
+    } catch (_) {
+        // Not a git checkout, or git is unavailable. The resolved path below is
+        // still the authoritative answer, so leave the placeholders.
+    }
+    // A linked worktree has a .git FILE pointing at the real repo's
+    // worktrees/<name> admin dir; the main checkout has a .git DIRECTORY. That
+    // distinction is the whole reason two copies can silently fight over one
+    // port, so surface it explicitly.
+    let linkedWorktree = false;
+    try {
+        linkedWorktree = fs.statSync(path.join(STATIC_DIR, '.git')).isFile();
+    } catch (_) { /* no .git at all */ }
+    checkoutDescription = { dir: STATIC_DIR, branch, sha, linkedWorktree };
+    return checkoutDescription;
+}
 
 const CACHE_CONTROL = 'no-store, no-cache, must-revalidate, max-age=0';
 // Static page assets are version-busted via ?v= in index.html, so browsers may
@@ -1047,6 +1098,17 @@ const server = http.createServer((req, res) => {
     // correct per-connection fate — the socket is already gone.
     res.on('error', () => {});
 
+    // Expose the serving checkout to the browser, not just the terminal. The
+    // symptom of this whole class of bug is observed in the BROWSER ("my edit
+    // did nothing"), so the answer has to be inspectable there: DevTools ->
+    // Network -> any response -> Response Headers, or view-source. Cheap (the
+    // description is memoised) and set before any writeHead, so it rides along
+    // on static assets and proxied responses alike; an explicit header of the
+    // same name elsewhere would still win.
+    try {
+        res.setHeader('X-Rydius-Served-From', describeCheckout().dir);
+    } catch (_) { /* never let diagnostics break a response */ }
+
     let requestUrl;
     try {
         requestUrl = new URL(req.url, 'http://localhost');
@@ -1256,6 +1318,18 @@ server.headersTimeout = 66000;
 
 server.listen(PORT, '127.0.0.1', () => {
     console.log('Rydius Stream host is running on this laptop.');
+    // FIRST, because it is the fact that invalidates every other observation
+    // made against this window: if you are not looking at the expected path,
+    // nothing below it (and nothing on the page) reflects your edits.
+    const checkout = describeCheckout();
+    console.log(`Serving from: ${checkout.dir}`);
+    console.log(`Checkout:     ${checkout.branch} @ ${checkout.sha}`
+        + (checkout.linkedWorktree ? '  (git linked worktree)' : ''));
+    if (checkout.linkedWorktree) {
+        console.log('Note: this is a git LINKED WORKTREE. Sibling worktrees and the main '
+            + 'checkout serve the same ports — if the page does not reflect your edits, '
+            + 'another copy is holding the port. Compare the path above with your editor.');
+    }
     console.log(`Local page:    http://127.0.0.1:${PORT}/streaming/`);
     console.log(`WebRTC signal: http://127.0.0.1:${MEDIAMTX_PORT} (proxied at /stream-api/**)`);
     console.log(`MediaMTX API:  http://127.0.0.1:${MEDIAMTX_API_PORT} (proxied at /stream-api/v3/**)`);
