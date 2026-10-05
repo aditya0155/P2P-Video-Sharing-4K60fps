@@ -146,6 +146,47 @@ try {
         throw "Cloudflare tunnel config exists but cloudflared.exe is missing: $cloudflaredPath"
     }
 
+    # WHICH CHECKOUT IS ACTUALLY STARTING.
+    #
+    # This launcher resolves everything against its OWN directory (`$scriptDir`),
+    # so a double-click here always starts this checkout — which is correct. The
+    # trap is the opposite one: this repo has ~40 git worktrees PLUS a main
+    # checkout, every one of them carries its own copy of app.js/server.js, and
+    # every port in mediamtx.yml is fixed (3000/8888/1935/8554/8889/8189). So if
+    # the host is ALREADY running from a different checkout, this run fails to
+    # bind and the page you are looking at is silently the other checkout's
+    # code — with no symptom except "my edit did nothing".
+    #
+    # Printing the absolute path makes that visible in the first line, and the
+    # two guards below catch the machine-local assets that make a worktree a
+    # strictly worse place to run from.
+    $gitMarker = Join-Path $scriptDir '.git'
+    $isWorktree = Test-Path -LiteralPath $gitMarker -PathType Leaf   # worktrees use a FILE, the main checkout a directory
+    Write-Host ''
+    Write-Host "  Starting host from: $scriptDir" -ForegroundColor White
+    if ($isWorktree) {
+        Write-Host '  NOTE: this is a git WORKTREE, not the main checkout.' -ForegroundColor Yellow
+    }
+
+    # Machine-local assets that .gitignore deliberately keeps out of git, and
+    # which therefore exist ONLY in the main checkout:
+    #   ffmpeg_win/              -> the ffmpeg 8.1 build the AV1 leg requires
+    #   cloudflared_config.yml   -> the tunnel remote viewers connect through
+    #   secrets.local.env        -> optional Cloudflare TURN credentials
+    # Missing ones are NOT fatal — an H.264 host with no tunnel still serves
+    # 127.0.0.1 — but they degrade silently, so they are named here rather than
+    # discovered later as "AV1 will not sync" or "remote viewers cannot connect".
+    $bundledFfmpeg = Join-Path $scriptDir 'ffmpeg_win\ffmpeg-n8.1-latest-win64-gpl-shared-8.1\bin\ffmpeg.exe'
+    if (-not (Test-Path -LiteralPath $bundledFfmpeg -PathType Leaf)) {
+        Write-Host '  WARNING: bundled ffmpeg 8.1 not found (ffmpeg_win/ is gitignored).' -ForegroundColor Yellow
+        Write-Host '           An AV1 WHIP source will NOT sync without it; run the host from the main checkout.' -ForegroundColor Yellow
+    }
+    if (-not (Test-Path -LiteralPath $tunnelConfigPath -PathType Leaf)) {
+        Write-Host '  WARNING: cloudflared_config.yml not found, so no public tunnel will start.' -ForegroundColor Yellow
+        Write-Host '           Remote viewers cannot connect; 127.0.0.1 will work. Run setup_cloudflared.ps1 from the main checkout.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+
     # Optional Cloudflare TURN credentials (written by setup_cloudflared.ps1).
     # The file keeps the API token on this laptop; browsers only ever receive
     # short-lived, server-minted ICE credentials from /stream-api/turn.
@@ -159,6 +200,32 @@ try {
     }
 
     if (Test-LocalTcpPort $webPort) {
+        # Name the holder. "Port 3000 is already in use" is true but useless: with
+        # ~40 worktrees plus a main checkout all pinned to the same fixed ports,
+        # the overwhelmingly common cause is another CHECKOUT of this same repo
+        # already running, and the symptom the user reports is "my edit did
+        # nothing" rather than "a port is busy". Resolving the owning process's
+        # command line turns the generic message into the actual fix.
+        $holder = $null
+        try {
+            $conn = Get-NetTCPConnection -State Listen -LocalPort $webPort -ErrorAction Stop |
+                Select-Object -First 1
+            if ($conn) {
+                $holderPid = $conn.OwningProcess
+                $holder = "pid $holderPid"
+                # The command line identifies WHICH checkout holds the port, and it
+                # is the entire point of the message. `OwningProcess` lives on the
+                # connection, not on Win32_Process - reading it off the process is
+                # why the first version printed an empty pid.
+                try {
+                    $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $holderPid" -ErrorAction Stop
+                    if ($proc.CommandLine) { $holder = "$($proc.Name) (pid $holderPid) -- $($proc.CommandLine)" }
+                } catch { }
+            }
+        } catch { $holder = $null }
+        if ($holder) {
+            throw "Port $webPort is already held by: $holder`n`nThat is almost always another CHECKOUT of this repo already running (every port in mediamtx.yml is fixed). Stop it, or set PORT to a free port. The host you just launched would serve ITS OWN copy of app.js, not this one."
+        }
         throw "Port $webPort is already in use. Stop the other site server or set PORT to a free port before starting."
     }
 

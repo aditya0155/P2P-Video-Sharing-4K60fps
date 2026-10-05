@@ -1321,6 +1321,14 @@ server.listen(PORT, '127.0.0.1', () => {
     // FIRST, because it is the fact that invalidates every other observation
     // made against this window: if you are not looking at the expected path,
     // nothing below it (and nothing on the page) reflects your edits.
+    //
+    // STATIC_DIR is __dirname, so this process serves whichever copy of
+    // index.html/app.js it was launched from, and this repo has many sibling git
+    // worktrees plus the main checkout. Every port in mediamtx.yml
+    // (3000/8888/1935/8554/8889/8189) is FIXED, so a second instance fails to
+    // bind rather than replacing the first -- the wrong copy keeps serving and
+    // reports no error at all. The absolute path plus branch/SHA is therefore the
+    // only way to tell, which is why it is printed before anything else.
     const checkout = describeCheckout();
     console.log(`Serving from: ${checkout.dir}`);
     console.log(`Checkout:     ${checkout.branch} @ ${checkout.sha}`
