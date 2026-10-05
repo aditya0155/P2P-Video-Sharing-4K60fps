@@ -50,6 +50,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const MEDIAMTX_API_PATH = '/stream-api/v3/paths/list';
 
     const WHIP_POST_TIMEOUT_MS = 25000;
+    // The session DELETE is bounded like the POST: teardown holds the
+    // `isTearingDown` re-entrancy guard across this await, so an unbounded
+    // request can wedge the whole transport state machine.
+    const WHIP_DELETE_TIMEOUT_MS = 5000;
+    // The advisory "is someone already publishing?" probe, awaited by the
+    // source picker. It never blocks the broadcast (a failure reports "no"), but
+    // it must not be able to hang the picker either.
+    const PATH_PROBE_TIMEOUT_MS = 5000;
     const ICE_GATHER_TIMEOUT_MS = 8000;
     const STATS_INTERVAL_MS = 1000;
 
@@ -238,7 +246,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function hasSource() {
-        return Boolean(displayStream && displayStream.getVideoTracks().length);
+        // Liveness, not mere presence. A MediaStream whose tracks have been
+        // stopped still reports them, and `track.stop()` never fires 'ended' -- so
+        // a presence check reports a dead capture as ready, re-enables Start, and
+        // the retry publishes a permanently silent video track. Nothing else in
+        // this file checked readyState, so this is the only guard.
+        if (!displayStream) return false;
+        return displayStream.getVideoTracks().some((track) => track.readyState === 'live');
     }
 
     // ==========================================================================
@@ -785,8 +799,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 whipSessionUrl = null;
                 try {
                     // keepalive so the DELETE still leaves the page if this runs
-                    // from the unload handler.
-                    await fetch(sessionUrl, { method: 'DELETE', keepalive: true });
+                    // from the unload handler. The AbortController is not
+                    // cosmetic: this is the only network call in the file without
+                    // a bound, and a stalled DELETE would hold `isTearingDown`
+                    // true forever -- wedging teardown permanently, leaving the UI
+                    // stuck mid-transition with no way to recover but reloading.
+                    // The session is nulled above, so timing out here cannot cause
+                    // a double DELETE.
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), WHIP_DELETE_TIMEOUT_MS);
+                    try {
+                        await fetch(sessionUrl, { method: 'DELETE', keepalive: true, signal: controller.signal });
+                    } finally {
+                        clearTimeout(timer);
+                    }
                 } catch (err) {
                     // MediaMTX also expires the session when the publisher
                     // connection drops, so a failed DELETE is not fatal.
@@ -798,8 +824,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 const pc = peerConnection;
                 peerConnection = null;
                 try {
+                    // The sender's video track IS the display track (pc.addTrack
+                    // in startPublishing), so stopping it here would destroy the
+                    // very capture `keepSource` promises to preserve -- and
+                    // track.stop() never fires 'ended', so nothing downstream
+                    // would ever learn the source died. The caller would then
+                    // re-enable Start on a dead source and the retry would
+                    // publish a permanently silent m-section. The whole point of
+                    // keepSource is "the capture is fine, the network was not".
+                    const keptVideoTracks = keepSource && displayStream
+                        ? displayStream.getVideoTracks()
+                        : [];
                     pc.getSenders().forEach((sender) => {
-                        if (sender.track) sender.track.stop();
+                        if (!sender.track) return;
+                        if (keptVideoTracks.includes(sender.track)) return;
+                        sender.track.stop();
                     });
                 } catch (err) {
                     console.warn('[Studio] Error stopping senders:', err);
@@ -912,7 +951,11 @@ document.addEventListener('DOMContentLoaded', () => {
     async function isAlreadyPublishing() {
         try {
             const response = await fetch(window.location.origin + MEDIAMTX_API_PATH, {
-                cache: 'no-store'
+                cache: 'no-store',
+                // Bounded like every other request in this file. This probe is
+                // AWAITED inside pickSource(), so an unbounded stall would hang
+                // the source picker with no error and no way forward.
+                signal: AbortSignal.timeout(PATH_PROBE_TIMEOUT_MS)
             });
             if (!response.ok) return false;
             const data = await response.json();

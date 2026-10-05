@@ -269,6 +269,15 @@ try {
             $cloudflaredProcess = $null
         } else {
             Write-Host 'Tunnel is up: https://stream.rydius.in' -ForegroundColor Green
+            # server.js keys chat/reaction rate limits on the real client IP.
+            # It only honours CF-Connecting-Ip when CF_TUNNEL_HOST is set,
+            # because this server binds 127.0.0.1 and every path in (tunnel,
+            # Tailscale serve, a local client) therefore looks like loopback --
+            # only the tunnel actually rewrites the header, so only the tunnel
+            # can safely be trusted for it. Without this flag every remote viewer
+            # shares one bucket and a single chatty client locks the whole room
+            # out of chat.
+            $env:CF_TUNNEL_HOST = 'stream.rydius.in'
         }
     } else {
         Write-Host 'Cloudflare tunnel not configured (run setup_cloudflared.ps1 once). Local + Tailscale access still work.' -ForegroundColor DarkYellow

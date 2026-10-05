@@ -75,6 +75,31 @@ const MIME_TYPES = {
 // left generous so a burst of simultaneous WHEP handshakes never queues.
 const MEDIAMTX_AGENT = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 64 });
 
+// Connection-scoped headers that must never be relayed to an upstream (RFC 9110
+// §7.6.1). Forwarding them creates conflicting message framing (a request
+// smuggling surface against MediaMTX) and defeats the keep-alive pool above.
+const HOP_BY_HOP_HEADERS = new Set([
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'proxy-connection',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade'
+]);
+
+// RFC 9110 §7.6.1: any header NAMED in the request's Connection field is
+// hop-by-hop for that message, and the list is attacker-controlled. Filtering
+// only the fixed set above would still relay `Connection: X-Smuggled` together
+// with `X-Smuggled`, which is the actual request-smuggling surface.
+function connectionNominatedHeaders(headers) {
+    const raw = headers.connection;
+    if (typeof raw !== 'string') return new Set();
+    return new Set(raw.split(',').map((token) => token.trim().toLowerCase()).filter(Boolean));
+}
+
 const STATIC_FILES = new Map([
     ['/', 'index.html'],
     ['/index.html', 'index.html'],
@@ -144,13 +169,44 @@ function setCorsHeaders(headers) {
     return headers;
 }
 
+// MediaMTX's control API is unauthenticated by default, and the whole thing is
+// published publicly through the Cloudflare Tunnel. Forwarding /stream-api/v3/**
+// verbatim therefore handed the internet an unauthenticated remote-control
+// surface for the media server: `PATCH /v3/config/global/set` to rewrite the
+// configuration, `DELETE /v3/paths/list/live-h264/readystate` to kill the
+// broadcast mid-stream, `GET /v3/config/global/get` to read back credentials.
+//
+// The player and the studio only ever need ONE endpoint: a read-only GET of the
+// path list (app.js status probe + rendition poll, studio.js takeover check).
+// Everything else is refused here, before the proxy is ever reached.
+const ALLOWED_API_ROUTES = new Set(['/stream-api/v3/paths/list']);
+
+function isAllowedControlApiRequest(pathname, method) {
+    if (!ALLOWED_API_ROUTES.has(pathname)) return false;
+    // Read-only. A GET/HEAD is the whole legitimate surface; PATCH/PUT/DELETE on
+    // this path would be a write against the control plane.
+    return method === 'GET' || method === 'HEAD';
+}
+
 function proxyToMediaMTX(req, res, requestUrl) {
     const targetPath = requestUrl.pathname.slice('/stream-api'.length) || '/';
     // MediaMTX splits its HTTP surfaces: the control API (status probes) listens on
     // MEDIAMTX_API_PORT, WebRTC/WHIP signaling on MEDIAMTX_PORT. Route by prefix so
     // /stream-api/v3/** reaches the API.
     const targetPort = requestUrl.pathname.startsWith('/stream-api/v3/') ? MEDIAMTX_API_PORT : MEDIAMTX_PORT;
-    const headers = { ...req.headers, host: `${MEDIAMTX_HOST}:${targetPort}` };
+    // Hop-by-hop headers (RFC 9110 §7.6.1) describe THIS connection and must not
+    // be forwarded by an intermediary. Copying them all also breaks the thing
+    // MEDIAMTX_AGENT exists for: a client `connection: close` would otherwise
+    // travel upstream and tear down a pooled socket, forcing a fresh TCP
+    // connection to MediaMTX on every proxied request.
+    const headers = {};
+    const nominated = connectionNominatedHeaders(req.headers);
+    for (const [name, value] of Object.entries(req.headers)) {
+        const lower = name.toLowerCase();
+        if (HOP_BY_HOP_HEADERS.has(lower) || nominated.has(lower)) continue;
+        headers[name] = value;
+    }
+    headers.host = `${MEDIAMTX_HOST}:${targetPort}`;
     const proxyReq = http.request({
         host: MEDIAMTX_HOST,
         port: targetPort,
@@ -254,10 +310,13 @@ function proxyToMediaMTX(req, res, requestUrl) {
             return;
         }
         console.error(`[Proxy] MediaMTX at ${MEDIAMTX_HOST}:${targetPort} is unavailable:`, error.message);
-        res.writeHead(502, {
+        // setCorsHeaders matters here: without it the browser reports an opaque
+        // CORS failure and the viewer never sees the one message that tells them
+        // what to do about it.
+        res.writeHead(502, setCorsHeaders({
             'Content-Type': 'application/json; charset=utf-8',
             'Cache-Control': CACHE_CONTROL
-        });
+        }));
         res.end(JSON.stringify({ error: 'MediaMTX is not running. Start the host with start_host.bat.' }));
     });
 
@@ -338,7 +397,12 @@ async function mintTurnIceServers() {
         // disconnected once their credentials expire). At TTL/2 every served
         // mint keeps at least TTL/2 of validity (default 30 min vs the 10 min
         // viewer cache), making an expired-credential reconnect impossible.
-        turnMintCache.renewAt = now + Math.max(60000, (CF_TURN_TTL_SECONDS / 2) * 1000);
+        // The bound is additionally clamped to the credential's own lifetime so
+        // a SHORT TTL (Cloudflare's minimum is 60s) can never schedule renewal
+        // at or past expiry, which would serve credentials that are already
+        // dead and silently drop the TURN allocation.
+        const ttlMs = CF_TURN_TTL_SECONDS * 1000;
+        turnMintCache.renewAt = now + Math.max(1000, Math.min(ttlMs / 2, ttlMs - 5000));
         console.log(`[TURN] Minted relay credentials (${turnMintCache.iceServers.length} TURN entries).`);
     } catch (error) {
         // Any failure just means "host candidates only" for the next 30s; a
@@ -413,9 +477,27 @@ const TRUST_FORWARDED_HEADERS = Boolean(
     process.env.CF_TUNNEL_HOST || process.env.TRUST_PROXY_HEADERS === '1'
 );
 function clientIpForRateLimit(req) {
+    // `cf-connecting-ip` is the one header Cloudflare itself sets and overwrites
+    // on every request arriving through the tunnel, so a client cannot forge it
+    // THERE. Behind the tunnel it is also the only way to tell viewers apart:
+    // this server binds 127.0.0.1, so `cloudflared` dials it over loopback and
+    // every remote viewer would otherwise resolve to the same rate-limit key --
+    // one chatty client locking every other viewer out of chat and reactions
+    // (verified: 8 messages -> 200,200,200,200,200,429,429,429).
+    //
+    // It is gated on TRUST_FORWARDED_HEADERS because that flag is the explicit
+    // statement "this process really is behind the tunnel, which rewrites these
+    // headers". The peer address CANNOT be that statement: this process listens
+    // on loopback only, so the Tailscale path (`tailscale serve`, which also
+    // proxies over loopback) and any local client look identical to the tunnel
+    // here. Trusting on that basis would let a tailnet or local client mint a
+    // fresh bucket per request -- exactly the bypass the old unguarded
+    // x-forwarded-for chain had. start_host.ps1 sets CF_TUNNEL_HOST when it
+    // actually starts cloudflared, so the deployment that needs this is the one
+    // that enables it.
     if (TRUST_FORWARDED_HEADERS) {
         const cfIp = req.headers['cf-connecting-ip'];
-        if (typeof cfIp === 'string' && cfIp) return cfIp.trim();
+        if (typeof cfIp === 'string' && cfIp.trim()) return cfIp.trim();
         const xff = req.headers['x-forwarded-for'];
         if (typeof xff === 'string' && xff) {
             // First hop only: the rest of the chain is client-supplied.
@@ -423,7 +505,8 @@ function clientIpForRateLimit(req) {
             if (first) return first;
         }
     }
-    return (req.socket && req.socket.remoteAddress) || 'unknown';
+    const peer = (req.socket && req.socket.remoteAddress) || '';
+    return peer || 'unknown';
 }
 
 // Per-IP reaction limits are only half the story: aggregate rate is
@@ -616,7 +699,19 @@ function handleChat(req, res, requestUrl) {
         const isHost = isDirectLocal(req);
         const lastEventId = Number.parseInt(req.headers['last-event-id'] || requestUrl.searchParams.get('lastId') || '0', 10);
         let initialHistory;
-        if (lastEventId > 0) {
+        // Replay is only meaningful for ids this process actually issued. The
+        // counter restarts at 0 on boot, so a browser that reconnects after a
+        // server restart presents lastEventId=4 while messages are being
+        // numbered from 1 again: `m.id > 4` filtered out everything until the
+        // count climbed past 4, silently dropping real messages. The same
+        // happens for any id older than the ring buffer. In both cases the
+        // honest answer is the full retained window, which is also what a fresh
+        // subscriber gets — the client can render it without a gap marker.
+        const replayable = Number.isFinite(lastEventId)
+            && lastEventId > 0
+            && lastEventId <= lastChatMessageId
+            && (!chatHistory.length || lastEventId >= chatHistory[0].id);
+        if (replayable) {
             initialHistory = chatHistory.filter((m) => m.id > lastEventId);
         } else {
             initialHistory = chatHistory.slice(-50);
@@ -695,7 +790,16 @@ function handleChat(req, res, requestUrl) {
     if (subpath === '/messages' || subpath === '/messages/') {
         if (req.method === 'GET' || req.method === 'HEAD') {
             const sinceId = Number.parseInt(requestUrl.searchParams.get('since') || '0', 10);
-            const messages = sinceId > 0 ? chatHistory.filter((m) => m.id > sinceId) : chatHistory;
+            // Same rule as the SSE replay above, for the same reason: this is the
+            // client's FALLBACK poll (used when EventSource is unavailable), and
+            // after a server restart the ids restart from 1, so `sinceId` can be
+            // ahead of the counter and the naive filter would silently drop every
+            // real message until the count climbed past it.
+            const replayable = Number.isFinite(sinceId)
+                && sinceId > 0
+                && sinceId <= lastChatMessageId
+                && (!chatHistory.length || sinceId >= chatHistory[0].id);
+            const messages = replayable ? chatHistory.filter((m) => m.id > sinceId) : chatHistory;
             const body = JSON.stringify({ ok: true, messages });
             res.writeHead(200, setCorsHeaders({
                 'Content-Type': 'application/json; charset=utf-8',
@@ -977,6 +1081,18 @@ const server = http.createServer((req, res) => {
             handleChat(req, res, requestUrl);
             return;
         }
+        // Everything else under /stream-api/v3/** is the MediaMTX control plane.
+        // It is unauthenticated upstream and publicly reachable here, so only the
+        // one read-only endpoint the player actually uses is allowed through.
+        if (requestUrl.pathname.startsWith('/stream-api/v3/')
+            && !isAllowedControlApiRequest(requestUrl.pathname, req.method)) {
+            res.writeHead(403, setCorsHeaders({
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL
+            }));
+            res.end('403 Forbidden: the MediaMTX control API is not exposed through this proxy.');
+            return;
+        }
         proxyToMediaMTX(req, res, requestUrl);
         return;
     }
@@ -1007,7 +1123,15 @@ const server = http.createServer((req, res) => {
         // Any edit changes size/mtime and therefore the ETag, so stale content
         // can never be served from cache.
         const etag = `W/"${stats.size}-${Math.floor(stats.mtimeMs)}"`;
-        if (req.headers['if-none-match'] === etag) {
+        // RFC 9110 §13.1.2: If-None-Match is `*` or a comma-separated list, and
+        // ANY member matching makes the precondition fail (=> 304). Comparing the
+        // whole header to the etag only ever caught the exact-single-value form,
+        // so a client sending `*` or a list re-downloaded the full asset every
+        // time and the conditional-GET win was lost exactly where it mattered.
+        const inm = req.headers['if-none-match'];
+        const etagMatches = inm === '*'
+            || (typeof inm === 'string' && inm.split(',').some((tag) => tag.trim() === etag));
+        if (etagMatches) {
             res.writeHead(304, {
                 'Cache-Control': STATIC_CACHE_CONTROL,
                 'CDN-Cache-Control': 'no-store',

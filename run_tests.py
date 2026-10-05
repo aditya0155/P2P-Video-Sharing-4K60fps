@@ -278,6 +278,12 @@ class StubMediaMTX:
                     "content_type": self.headers.get("Content-Type"),
                     "authorization": self.headers.get("Authorization"),
                     "body": body.decode("utf-8", "replace"),
+                    # The full header set as it arrived, so a test can assert on
+                    # hop-by-hop headers the proxy must NOT relay. `self.headers`
+                    # is case-insensitive but iterating it gives the original
+                    # spellings, which is what a smuggling defence must match on.
+                    "headers": {key: value for key, value in self.headers.items()},
+                    "header_names": {key.lower() for key in self.headers.keys()},
                 })
                 route = stub.routes.get((self.command, self.path))
                 if route is None:
@@ -1002,6 +1008,209 @@ class StreamApiProxyChecks(_SiteUnderTest):
         self.assertEqual(self.signaling.requests, [], "preflight must not reach MediaMTX")
         self.assertEqual(self.api.requests, [], "preflight must not reach MediaMTX")
 
+    # --- the control plane must not be a public remote control ---------------
+    #
+    # MediaMTX's API is unauthenticated and this whole server is published
+    # through the Cloudflare Tunnel, so proxying /stream-api/v3/** verbatim
+    # exposed config writes and stream teardown to anyone on the internet. The
+    # player and studio only ever issue a read-only GET of the path list, so
+    # everything else is refused here without touching the upstream.
+    CONTROL_API_WRITE_PROBES = (
+        ("PATCH", "/stream-api/v3/config/global/set", b'{"logLevel":"debug"}'),
+        ("POST", "/stream-api/v3/recordings/disk/start", b"{}"),
+        ("DELETE", "/stream-api/v3/paths/list/live-h264/readystate", None),
+        ("GET", "/stream-api/v3/config/global/get", None),
+        ("POST", "/stream-api/v3/paths/list/live/readystate", b"{}"),
+    )
+
+    def test_control_api_is_read_only_paths_list_only(self):
+        for method, path, body in self.CONTROL_API_WRITE_PROBES:
+            with self.subTest(method=method, path=path):
+                self.api.clear()
+                status, headers, _ = http_request(self.port, method, path, body=body)
+                self.assertEqual(
+                    status, 403,
+                    f"{method} {path} must be refused: the control plane is "
+                    f"unauthenticated upstream and this server is public",
+                )
+                self.assertEqual(
+                    self.api.requests, [],
+                    f"{method} {path} must be blocked BEFORE the proxy runs",
+                )
+                # The refusal itself must be readable cross-origin, or the viewer
+                # sees an opaque CORS failure instead of the explanation.
+                self.assertEqual(headers.get("Access-Control-Allow-Origin"), "*")
+
+    def test_the_one_control_api_route_the_player_needs_still_works(self):
+        # The allow-list must not break the status probe: this is the only
+        # control-API call app.js and studio.js make.
+        self.api.clear()
+        status, _, body = http_request(self.port, "GET", "/stream-api/v3/paths/list")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.api.requests), 1, "the probe must still be proxied")
+        json.loads(body.decode("utf-8"))
+
+    def test_hop_by_hop_headers_are_not_forwarded_upstream(self):
+        # Connection-scoped headers must not be relayed (RFC 9110 7.6.1): they
+        # describe THIS hop, and forwarding them creates conflicting framing (a
+        # smuggling surface against MediaMTX) and defeats the keep-alive pool.
+        #
+        # `connection` itself is NOT asserted absent: Node's agent legitimately
+        # sets its own Connection on every upstream request, so its presence
+        # proves nothing either way. These are headers Node never synthesises,
+        # so if they appear upstream they arrived from the client and were
+        # relayed.
+        self.api.clear()
+        http_request(
+            self.port, "GET", "/stream-api/v3/paths/list",
+            headers={
+                "Proxy-Authorization": "Basic should-not-be-relayed",
+                "TE": "trailers",
+                "Trailer": "X-Smuggled",
+                "X-Keep-Me": "yes",
+            },
+        )
+        self.assertEqual(len(self.api.requests), 1)
+        record = self.api.requests[0]
+        for hop in ("proxy-authorization", "te", "trailer"):
+            self.assertNotIn(
+                hop, record["header_names"],
+                f"{hop} is hop-by-hop and must not be relayed upstream",
+            )
+        # Look the end-to-end header up case-insensitively: the stub records the
+        # original spelling the client used, and asserting on an exact-cased key
+        # would make this test depend on the casing the client happened to pick.
+        forwarded = {k.lower(): v for k, v in record["headers"].items()}
+        self.assertEqual(
+            forwarded.get("x-keep-me"), "yes",
+            "ordinary end-to-end headers must still be forwarded",
+        )
+
+    def test_headers_named_in_the_connection_field_are_not_forwarded(self):
+        # RFC 9110 7.6.1 makes any header NAMED in Connection hop-by-hop for
+        # that message, and that list is attacker-controlled. A fixed blocklist
+        # alone still relays `Connection: X-Smuggled` together with X-Smuggled,
+        # which is the actual smuggling surface.
+        self.api.clear()
+        http_request(
+            self.port, "GET", "/stream-api/v3/paths/list",
+            headers={"Connection": "X-Smuggled", "X-Smuggled": "yes", "X-Real": "ok"},
+        )
+        self.assertEqual(len(self.api.requests), 1)
+        record = self.api.requests[0]
+        self.assertNotIn(
+            "x-smuggled", record["header_names"],
+            "a header nominated by Connection is hop-by-hop and must not be "
+            "relayed upstream",
+        )
+        self.assertEqual(
+            {k.lower(): v for k, v in record["headers"].items()}.get("x-real"), "ok",
+            "headers that Connection does not nominate must still be forwarded",
+        )
+
+    def test_forwarded_client_ip_is_ignored_unless_a_tunnel_is_configured(self):
+        # This server binds 127.0.0.1, so the peer address cannot distinguish the
+        # Cloudflare tunnel from Tailscale serve or a local client -- all three
+        # arrive on loopback. Honouring CF-Connecting-Ip on that basis would let
+        # any of them mint a fresh rate-limit bucket per request, which is the
+        # bypass the old unguarded x-forwarded-for chain had. The launcher sets
+        # CF_TUNNEL_HOST when it actually starts cloudflared, so the deployment
+        # that needs per-viewer limits is the one that enables them.
+        server = read_text(SERVER_PATH)
+        self.assertIn("TRUST_FORWARDED_HEADERS", server)
+        body = self._js_function_body(server, "clientIpForRateLimit") \
+            if hasattr(self, "_js_function_body") else None
+        if body is not None:
+            self.assertIn(
+                "TRUST_FORWARDED_HEADERS", body,
+                "the forwarded-IP branch must be gated on explicit tunnel config",
+            )
+        # The launcher is the thing that turns that gate on, and only when the
+        # tunnel actually came up.
+        launcher = read_text(LAUNCHER_PATH)
+        self.assertIn("CF_TUNNEL_HOST", launcher,
+                      "the launcher must enable tunnel trust or every remote "
+                      "viewer shares one rate-limit bucket")
+
+    def test_if_none_match_accepts_star_and_lists_per_rfc(self):
+        # RFC 9110 13.1.2: `*` and comma-separated lists both satisfy the
+        # precondition. Comparing the whole header to one etag only ever caught
+        # the exact form, so a revalidating client re-downloaded the asset.
+        status, headers, _ = http_request(self.port, "GET", "/app.js")
+        self.assertEqual(status, 200, "app.js must be served before probing etags")
+        etag = headers.get("ETag")
+        self.assertTrue(etag, "static assets must carry an ETag to revalidate against")
+        for header in ("*", f'W/"other", {etag}', f'{etag}, W/"other"'):
+            with self.subTest(if_none_match=header):
+                status, _, body = http_request(
+                    self.port, "GET", "/app.js", headers={"If-None-Match": header},
+                )
+                self.assertEqual(status, 304, f"If-None-Match: {header} must revalidate to 304")
+                self.assertEqual(body, b"", "a 304 must carry no body")
+        # A genuinely stale etag must still re-download, or the 304 above is
+        # worthless as a freshness guarantee.
+        status, _, _ = http_request(
+            self.port, "GET", "/app.js", headers={"If-None-Match": 'W/"stale"'},
+        )
+        self.assertEqual(status, 200, "a non-matching etag must return the body")
+
+    @staticmethod
+    def _read_chat_init(port, query=""):
+        """Open the SSE stream and read exactly the `init` frame.
+
+        The stream never ends, so reading to EOF hangs -- which is how the
+        first version of this test deadlocked. Read the one frame we need off
+        the socket and close.
+        """
+        conn = HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", f"/stream-api/chat/events{query}")
+            response = conn.getresponse()
+            if response.status != 200:
+                return response.status, None
+            frame = b""
+            while b"\n\n" not in frame:
+                chunk = response.fp.readline()
+                if not chunk:
+                    break
+                frame += chunk
+            if b"event: init" not in frame:
+                return response.status, None
+            payload = frame.split(b"data: ", 1)[1].split(b"\n", 1)[0]
+            return response.status, json.loads(payload.decode("utf-8"))
+        finally:
+            conn.close()
+
+    def test_chat_replay_does_not_silently_drop_messages_across_a_restart(self):
+        # Message ids restart at 1 when the server restarts, so a browser
+        # reconnecting with lastId=99 while messages are numbered from 1 again
+        # used to have `m.id > 99` filter out every real message, silently and
+        # with no gap marker. The client must get the retained window instead.
+        self.start_site()
+        for text in ("alpha", "bravo", "charlie"):
+            http_request(
+                self.port, "POST", "/stream-api/chat/messages",
+                body=json.dumps({"text": text, "author": "Viewer"}).encode("utf-8"),
+            )
+        status, init = self._read_chat_init(self.port, "?lastId=99")
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(init, "the init frame must be readable")
+        texts = [m.get("text") for m in init["history"]]
+        for text in ("alpha", "bravo", "charlie"):
+            self.assertIn(
+                text, texts,
+                "an id this process never issued must fall back to the full "
+                "retained window instead of silently dropping messages",
+            )
+        # A legitimate in-range replay must still replay only what followed it,
+        # or the fix would just resend the whole log to every reconnecting tab.
+        status, init = self._read_chat_init(self.port, "?lastId=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [m.get("text") for m in init["history"]], ["bravo", "charlie"],
+            "an id inside the retained window must replay only what followed it",
+        )
+
     def test_upstream_that_dies_mid_body_is_cut_loose_instead_of_hanging(self):
         # A response that dies AFTER its headers is reported on Node's *response*
         # object, never on the request, and pipe() does not forward source errors
@@ -1142,8 +1351,26 @@ class TurnCredentialProxyChecks(_SiteUnderTest):
         # hand a reconnecting viewer expired credentials and kill its relay.
         server = read_text(SERVER_PATH)
         app = read_text(APP_PATH)
-        self.assertIn("(CF_TURN_TTL_SECONDS / 2) * 1000", server,
-                      "server must renew mints on a TTL/2 half-life schedule")
+        # Assert the SCHEDULE, not one literal spelling of it. The half-life
+        # term used to be written as `(CF_TURN_TTL_SECONDS / 2) * 1000` and
+        # pinning that exact string meant any correct rewrite of the expression
+        # failed the suite — so this now checks the property it protects: the
+        # renewal offset is the TTL/2 term.
+        self.assertRegex(
+            server,
+            r"renewAt\s*=\s*now\s*\+\s*Math\.max\([^;]*ttlMs\s*/\s*2",
+            "server must renew mints on a TTL/2 half-life schedule",
+        )
+        # ...and that the offset is additionally clamped to the credential's own
+        # lifetime. A fixed 60s floor equalled the FULL TTL at Cloudflare's
+        # minimum 60s TTL, so a mint served at the tail of its window carried
+        # zero remaining validity and the allocation silently failed.
+        self.assertRegex(
+            server,
+            r"renewAt\s*=\s*now\s*\+\s*Math\.max\([^;]*ttlMs\s*-\s*5000",
+            "the renewal offset must be clamped to the credential lifetime, or a "
+            "short TTL schedules renewal at/after expiry and serves dead credentials",
+        )
         self.assertRegex(app, r"cachedIceServersAt (?:<=>|> |<=) 10 \* 60 \* 1000",
                          "viewer ICE cache (10 min) must stay below the mint's >=30 min validity floor")
 
