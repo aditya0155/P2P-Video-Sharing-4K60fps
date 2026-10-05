@@ -489,3 +489,55 @@ Two supporting facts, both measured rather than assumed:
 - **The readiness probe's per-attempt budget sat on top of the median cold start.** A cold `server.js` answers its first request in ~0.52 s (median of 25 boots on this host, max 1.05 s) while every later request takes 3–25 ms, and each attempt was allowed **0.5 s** — so the probe discarded its first attempt on most boots and only ever succeeded on a retry. The attempt budget is now 2 s inside a 15 s overall deadline.
 
 Pinned by `test_a_taken_port_is_retried_and_then_reported_with_the_childs_words` (a real listening socket holds the port; the suite must retry it *and* surface `already in use`) and `test_the_readiness_probe_outlasts_a_cold_first_response` (a server that takes 1.2 s to answer must still be recognised as ready). The blocker in the first test deliberately does **not** set `SO_REUSEADDR`: on Windows that would let `server.js` bind the same port anyway, so the collision would never occur and the test would pass for the wrong reason. It also accepts-and-drops in a thread, so each retry fails in milliseconds instead of sitting out the full per-attempt timeout five times over.
+
+## Sixth-pass audit — a torn-down connection attempt was disarming the one that replaced it
+
+The previous passes hardened the *ordering* inside a single connect attempt. This one looks at what happens when two attempts overlap, which the generation token (`superseded()`) was added for but only ever applied to part of the function. Two module globals — `whepPostTimeout` and `gatherTimeout` — exist solely so `cleanupConnection()` can cancel an in-flight attempt, which makes each one a **slot that two attempts write to**. Nothing checked which attempt owned the handle being cleared.
+
+### A superseded attempt cleared the live attempt's WHEP POST bound
+
+`connectStream`'s `finally` cleared the global unconditionally:
+
+```
+A arms the 10s WHEP POST bound, awaits fetch
+A is torn down; cleanupConnection clears + nulls the global
+B starts and arms its own 10s bound
+A's aborted fetch rejects, A's `finally` runs
+  -> clearTimeout(B's bound); whepPostTimeout = null
+```
+
+B is then left with a POST that **no timeout can end and that teardown can no longer cancel**, so a stalled handshake hangs to the 26 s connect watchdog instead of 10 s — and nothing in the log says why, because the log only shows the connect that eventually succeeded. Reproduced against a model of the real module state before the fix: the global was `NULL` and the live timer set empty after A's `finally` ran.
+
+### The same shape silently killed the routable-candidate ICE path
+
+`gatherTimeout` had it twice over. The gather window's `finish()` is resumed by a `routablePoll` timer that is a **local of that closure**, so `cleanupConnection()` cannot clear it — a stale attempt is guaranteed to run `finish()` late. It then cleared B's 6 s cap and nulled the global. Worse, `pollRoutable()` guarded on `gatherTimeout === null` to know the window was still open: it was reading the very global the stale attempt had just nulled, so the whole routable-candidate loop **stopped rescheduling and returned silently**. The attempt degraded to "gathering complete, or forever" on exactly the hard networks (STUN blocked, TURN slow) that routine exists for.
+
+Both handles are now attempt-owned (`myPostTimeout`/`myAbortController`, `gatherCap`/`gatherOpen`) and published to the globals for teardown, released only under an identity check. `pollRoutable` guards on the attempt-local flag. `finish()` is also idempotent now.
+
+### A stale attempt's *failure* tore down a healthy session
+
+The `AbortError` branch had a `superseded()` guard; the **generic** error branch did not. `AbortError` is not the only way a torn-down attempt fails — `cleanupConnection()` calls `pc.close()` while the attempt is still suspended on `createOffer()` / `setLocalDescription()`, and those reject with `InvalidStateError` ("signalingState is 'closed'"). That landed in the unguarded branch, which cleared `isConnecting` and ran `handleDisconnected()`: clearing the **live** attempt's 26 s connect watchdog, closing the **live** attempt's peer connection, painting the page OFFLINE and re-arming the status poll. Any teardown trigger can produce it — an ABR rendition switch, the freeze watchdog's Stage 3, the seam safety net, the network-change handler — so a clean connect was followed by an unexplained drop on a perfectly healthy link.
+
+Pinned by `test_superseded_attempt_cannot_clear_a_live_attempts_timers`, `test_superseded_session_error_must_not_tear_down_the_live_session` and the js_checks pair `superseded-attempt-cannot-disarm-a-live-attempt` / `superseded-session-error-must-not-tear-down-the-live-session`. The js_checks case runs the real `finish()` and `finally` bodies in one shared scope **and asserts the old bodies still reproduce the fault**, so it cannot pass vacuously. Each was verified to fail when the fix is reverted and to pass when it is applied.
+
+## Seventh-pass audit — the launcher could not tell you that you were editing the wrong copy
+
+The single most expensive failure mode on this machine is not a bug in the code, it is **the code you edited not being the code that is running**. This repo is checked out many times over — a main checkout plus one worktree per task, forty-odd directories on this host — and sibling worktrees usually sit on the *same commit*, so their `mediamtx.yml` files are byte-identical. Every value comparison therefore passes, while the process doing the work belongs to a different directory.
+
+### "config matches mediamtx.yml" was printed while the hooks pointed elsewhere
+
+`start_host.ps1` already had a stale-config guard, and its own comment named this hazard exactly: *"Reusing a stale instance therefore turned every tuning edit into a silent no-op while the launcher cheerfully reported success."* It compares the running instance's **values** against the file on disk. That cannot detect a different checkout — with identical files there is nothing to detect.
+
+What differs is the **file itself**, and that matters because `runOnAvailable: node "codec_bridge.js"` is a **relative path**, resolved against MediaMTX's working directory. The rendition bridge actually transcoding is decided entirely by the directory the running instance was launched from. So editing `codec_bridge.js` in this worktree, re-running the launcher, and being told in reassuring cyan that the config matches — while the live transcoder runs a different copy of the file — was entirely possible, and silent.
+
+The guard now reads the reused process's own **command line** (the launcher already shells out to CIM for the UDP-port holder, so this adds no dependency), extracts the config path it was started with, and compares it against this checkout's. A mismatch is a loud, named warning. Verified against the real sibling checkout on this machine: `foreignConfig: True`.
+
+### The message claimed a scope it did not have
+
+The scalar reader is anchored at column 0, so every indented line is skipped — which means the whole `paths:` block, holding `runOnAvailable`, `runOnUnavailable` and `overridePublisher`, has **never** been compared. The reassurance now says so explicitly rather than letting "config matches" imply otherwise. (The project's own research notes had already flagged this as an open item.)
+
+### The UDP pre-flight was pinned to a literal
+
+`$webrtcUdpPort = 8189` was the one value in the launcher not derived from `mediamtx.yml`, while everything else was. Editing `webrtcLocalUDPAddress` therefore left the conflict check probing a port nothing binds — the guard going silently dead on exactly the edit it exists to catch. It is now parsed out of the config, with the literal kept only as a documented fallback for a missing file.
+
+Pinned by `test_launcher_detects_a_mediamtx_started_from_another_checkout` and `test_launcher_derives_the_webrtc_udp_port_from_the_config`.
