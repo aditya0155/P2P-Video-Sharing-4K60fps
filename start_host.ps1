@@ -39,6 +39,25 @@ $webPort = 3000
 # pre-flight touches it — so a conflict there used to surface only as a generic
 # "MediaMTX exited during startup" while the site itself still loaded.
 $webrtcUdpPort = 8189
+# ...but derived from mediamtx.yml when that file can be read, so the pre-flight
+# can never drift from the config it is protecting. It was hard-coded while
+# every other value in this launcher is taken from the file, so editing
+# `webrtcLocalUDPAddress` left the conflict check probing a port nothing binds:
+# the guard it exists to raise went silently dead on exactly the edit it should
+# have caught. The literal above stays as the fallback for a missing/unreadable
+# file, which the required-file check further down then reports by name.
+try {
+    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        $udpLine = Select-String -LiteralPath $configPath -Pattern '^\s*webrtcLocalUDPAddress:\s*\S+\s*$' |
+            Select-Object -First 1
+        if ($udpLine -and $udpLine.Matches[0].Groups[1].Value -match ':(\d{1,5})\s*$') {
+            $parsedPort = [int]$Matches[1]
+            if ($parsedPort -ge 1 -and $parsedPort -le 65535) { $webrtcUdpPort = $parsedPort }
+        }
+    }
+} catch {
+    # Keep the fallback; a parse failure must not stop the launcher here.
+}
 if ($env:PORT) {
     if (-not [int]::TryParse($env:PORT, [ref]$webPort) -or $webPort -lt 1 -or $webPort -gt 65535) {
         throw "PORT must be a valid TCP port; received $env:PORT"
@@ -302,8 +321,62 @@ try {
         } catch {
             Write-Host "Could not compare the running MediaMTX config (proceeding): $($_.Exception.Message)" -ForegroundColor Yellow
         }
-        if ($configVerified -and $compared -gt 0) {
-            Write-Host "Reusing the running MediaMTX instance (PID $($existing.ProcessId)); config matches mediamtx.yml ($compared scalar keys compared)." -ForegroundColor Cyan
+# WHICH mediamtx.yml was the running instance actually started with?
+        #
+        # Comparing the running instance's VALUES against the file on disk cannot
+        # detect a different checkout, and that is the common case on this
+        # machine: this repo is checked out many times over (a main checkout plus
+        # one worktree per task) and sibling worktrees usually sit on the SAME
+        # commit, so their mediamtx.yml files are byte-identical and every
+        # comparison above passes.
+        #
+        # What does NOT match is the file itself, and it matters because
+        # `runOnAvailable: node "codec_bridge.js"` is a RELATIVE path resolved
+        # against MediaMTX's working directory. The rendition bridge that is
+        # actually transcoding is therefore decided entirely by the directory the
+        # running instance was launched from, and no value comparison can see it.
+        # Symptom: you edit codec_bridge.js, re-run the launcher, it reports the
+        # config matches in the reassuring colour, and the change is a silent
+        # no-op because the live transcoder is running a different copy of the
+        # file.
+        #
+        # The process's own command line is the one locally available signal that
+        # answers this, and the launcher already shells out to CIM for the
+        # UDP-port holder, so this adds no new dependency.
+        $liveConfigPath = $null
+        try {
+            $liveProc = Get-CimInstance Win32_Process -Filter "ProcessId=$($existing.ProcessId)" -ErrorAction Stop
+            if ($liveProc -and $liveProc.CommandLine) {
+                $configArg = [regex]::Matches($liveProc.CommandLine, '"([^"]+\.ya?ml)"')
+                if ($configArg.Count -gt 0) { $liveConfigPath = $configArg[0].Groups[1].Value }
+            }
+        } catch { $liveConfigPath = $null }
+        $foreignConfig = $false
+        if ($liveConfigPath) {
+            try {
+                $liveFull = (Resolve-Path -LiteralPath $liveConfigPath -ErrorAction Stop).Path
+                $oursFull = (Resolve-Path -LiteralPath $configPath -ErrorAction Stop).Path
+                $foreignConfig = ($liveFull -ne $oursFull)
+            } catch { $foreignConfig = $false }
+        }
+        if ($foreignConfig) {
+            # A WARNING, not a throw, for the same reason the stale-scalar
+            # warning is one: the streaming stack is already up, and refusing to
+            # bring the site up beside it helps nobody. But it has to be loud and
+            # name the other path, because this is the one case where the
+            # launcher's own "config matches" line is actively misleading.
+            Write-Warning ("The running MediaMTX was started from a DIFFERENT copy of this project: it is using '$liveConfigPath', not '$configPath'. Its runOnAvailable hook (node codec_bridge.js) is a RELATIVE path, so the codec bridge actually transcoding is the OTHER copy's. Edits to codec_bridge.js or mediamtx.yml in THIS folder have NO effect until that mediamtx.exe is stopped (Ctrl+C in its window) and this launcher starts its own. The site and tunnel are being started anyway.")
+        }
+
+        if ($configVerified -and $compared -gt 0 -and -not $foreignConfig) {
+            # The scalar comparison above is blind to the whole `paths:` block
+            # (its keys are indented and the reader is anchored at column 0), so
+            # "config matches" has to state what it actually covers. The rendition
+            # hooks live there, and they are precisely the settings a
+            # codec-bridge edit depends on.
+            Write-Host "Reusing the running MediaMTX instance (PID $($existing.ProcessId)); top-level config matches mediamtx.yml ($compared scalar keys compared). Path-level settings under 'paths:' -- including runOnAvailable/runOnUnavailable, which launch codec_bridge.js -- are NOT compared." -ForegroundColor Cyan
+        } elseif ($foreignConfig) {
+            Write-Host "Reusing the running MediaMTX instance (PID $($existing.ProcessId)); it belongs to a DIFFERENT copy of this project (see the warning above)." -ForegroundColor Yellow
         } else {
             # Never print "config matches" in the reassuring colour when the
             # comparison did not actually run — that was the one path that was
