@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 /*
  * Unit checks for the browser-only logic inside app.js.
@@ -3055,6 +3055,518 @@ Object.assign(cases, {
             'the law default and CATCHUP_MAX_RATE have diverged');
         console.log(`    the guard can only fire at saturation (${moduleCap}x), `
             + `so it cannot judge a slow ramp`);
+    },
+    'chat-notification-behaviour'() {
+        function makeEl(tag) {
+            const el = {
+                tagName: tag,
+                className: '',
+                innerText: '',
+                innerHTML: undefined,
+                hidden: false,
+                dataset: {},
+                children: [],
+                classes: new Set(),
+                parentNode: null,
+                attrs: {},
+                setAttribute(k, v) { this.attrs[k] = v; },
+                appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
+                removeChild(child) {
+                    const i = this.children.indexOf(child);
+                    if (i !== -1) this.children.splice(i, 1);
+                    child.parentNode = null;
+                    return child;
+                },
+                classList: {
+                    add(...names) { names.forEach((n) => el.classes.add(n)); },
+                    remove(...names) { names.forEach((n) => el.classes.delete(n)); },
+                    contains(name) { return el.classes.has(name); }
+                }
+            };
+            return el;
+        }
+
+        const doc = {
+            createElement: makeEl,
+            getElementById: (id) => (id === 'chat-toast-overflow' ? overflowEl : null)
+        };
+        const layer = makeEl('div');
+        const overflowEl = makeEl('div');
+        overflowEl.hidden = true;
+        const badge = makeEl('span');
+        badge.hidden = true;
+        // Live Chat is the default tab, so the badge must stay DOWN while the
+        // host is watching the log render in front of them. Flip this to model
+        // the host being on the Stream Info tab instead.
+        const tabChat = makeEl('button');
+        tabChat.classes.add('active');
+
+        const timers = [];
+        const sandbox = {
+            document: doc,
+            chatToastLayer: layer,
+            chatToastOverflowEl: overflowEl,
+            chatUnreadBadge: badge,
+            tabChat: tabChat,
+            liveChatToasts: 0,
+            chatUnreadCount: 0,
+            lastChatToastAt: -1e9,
+            chatToastOverflow: 0,
+            CHAT_TOAST_LIFETIME_MS: 7000,
+            CHAT_TOAST_EXIT_MS: 260,
+            CHAT_TOAST_BURST_MS: 1200,
+            MAX_CHAT_TOASTS: 3,
+            MAX_CHAT_UNREAD: 99,
+            Date: { now: () => clock },
+            setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+            // cancelable, like the real one: the counter's expiry is re-armed
+            // on every folded message, so it must be possible to cancel.
+            clearTimeout: (id) => { if (id) timers[id - 1] = null; },
+            console: quietConsole()
+        };
+        let clock = 1e9;
+        sandbox.Date.now = () => clock;
+
+        // Compile the real functions against ONE shared context. Each
+        // compileFunction() call creates its own vm context, and a primitive
+        // like chatUnreadCount is a per-context binding, not a property of the
+        // sandbox object — so four separate contexts would each get their own
+        // copy and no function could observe another's writes.
+        // A primitive that a function assigns to (`chatUnreadCount += 1`) is a
+        // CONTEXT BINDING in a vm, not a property of the sandbox object. Seeding
+        // it in the object literal creates only a property, so the function's
+        // free reference resolves to nothing. Declare the mutable state as real
+        // bindings in the context first, then let the functions own them.
+        const context = vm.createContext(sandbox, { name: 'app.js#chat-notification' });
+        vm.runInContext(
+            'var chatUnreadCount = 0, liveChatToasts = 0, chatToastOverflow = 0, lastChatToastAt = -1e9, chatOverflowTimer = null;',
+            context);
+        const load = (name) => vm.runInContext(`(${extractFunction(name)})`, context,
+            { filename: `app.js#${name}` });
+        // showChatNotification CALLS renderChatUnread, and clearChatUnread calls
+        // it too, so these names must be real globals inside the context — a
+        // bare expression statement would leave them unbound. Declare them all
+        // in one pass from a temporary holder object.
+        context.__fns = {
+            showChatNotification: load('showChatNotification'),
+            renderChatUnread: load('renderChatUnread'),
+            clearChatUnread: load('clearChatUnread'),
+            clearChatOverflow: load('clearChatOverflow'),
+            updateChatToastOverflow: load('updateChatToastOverflow'),
+            scheduleChatOverflowRetire: load('scheduleChatOverflowRetire'),
+            dismissChatToast: load('dismissChatToast')
+        };
+        vm.runInContext(
+            'for (const k in __fns) this[k] = __fns[k];', context);
+        const show = context.showChatNotification;
+        const render = context.renderChatUnread;
+        const clear = context.clearChatUnread;
+        const updateOverflow = context.updateChatToastOverflow;
+
+        // Read state back out of the context, not off the sandbox literal.
+        const state = () => vm.runInContext(
+            '({ live: liveChatToasts, unread: chatUnreadCount })', context);
+
+        // -- 1. Isolated messages each build a card -------------------------
+        show('Ann', 'first', 'USER');
+        assertEqual(state().live, 1, 'an isolated message must build one card');
+        assert(layer.classList.contains('active'), 'the layer must be visible while it holds a card');
+        const card = layer.children[0];
+        assert(card.innerHTML === undefined, 'card text must never be assigned innerHTML');
+
+        // -- 2. A burst must NOT stack a card per message ------------------
+        for (let i = 0; i < 25; i++) {
+            clock += 100;               // inside CHAT_TOAST_BURST_MS
+            show('Ann', 'burst ' + i, 'USER');
+        }
+        assertEqual(state().live, 1,
+            'a burst inside the window must fold into one card, not stack 26');
+        assertEqual(overflowEl.hidden, false, 'the folded counter must be shown');
+        assertEqual(overflowEl.innerText, '+25 more',
+            'the counter must report how many messages it absorbed');
+
+        // -- 3. Even spread out, the stack is capped at MAX_CHAT_TOASTS ----
+        for (let i = 0; i < 10; i++) {
+            clock += 5000;              // outside the burst window
+            show('Ann', 'spread ' + i, 'USER');
+        }
+        assertEqual(state().live, 3,
+            'the concurrent card count must never exceed MAX_CHAT_TOASTS');
+
+        // -- 4. Unread badge: shown while unread, hidden at zero ----------
+        // Steps 1-3 ran with the chat tab visible, so nothing was unread and the
+        // badge never rose. Model the host sitting on Stream Info instead.
+        assertEqual(badge.hidden, true,
+            'with Live Chat open the host is already reading the log, so the badge '
+            + 'must NOT count those messages');
+        assertEqual(state().unread, 0,
+            'messages rendered in the open chat tab are not unread');
+        tabChat.classes.delete('active');            // host switches to Stream Info
+        show('Ann', 'while away', 'USER');
+        assertEqual(badge.hidden, false,
+            'a message arriving while the chat tab is hidden MUST raise the badge');
+        assertEqual(state().unread, 1, 'exactly one message, exactly one unread');
+        clear();
+        assertEqual(badge.hidden, true, 'clearing the count must HIDE the badge, not show 0');
+        assertEqual(state().unread, 0, 'clearing must zero the count');
+
+        // -- 5. The label is clamped so it cannot reflow the tab strip ----
+        vm.runInContext('chatUnreadCount = 100', context);
+        render();
+        assertEqual(badge.innerText, '99+', 'a runaway count must clamp to 99+');
+        vm.runInContext('chatUnreadCount = 99', context);
+        render();
+        assertEqual(badge.innerText, '99', 'a count at the cap renders exactly');
+
+        // -- 6. The counter is cleared once the burst is retired -----------
+        vm.runInContext('chatToastOverflow = 0', context);
+        updateOverflow();
+        assertEqual(overflowEl.hidden, true, 'a zero counter must be hidden');
+
+        // -- 7. The layer MUST fully go idle after a burst ----------------
+        // The regression: nothing ever cleared chatToastOverflow, and it is the
+        // last thing holding the layer `active` — which is pointer-events:auto
+        // over the video. One burst therefore left a permanent invisible
+        // click-eater in the corner of the player's hit area.
+        // Start from a clean stack: earlier steps deliberately left 3 live
+        // cards and a folded count, and step 7 is about the retire path.
+        layer.children.length = 0;
+        vm.runInContext('liveChatToasts = 0; chatToastOverflow = 0; lastChatToastAt = -1e9;', context);
+        timers.length = 0;
+        clock += 5000;
+        show('Ann', 'kicks off a fold', 'USER');   // alone -> 1 card
+        clock += 10;
+        show('Ann', 'folds', 'USER');               // inside burst window
+        assertEqual(vm.runInContext('chatToastOverflow', context), 1,
+            'the second close message must fold into the counter');
+
+        // Fire the card's dismissal and the counter's own retire timer.
+        const foldedCard = layer.children[layer.children.length - 1];
+        context.dismissChatToast(foldedCard);
+        let guard = 0;
+        while (timers.length && guard++ < 60) {
+            const t = timers.shift();
+            if (t) t.fn();
+        }
+
+        assertEqual(vm.runInContext('chatToastOverflow', context), 0,
+            'the folded counter must retire on its own, not stay forever');
+        assertEqual(layer.classList.contains('active'), false,
+            'the layer must be released, or it stays a permanent click-eater over the video');
+        assertEqual(overflowEl.hidden, true, 'the pill must be hidden once retired');
+
+        // -- 8. Clicking through retires the counter ----------------------
+        // The host clicked the card, so they are going to the log that already
+        // holds every folded message; leaving a stale "+N more" behind would
+        // be a permanent artifact they can only clear by reloading.
+        clock += 5000;
+        show('Ann', 'another fold', 'USER');
+        clock += 10;
+        show('Ann', 'folds again', 'USER');
+        assertEqual(vm.runInContext('chatToastOverflow', context), 1,
+            'precondition: a message is folded');
+        const liveBefore = vm.runInContext('liveChatToasts', context);
+        context.clearChatOverflow();
+        assertEqual(vm.runInContext('chatToastOverflow', context), 0,
+            'acting on a notification must clear the folded counter');
+        assertEqual(overflowEl.hidden, true, 'the pill must be hidden after click-through');
+        // A visible card legitimately keeps the layer active; the assertion is
+        // that clearChatOverflow did not leave a STALE counter behind.
+        assertEqual(layer.classList.contains('active'), liveBefore > 0,
+            'the layer must be released only once no card remains on screen');
+        // Drain the remaining card so the layer must then go idle.
+        let g3 = 0;
+        while (timers.length && g3++ < 60) { const t = timers.shift(); if (t) t.fn(); }
+        assertEqual(layer.classList.contains('active'), false,
+            'the layer must be released once the last card is gone');
+
+        // -- 9. A SOLO card must also release the layer --------------------
+        // A distinct failure mode from step 7: nothing is ever folded here, so
+        // the counter is 0 and ONLY the dismissal path can release the layer.
+        // If that path is skipped, one ordinary message leaves a dead,
+        // click-eating box over the video for the rest of the session — and
+        // most messages are solo, so this is the common way to hit the bug.
+        layer.children.length = 0;
+        vm.runInContext('liveChatToasts = 0; chatToastOverflow = 0; lastChatToastAt = -1e9;', context);
+        timers.length = 0;
+        clock += 5000;
+        show('Ann', 'just one message', 'USER');
+        assertEqual(layer.children.length, 1, 'precondition: one card is up');
+        assertEqual(layer.classList.contains('active'), true, 'precondition: layer is active');
+        let g4 = 0;
+        while (timers.length && g4++ < 60) { const t = timers.shift(); if (t) t.fn(); }
+        assertEqual(layer.children.length, 0, 'the solo card must be removed');
+        assertEqual(vm.runInContext('chatToastOverflow', context), 0,
+            'no fold happened, so the counter must still be zero');
+        assertEqual(layer.classList.contains('active'), false,
+            'a single message must not leave the layer active over the video');
+    },
+    'polling-fallback-catch-up-is-silent'() {
+        function stubEl() {
+            const classes = new Set();
+            return { innerText: '', hidden: false, dataset: {}, children: [], style: {}, classes,
+                setAttribute() {}, appendChild(c) { this.children.push(c); return c; },
+                removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c; },
+                classList: { add(...n) { n.forEach(x => classes.add(x)); },
+                    remove(...n) { n.forEach(x => classes.delete(x)); },
+                    contains: n => classes.has(n) } };
+        }
+
+        // Run the REAL startPollingFallback with a controllable watermark and
+        // a fetch that reports what `since` it was asked for.
+        function runPoll(initialWatermark, backlog, primed) {
+            const asked = [];
+            const seen = [];
+            let tick = null;
+            // A single array is reused for every poll; a nested array is a queue
+            // of per-poll responses, so a multi-poll scenario can hand back a
+            // different batch on each tick.
+            const batches = Array.isArray(backlog[0]) ? backlog.slice() : [backlog];
+            // The watermark is a real vm BINDING, not a sandbox property:
+            // `const since = lastReceivedMessageId` reads a free variable, and
+            // the mutated version must observe whatever the body assigns to it.
+            // As a plain object property it would still read the initial value,
+            // and the test could not tell the two implementations apart.
+            const ctx = vm.createContext({
+                console: quietConsole(),
+                setInterval: (fn) => { tick = fn; return 1; },
+                fallbackPollTimer: null,
+                window: { location: { origin: 'http://127.0.0.1:1' } },
+                handleIncomingMessage: (m, isHistory) => {
+                    seen.push({ id: m.id, isHistory });
+                    // Mirror the real receive path: it advances the watermark.
+                    vm.runInContext('lastReceivedMessageId = ' + m.id, ctx);
+                },
+                fetch: (url) => {
+                    asked.push(url);
+                    // `batches` is either one array reused for every poll, or a
+                    // queue of per-poll arrays so a multi-poll scenario can hand
+                    // back a different response on each tick.
+                    const batch = Array.isArray(batches[0])
+                        ? (batches.length > 1 ? batches.shift() : batches[0])
+                        : batches[0];
+                    return Promise.resolve({
+                        ok: true,
+                        json: () => Promise.resolve({ ok: true, messages: batch || [] })
+                    });
+                }
+            });
+            vm.runInContext('var lastReceivedMessageId = ' + initialWatermark + ';', ctx);
+            vm.runInContext('var chatStreamPrimed = ' + Boolean(primed) + ';', ctx);
+            const fn = vm.runInContext('(' + extractFunction('startPollingFallback') + ')', ctx);
+            fn();
+            const isPrimed = () => vm.runInContext('chatStreamPrimed', ctx);
+            // The real driver calls the interval body every 3s.
+            const runOnce = () => { tick(); return settle(); };
+            runOnce();
+            return { asked, seen, runOnce, isPrimed };
+        }
+
+        // The interval body is async: it runs up to the first await before the
+        // fetch is even called, so the URL is recorded on a later microtask.
+        // `settle` flushes enough of the queue for the body to finish.
+        const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+        // -- Catch-up: watermark 0 means the server returns the WHOLE history.
+        const backlog = [{ id: 1 }, { id: 2 }, { id: 3 }];
+        const first = runPoll(0, backlog);
+        return settle().then(() => {
+            assertEqual(first.asked.length, 1, 'exactly one poll request must be issued');
+            assertEqual(first.asked[0].includes('since=0'), true,
+                'a watermark of 0 must ask the server for since=0');
+            assertEqual(first.seen.length, 3, 'every backlog message must be delivered');
+            assertEqual(first.seen.every((m) => m.isHistory === true), true,
+                'a since=0 response is the whole backlog, so EVERY message in it '
+                + 'must be marked as history — otherwise the host is notified for '
+                + 'messages it already has');
+        }).then(() => {
+            // -- Steady state: a non-zero watermark is a genuine delta.
+            const delta = runPoll(7, [{ id: 8 }, { id: 9 }]);
+            return settle().then(() => {
+                assertEqual(delta.asked[0].includes('since=7'), true,
+                    'a known watermark must be sent as since=<id>');
+                assertEqual(delta.seen.length, 2, 'the delta must be delivered');
+                assertEqual(delta.seen.every((m) => m.isHistory === false), true,
+                    'messages after a known watermark are genuinely new and must notify');
+            });
+        }).then(() => {
+            // -- Primed stream: a still-zero watermark means the log is EMPTY,
+            //    not that this is backlog. Keying the catch-up decision on
+            //    `since === 0` alone silently swallowed the first live message
+            //    after every fallback engagement, because the watermark only
+            //    moves once a message lands.
+            const primed = runPoll(0, [{ id: 42 }], true);
+            return settle().then(() => {
+                assertEqual(primed.asked[0].includes('since=0'), true,
+                    'an empty log still asks for since=0');
+                assertEqual(primed.seen.length, 1, 'the live message must be delivered');
+                assertEqual(primed.seen[0].isHistory, false,
+                    'once init has landed, a since=0 response is NEW traffic and '
+                    + 'must notify; treating it as backlog drops the first live message');
+            });
+        }).then(() => {
+            // -- The client must be able to prime ITSELF off a poll ---------
+            // chatStreamPrimed was written only by the SSE `init` handler, but
+            // a failed EventSource constructor returns BEFORE that listener is
+            // attached, and an EventSource handed a non-200 or a non
+            // event-stream MIME type goes straight to CLOSED without ever
+            // reconnecting. Polling is then the only transport all session and
+            // the flag stayed false, so with a still-zero watermark EVERY
+            // message was classified as backlog and the host was notified
+            // never. Poll 1 here is empty (nothing to sync), poll 2 carries a
+            // genuinely live message that must notify.
+            const twoPoll = runPoll(0, [[], [{ id: 77 }]], false);
+            return twoPoll.runOnce().then(() => {
+                assertEqual(twoPoll.seen.length, 1, 'the live message must be delivered');
+                assertEqual(twoPoll.seen[0].id, 77, 'it must be the second poll batch');
+                assertEqual(twoPoll.seen[0].isHistory, false,
+                    'a live message on the polling-only path MUST notify; if this '
+                    + 'is silent the host is never told anything again');
+                assertEqual(twoPoll.isPrimed(), true,
+                    'applying a poll response must prime the client, or every later '
+                    + 'message is misread as backlog');
+            });
+        }).then(() => {
+            // -- The watermark must be sampled BEFORE the await. Reading it
+            //    after would see the value this very batch just advanced, and
+            //    the batch would be misclassified as a delta.
+            const racy = runPoll(0, [{ id: 1 }, { id: 2 }]);
+            return settle().then(() => {
+                assertEqual(racy.seen.every((m) => m.isHistory === true), true,
+                    'the batch must be classified from the watermark as it was '
+                    + 'BEFORE the fetch, not after handleIncomingMessage advanced it');
+            });
+        });
+    },
+    'chat-notification-gate-decisions'() {
+        function makeEl(tag) {
+            const classes = new Set();
+            return {
+                tag, className: '', innerText: '', innerHTML: undefined, hidden: false,
+                dataset: {}, children: [], style: {}, attrs: {}, offsetWidth: 1, parentNode: null,
+                classes,
+                setAttribute(k, v) { this.attrs[k] = v; },
+                appendChild(c) { c.parentNode = this; this.children.push(c); return c; },
+                removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c; },
+                get firstChild() { return this.children[0] || null; },
+                classList: {
+                    add(...n) { n.forEach(x => classes.add(x)); },
+                    remove(...n) { n.forEach(x => classes.delete(x)); },
+                    contains: (n) => classes.has(n)
+                }
+            };
+        }
+
+        // (isHost, isHistory, clientId is ours) -> did a card get built?
+        function decide(isHost, isHistory, isSelf) {
+            const layer = makeEl('div');
+            const badge = makeEl('span');
+            const sfx = [];
+            const ctx = {
+                console: { log() {}, warn() {}, error() {} },
+                document: { createElement: makeEl, getElementById: () => null },
+                chatMessages: makeEl('div'), activityEmpty: makeEl('div'),
+                chatToastLayer: layer, chatUnreadBadge: badge, chatToastOverflowEl: null,
+                tabChat: makeEl('button'),        // no `active` -> badge would rise
+                myClientId: 'c_host',
+                addMessage() {},
+                playSfx: (t) => sfx.push(t),
+                requestAnimationFrame() {},
+                Date: { now: () => 1e9 }
+            };
+            vm.createContext(ctx);
+            vm.runInContext(
+                'var lastReceivedMessageId = 0, liveChatToasts = 0, chatUnreadCount = 0, '
+                + 'lastChatToastAt = -1e9, chatToastOverflow = 0, chatOverflowTimer = null, '
+                + 'isHost = ' + isHost + ';'
+                // The receive path also consults the dedupe sets before it ever
+                // reaches the notification branch.
+                + 'var seenMessageIds = new Set(), seenClientMsgIds = new Set();', ctx);
+            // The notification helpers are stubbed: the point is WHICH branch
+            // the real receive path takes, not how a card is painted.
+            ctx.__notified = 0;
+            vm.runInContext('var showChatNotification = () => { __notified += 1; }, '
+                + 'updateChatToastOverflow = () => {}, scheduleChatOverflowRetire = () => {}, '
+                + 'renderChatUnread = () => {};', ctx);
+            const fn = vm.runInContext('(' + extractFunction('handleIncomingMessage') + ')', ctx);
+            fn({
+                id: 1, author: 'Viewer', text: 'hello', badge: 'USER',
+                clientId: isSelf ? 'c_host' : 'c_viewer'
+            }, isHistory);
+            return { notified: ctx.__notified, sfx };
+        }
+
+        const cases = [
+            ['a NEW viewer message, as HOST', true, false, false, 1, 'chime'],
+            ['a REPLAYED history message, as HOST', true, true, false, 0, null],
+            ["the host's own echo", true, false, true, 0, null],
+            ['a NEW viewer message, as a VIEWER', false, false, false, 0, 'pop']
+        ];
+        for (const [label, isHost, isHistory, isSelf, expect, sfx] of cases) {
+            const r = decide(isHost, isHistory, isSelf);
+            assertEqual(r.notified, expect,
+                `${label} must ${expect ? 'raise a card' : 'stay silent'}`);
+            if (sfx) {
+                assertEqual(r.sfx.length > 0 && r.sfx[0] === sfx, true,
+                    `${label} must play '${sfx}', got [${r.sfx}]`);
+            } else {
+                assertEqual(r.sfx.length, 0,
+                    `${label} must not play a notification sound, got [${r.sfx}]`);
+            }
+        }
+    },
+    'chat-init-replay-classification'() {
+        function runInit(history, watermark) {
+            const seen = [];
+            let listeners = {};
+            class FakeEventSource {
+                constructor(url) { this.url = url; }
+                addEventListener(name, fn) { listeners[name] = fn; }
+                close() {}
+            }
+            const ctx = {
+                console: { log() {}, warn() {}, error() {} },
+                EventSource: FakeEventSource,
+                window: { location: { origin: 'http://127.0.0.1:1', hostname: '127.0.0.1' } },
+                document: { getElementById: () => null },
+                chatSource: null, fallbackPollTimer: null,
+                viewerNum: null, tabChat: null,
+                updateViewerCount() {}, clearChatUnread() {},
+                isHost: false, userBadge: 'USER', hasCustomNick: false,
+                userNick: 'Host', updateNickDisplay() {},
+                handleIncomingMessage: (m, isHistory) => {
+                    seen.push({ id: m.id, isHistory });
+                    vm.runInContext('lastReceivedMessageId = ' + m.id, ctx);
+                },
+                startPollingFallback() {},
+                JSON, Array, Object, Number, parseInt
+            };
+            vm.createContext(ctx);
+            vm.runInContext(
+                'var lastReceivedMessageId = ' + watermark
+                + ', chatStreamPrimed = ' + (watermark > 0) + ';', ctx);
+            const fn = vm.runInContext('(' + extractFunction('connectChatEvents') + ')', ctx);
+            fn();
+            listeners.init({ data: JSON.stringify({ isHost: true, history, reactionCounts: {} }) });
+            return { seen, primed: () => vm.runInContext('chatStreamPrimed', ctx) };
+        }
+
+        // Cold connect: no watermark, so the server sent slice(-50) of old
+        // backlog. It must be silent.
+        const cold = runInit([{ id: 1 }, { id: 2 }, { id: 3 }], 0);
+        assertEqual(cold.seen.length, 3, 'the init backlog must still be rendered');
+        assertEqual(cold.seen.every((m) => m.isHistory === true), true,
+            'a COLD connect replays old backlog; it must stay silent or the host '
+            + 'gets a wall of cards for messages from before they arrived');
+        assertEqual(cold.primed(), true, 'init must prime the client');
+
+        // Auto-reconnect: a watermark exists, so the server sent exactly the
+        // messages this client missed. They are new and must notify.
+        const missed = runInit([{ id: 41 }, { id: 42 }], 40);
+        assertEqual(missed.seen.length, 2, 'the missed messages must be rendered');
+        assertEqual(missed.seen.every((m) => m.isHistory === false), true,
+            'a RECONNECT replay is the messages this client missed, not backlog; '
+            + 'marking it history drops every message that arrived during a blip');
     },
 });
 

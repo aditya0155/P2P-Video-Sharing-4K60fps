@@ -26,6 +26,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const actionFeedback = document.getElementById('action-feedback');
     const volumeToast = document.getElementById('volume-toast');
     const volumeToastText = document.getElementById('volume-toast-text');
+    const chatToastLayer = document.getElementById('chat-toast-layer');
+    const chatUnreadBadge = document.getElementById('chat-unread-badge');
     
     // Controls
     const playerControls = document.getElementById('player-controls');
@@ -4918,8 +4920,11 @@ document.addEventListener('DOMContentLoaded', () => {
     videoContainer.addEventListener('click', (e) => {
         initAudioContext();
 
-        // Ignore clicks on controls or HUD overlays
-        if (e.target.closest('.player-controls') || e.target.closest('.telemetry-hud') || e.target.closest('.unmute-overlay')) {
+        // Ignore clicks on controls or HUD overlays. .chat-toast-layer is in
+        // this list because a notification is deliberately clickable (it jumps
+        // to the chat): without this, clicking one would also fire the
+        // play/pause toggle and the fullscreen handler underneath it.
+        if (e.target.closest('.player-controls') || e.target.closest('.telemetry-hud') || e.target.closest('.unmute-overlay') || e.target.closest('.chat-toast-layer')) {
             return;
         }
 
@@ -4941,7 +4946,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Double-click on video toggles fullscreen cleanly without stutter
     videoContainer.addEventListener('dblclick', (e) => {
-        if (e.target.closest('.player-controls') || e.target.closest('.telemetry-hud') || e.target.closest('.unmute-overlay')) return;
+        if (e.target.closest('.player-controls') || e.target.closest('.telemetry-hud') || e.target.closest('.unmute-overlay') || e.target.closest('.chat-toast-layer')) return;
         if (clickDebounceTimeout) {
             clearTimeout(clickDebounceTimeout);
             clickDebounceTimeout = null;
@@ -5003,6 +5008,12 @@ document.addEventListener('DOMContentLoaded', () => {
     videoContainer.addEventListener('wheel', (e) => {
         e.preventDefault();
         initAudioContext();
+        // A notification card sits directly under the pointer — it is the one
+        // overlay the host deliberately moves the mouse onto to read it — so
+        // without this the wheel changed the volume by 5% per notch while
+        // scrolling over the message. Same exclusion the click and dblclick
+        // handlers use.
+        if (e.target.closest('.chat-toast-layer')) return;
         const delta = e.deltaY < 0 ? 0.05 : -0.05;
         let newVol = Math.min(1, Math.max(0, parseFloat(volumeSlider.value) + delta));
         newVol = Math.round(newVol * 20) / 20; // 5% step snap
@@ -5674,6 +5685,10 @@ document.addEventListener('DOMContentLoaded', () => {
         contentChat.setAttribute('aria-hidden', String(!showActivity));
         contentInfo.setAttribute('aria-hidden', String(showActivity));
         if (tabIndicator) tabIndicator.style.transform = showActivity ? 'translate3d(0%, 0, 0)' : 'translate3d(100%, 0, 0)';
+        // Opening the chat by hand is what the unread badge is asking for, so
+        // it retires here. Declared below the toast engine but hoisted as a
+        // function declaration, so this runs fine on the initial tab setup too.
+        if (showActivity && typeof clearChatUnread === 'function') clearChatUnread();
     }
 
     tabChat.addEventListener('click', () => activateSidebarTab(tabChat));
@@ -5787,6 +5802,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const seenMessageIds = new Set();
     const seenClientMsgIds = new Set();
     let lastReceivedMessageId = 0;
+    // Set once the SSE `init` event has been handled. Distinguishes "no
+    // watermark because nothing has ever arrived" (a since=0 poll is then the
+    // whole backlog) from "no watermark because the log is empty" (a since=0
+    // poll is then real new traffic).
+    let chatStreamPrimed = false;
     let chatSource = null;
     let fallbackPollTimer = null;
 
@@ -5831,6 +5851,208 @@ document.addEventListener('DOMContentLoaded', () => {
         viewerNum.setAttribute('aria-label', `${count} viewer${count === 1 ? '' : 's'} connected`);
     }
 
+    // ── Incoming chat notification (host view) ──────────────────────────────
+    // A viewer message used to exist ONLY inside the sidebar log. The host is
+    // watching the video, frequently with the sidebar on the other tab or
+    // scrolled away, so a message could arrive and go entirely unnoticed.
+    // These cards put it on screen over the video, for a bounded window.
+    //
+    // Density is capped for the same reason MAX_FLYING_EMOJI exists: every
+    // card is a composited layer drawn ON TOP of live video, competing with
+    // the decoder for the same GPU budget on the same main thread. A busy
+    // room would otherwise stack one layer per message. So a burst inside
+    // CHAT_TOAST_BURST_MS collapses into a "+N more" counter instead of
+    // growing the stack, and the cap keeps the on-screen layer count fixed
+    // however the two limits interleave.
+    const CHAT_TOAST_LIFETIME_MS = 7000;
+    const CHAT_TOAST_EXIT_MS = 260;   // must match .chat-toast-out in CSS
+    const CHAT_TOAST_BURST_MS = 1200; // messages this close fold into the counter
+    const MAX_CHAT_TOASTS = 3;
+    const MAX_CHAT_UNREAD = 99;
+
+    let liveChatToasts = 0;
+    let chatUnreadCount = 0;
+    let lastChatToastAt = 0;
+    let chatToastOverflow = 0;
+    let chatOverflowTimer = null;
+    const chatToastOverflowEl = document.getElementById('chat-toast-overflow');
+    // liveChatToasts is the count of cards that exist in the DOM, including any
+    // that are mid-exit. dismissChatToast() decrements it only when the card is
+    // actually removed, so a card on its way out keeps counting against
+    // MAX_CHAT_TOASTS — the cap therefore bounds LAYERS ON SCREEN, which is
+    // what costs GPU time, not just cards queued for display.
+
+    function renderChatUnread() {
+        if (!chatUnreadBadge) return;
+        if (chatUnreadCount <= 0) {
+            chatUnreadBadge.hidden = true;
+            chatUnreadBadge.innerText = '0';
+            return;
+        }
+        // 99+ rather than an exact count: a runaway viewer must not be able to
+        // grow this label wide enough to reflow the tab strip.
+        chatUnreadBadge.innerText = chatUnreadCount > MAX_CHAT_UNREAD ? MAX_CHAT_UNREAD + '+' : String(chatUnreadCount);
+        chatUnreadBadge.hidden = false;
+    }
+
+    function clearChatUnread() {
+        if (chatUnreadCount === 0) return;
+        chatUnreadCount = 0;
+        renderChatUnread();
+    }
+
+    // Retire the burst counter. Without this the "+N more" pill survived every
+    // card dismissal, and because dismissChatToast keeps the layer `active`
+    // while the counter is non-zero, that pill pinned the layer visible AND
+    // pointer-events:auto for the rest of the session — a dead strip in the
+    // video's top-right corner that swallowed clicks meant for the player.
+    // Called when the host engages with the chat, and on the pill's own timer.
+    function clearChatOverflow() {
+        if (chatOverflowTimer) {
+            clearTimeout(chatOverflowTimer);
+            chatOverflowTimer = null;
+        }
+        if (chatToastOverflow === 0) return;
+        chatToastOverflow = 0;
+        updateChatToastOverflow();
+        if (liveChatToasts === 0 && chatToastLayer) {
+            chatToastLayer.classList.remove('active');
+        }
+    }
+
+    // The "+N more" pill has to retire on its own clock. It is the last thing
+    // holding the layer `active`, and an active layer is pointer-events:auto
+    // over the video — left set, it becomes a permanent invisible click-eater
+    // in the corner of the player's hit area, and the pill itself never goes
+    // away. Each new folded message pushes the deadline out, so a sustained
+    // flood stays legible while it lasts and then cleans itself up.
+    function scheduleChatOverflowRetire() {
+        if (chatOverflowTimer) clearTimeout(chatOverflowTimer);
+        chatOverflowTimer = setTimeout(() => {
+            chatOverflowTimer = null;
+            chatToastOverflow = 0;
+            updateChatToastOverflow();
+            if (liveChatToasts === 0) {
+                chatToastLayer.classList.remove('active');
+            }
+        }, CHAT_TOAST_LIFETIME_MS);
+    }
+
+    function updateChatToastOverflow() {
+        if (!chatToastOverflowEl) return;
+        if (chatToastOverflow > 0) {
+            chatToastOverflowEl.innerText = '+' + chatToastOverflow + ' more';
+            chatToastOverflowEl.hidden = false;
+        } else {
+            chatToastOverflowEl.hidden = true;
+            chatToastOverflowEl.innerText = '';
+        }
+    }
+
+    function dismissChatToast(card) {
+        if (!card || card.dataset.leaving === '1') return;
+        card.dataset.leaving = '1';
+        setTimeout(() => {
+            if (card.parentNode) card.parentNode.removeChild(card);
+            liveChatToasts = Math.max(0, liveChatToasts - 1);
+            // The layer keeps `active` while the counter is showing, so a
+            // folded burst never leaves an empty-but-visible layer behind.
+            // The counter itself is retired by scheduleChatOverflowRetire() —
+            // it must not be zeroed here, or a flood mid-flight would lose
+            // its "+N more" the instant the last card happened to expire.
+            if (liveChatToasts === 0 && chatToastOverflow === 0) {
+                chatToastLayer.classList.remove('active');
+            }
+        }, CHAT_TOAST_EXIT_MS);
+        card.classList.add('leaving');
+    }
+
+    function showChatNotification(author, text, badge) {
+        if (!chatToastLayer) return;
+
+        // The badge answers exactly one question: "is there chat you are not
+        // looking at?". Live Chat is the DEFAULT tab and activateSidebarTab is
+        // never called at init, so the host is watching the log render in front
+        // of them — counting those messages left the badge climbing to 99+ for
+        // the whole session, counting what was already on screen, and it never
+        // cleared because the host never "opened" a tab that was already open.
+        if (!tabChat || !tabChat.classList.contains('active')) {
+            chatUnreadCount += 1;
+            renderChatUnread();
+        }
+
+        const now = Date.now();
+        const isBurst = (now - lastChatToastAt) < CHAT_TOAST_BURST_MS;
+        lastChatToastAt = now;
+
+        // Fold instead of stacking. Over-the-cap messages also land here, so a
+        // sustained flood is bounded no matter how the two limits interleave.
+        if (isBurst || liveChatToasts >= MAX_CHAT_TOASTS) {
+            chatToastOverflow += 1;
+            updateChatToastOverflow();
+            scheduleChatOverflowRetire();
+            chatToastLayer.classList.add('active');
+            return;
+        }
+
+        const card = document.createElement('div');
+        card.className = 'chat-toast';
+
+        const icon = document.createElement('i');
+        icon.className = 'fa-solid fa-message chat-toast-icon';
+        icon.setAttribute('aria-hidden', 'true');
+
+        const content = document.createElement('div');
+        content.className = 'chat-toast-content';
+
+        const head = document.createElement('div');
+        head.className = 'chat-toast-head';
+
+        const authorSpan = document.createElement('span');
+        authorSpan.className = 'chat-toast-author';
+        // innerText, never innerHTML: author and body are untrusted viewer
+        // input, exactly as in addMessage().
+        authorSpan.innerText = author;
+
+        if (badge) {
+            const badgeSpan = document.createElement('span');
+            badgeSpan.className = 'author-badge badge-' + String(badge).toLowerCase();
+            badgeSpan.innerText = badge;
+            authorSpan.appendChild(badgeSpan);
+        }
+        head.appendChild(authorSpan);
+
+        const bodyDiv = document.createElement('div');
+        bodyDiv.className = 'chat-toast-text';
+        bodyDiv.innerText = text;
+
+        content.appendChild(head);
+        content.appendChild(bodyDiv);
+        card.appendChild(icon);
+        card.appendChild(content);
+
+        chatToastLayer.appendChild(card);
+        chatToastLayer.classList.add('active');
+        liveChatToasts += 1;
+
+        setTimeout(() => dismissChatToast(card), CHAT_TOAST_LIFETIME_MS);
+    }
+
+    // Clicking a notification is the point of putting it over the video: take
+    // the host straight to the chat so they can answer. The unread count and
+    // the folded counter both retire, because the host is now looking at the
+    // log that holds every one of those messages.
+    if (chatToastLayer) {
+        chatToastLayer.addEventListener('click', () => {
+            if (tabChat && !tabChat.classList.contains('active')) {
+                tabChat.click();
+            }
+            clearChatUnread();
+            clearChatOverflow();
+            if (chatInput) setTimeout(() => chatInput.focus(), 50);
+        });
+    }
+
     function handleIncomingMessage(msg, isHistory = false) {
         if (!msg || typeof msg !== 'object') return;
         if (msg.id) {
@@ -5866,7 +6088,22 @@ document.addEventListener('DOMContentLoaded', () => {
         addMessage(msg.author || 'Viewer', msg.text, isSelf, msg.badge || 'USER', msg.time);
 
         if (!isSelf && !isHistory) {
-            playSfx('pop');
+            // Only a genuinely NEW message notifies, and only for the host:
+            //  - isHistory is the replayed backlog (SSE init history, or the
+            //    catch-up burst after a reconnect), which would otherwise fire
+            //    a card for every message the host has already seen.
+            //  - isSelf is the host's own message coming back through the echo.
+            //  - isHost is authoritative from the server's init event, which
+            //    is why this must come after that event has been handled.
+            if (isHost) {
+                showChatNotification(msg.author || 'Viewer', msg.text, msg.badge || 'USER');
+                // The chime instead of the generic pop: this is the host's
+                // "someone is talking to me" cue, and playSfx caps concurrent
+                // voices, so firing both would only spend a second voice.
+                playSfx('chime');
+            } else {
+                playSfx('pop');
+            }
         }
     }
 
@@ -5897,8 +6134,25 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 }
                 if (Array.isArray(data.history)) {
-                    data.history.forEach((m) => handleIncomingMessage(m, true));
+                    // This payload is NOT always old backlog. On a native
+                    // EventSource auto-reconnect the browser resends
+                    // Last-Event-ID, and the server answers with
+                    // `chatHistory.filter(m => m.id > lastEventId)` — exactly
+                    // the messages this client MISSED while the stream was
+                    // down (server.js:506-507). Those are new to the host and
+                    // must notify; marking them history swallowed every message
+                    // that landed during a blip, which is exactly the window
+                    // this feature exists to cover. A cold first connect has no
+                    // watermark, so its window really is `slice(-50)` backlog
+                    // and stays silent. Sample the watermark BEFORE the batch,
+                    // since applying it advances the variable.
+                    const hadWatermark = lastReceivedMessageId > 0;
+                    data.history.forEach((m) => handleIncomingMessage(m, !hadWatermark));
                 }
+                // The stream is live from here. A poll that still sends since=0
+                // afterwards is asking for messages that arrived AFTER an empty
+                // init — genuinely new, not backlog.
+                chatStreamPrimed = true;
                 if (data.reactionCounts) {
                     for (const [emojiKey, count] of Object.entries(data.reactionCounts)) {
                         const countEl = document.getElementById(`count-${emojiKey}`);
@@ -5979,12 +6233,48 @@ document.addEventListener('DOMContentLoaded', () => {
     function startPollingFallback() {
         if (fallbackPollTimer) return;
         fallbackPollTimer = setInterval(async () => {
+            // Read the watermark BEFORE the await. It is mutated by
+            // handleIncomingMessage as the batch is applied, so testing it after
+            // the fetch resolved could read a value this very batch just
+            // advanced — and a batch that began at 0 would then be classified
+            // as a delta and notify for the whole backlog.
+            const since = lastReceivedMessageId;
             try {
-                const res = await fetch(window.location.origin + `/stream-api/chat/messages?since=${lastReceivedMessageId}`);
+                const res = await fetch(window.location.origin + `/stream-api/chat/messages?since=${since}`);
                 if (res.ok) {
                     const data = await res.json();
                     if (data.ok && Array.isArray(data.messages)) {
-                        data.messages.forEach((m) => handleIncomingMessage(m, false));
+                        // The FIRST poll sends since=0, and the server treats 0 as
+                        // "send everything" (server.js:585) rather than "send
+                        // nothing new" — so this response is the whole backlog,
+                        // not a delta. Passing isHistory=false made a client
+                        // that fell back to polling raise a notification for
+                        // every message it had already been shown, up to the
+                        // 100-message cap, the moment the fallback engaged.
+                        // A catch-up burst is still a replay of what the log
+                        // already holds, so it must be marked as history.
+                        // `since === 0` alone is not enough: while the log is
+                        // empty the watermark stays 0, so keying only on that
+                        // silently swallowed the first LIVE message after every
+                        // fallback engagement until the watermark moved. The
+                        // primed flag is what separates "never received
+                        // anything, so this is backlog" from "init arrived with
+                        // an empty log, so this is new traffic".
+                        const isCatchUp = since === 0 && !chatStreamPrimed;
+                        data.messages.forEach((m) => handleIncomingMessage(m, isCatchUp));
+                        // Applying a since=0 response synchronises this client,
+                        // so later polls are deltas whatever the watermark is.
+                        // The SSE init handler cannot be relied on to prime this:
+                        // a failed EventSource constructor returns BEFORE the
+                        // init listener is ever attached, and an EventSource that
+                        // gets a non-200 or a non-event-stream MIME type goes
+                        // straight to CLOSED without reconnecting. In both cases
+                        // polling is the only transport for the whole session,
+                        // and with the flag stuck false every message was
+                        // classified as backlog — the host got no notification
+                        // at all. Written AFTER the classification above, so it
+                        // cannot weaken the first-poll catch-up guard.
+                        chatStreamPrimed = true;
                     }
                 }
             } catch (_) {}
