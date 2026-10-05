@@ -440,6 +440,143 @@ body.perf-mode .action-feedback {
     animation: toast-fade 0.8s ease-out forwards;
 }
 
+/* ── Incoming Chat Notification Stack ──────────────────────────────────────
+   The host watches the video; a viewer message that only lands in the sidebar
+   log is invisible to them. These cards sit over live video, so the two rules
+   the other over-video overlays (.action-feedback, .volume-toast) already
+   follow are load-bearing here too:
+
+   1. NO backdrop-filter. A blur directly over the <video> forces a render
+      surface and re-samples the video texture on every decoded frame, on the
+      same GPU budget the decoder is using. Opaque background instead.
+   2. The layer is `visibility: hidden` while empty. opacity:0 would still
+      leave it in the render tree for the whole session, and an over-video
+      layer is exactly the case the codebase pays to keep out of it. A
+      `display:none` layer would be wrong the other way: it cannot be measured
+      for the fade-in, so the first card would pop instead of animating. */
+.chat-toast-layer {
+    position: absolute;
+    top: 20px; right: 20px;
+    z-index: 9;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+    max-width: min(320px, 62%);
+    /* The layer is only a hit target while it holds cards. pointer-events
+       stays off by default so an empty layer can never swallow a click meant
+       for the video (which toggles play/pause). */
+    pointer-events: none;
+    visibility: hidden;
+}
+.chat-toast-layer.active {
+    visibility: visible;
+    pointer-events: auto;
+}
+
+.chat-toast {
+    width: 100%;
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 9px 12px;
+    background: rgba(10, 8, 20, 0.94);
+    border: 1px solid var(--border-glow);
+    border-left: 2px solid var(--primary);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
+    animation: chat-toast-in 0.26s var(--ease) both;
+}
+/* Slide out to the right on dismiss. The card is removed from the DOM by
+   app.js after CHAT_TOAST_EXIT_MS, which is why the two durations must be kept
+   in step (the 0.22s animation finishes just inside the 0.26s timer). */
+.chat-toast.leaving {
+    animation: chat-toast-out 0.22s var(--ease) both;
+    /* The card is visually gone for the last part of the 0.22s fade but the
+       layer only drops `active` 40ms later. Without this, a click landing in
+       that window hit an invisible card and jumped the host to the chat tab
+       instead of toggling playback. */
+    pointer-events: none;
+}
+
+.chat-toast-icon {
+    flex: 0 0 auto;
+    margin-top: 1px;
+    font-size: 12px;
+    color: var(--primary);
+}
+
+.chat-toast-content {
+    min-width: 0;   /* lets the text ellipsis instead of stretching the card */
+    flex: 1 1 auto;
+}
+
+.chat-toast-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    margin-bottom: 2px;
+}
+
+.chat-toast-author {
+    font-weight: 700;
+    color: var(--text-secondary);
+    /* A 25-char nick plus badge must not widen the card past its max-width. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chat-toast-text {
+    font-size: 12.5px;
+    line-height: 1.4;
+    color: var(--text-primary);
+    word-break: break-word;
+    /* Messages are capped at 200 chars server-side; a burst must not push a
+       card tall enough to cover the video. Two lines, then ellipsis. */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+/* The "+N more" counter that absorbs a burst instead of stacking a card per
+   message (see MAX_CHAT_TOASTS in app.js). */
+.chat-toast-more {
+    flex: 0 0 auto;
+    align-self: center;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--cyan);
+    background: var(--cyan-dim);
+    border: 1px solid rgba(34, 211, 238, 0.3);
+    border-radius: var(--radius-full);
+    padding: 2px 7px;
+    white-space: nowrap;
+}
+
+/* Unread count on the Live Chat tab, for when the host is on Stream Info. */
+.tab-unread-badge {
+    background: var(--primary);
+    color: #fff;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 4px;
+    border-radius: var(--radius-full);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+}
+/* `hidden` must win over the display above, or the "0" badge would render. */
+.tab-unread-badge[hidden] { display: none; }
+
 /* ── Player Overlays ────────────────────────────────────────────────────── */
 .player-loader, .player-offline-overlay, .unmute-overlay {
     position: absolute; inset: 0;
@@ -1547,6 +1684,17 @@ kbd {
     20% { opacity: 1; transform: translate3d(-50%, 0, 0); }
     70% { opacity: 1; transform: translate3d(-50%, 0, 0); }
     100% { opacity: 0; transform: translate3d(-50%, -8px, 0); }
+}
+
+/* Chat notification cards animate transform/opacity only, so they stay on the
+   compositor and never trigger a layout or paint of the video beneath them. */
+@keyframes chat-toast-in {
+    from { opacity: 0; transform: translate3d(16px, 0, 0) scale(0.97); }
+    to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+@keyframes chat-toast-out {
+    from { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+    to { opacity: 0; transform: translate3d(16px, 0, 0) scale(0.97); }
 }
 
 /* ── Responsive ─────────────────────────────────────────────────────────── */

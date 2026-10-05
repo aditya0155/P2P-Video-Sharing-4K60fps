@@ -584,6 +584,35 @@ class JsLogicChecks(unittest.TestCase):
     def test_unmute_overlay_follows_the_mute_state(self):
         run_js_check(self, "unmute-overlay-follows-mute-state")
 
+    def test_chat_notification_behaviour_is_pinned_by_execution(self):
+        """Runs the real notification functions against a stub DOM, so the
+        burst cap, the hidden-at-zero badge, the 99+ clamp and the layer's
+        release after a burst are proven by observation rather than by the
+        presence of an identifier."""
+        run_js_check(self, "chat-notification-behaviour")
+
+    def test_chat_notification_gate_decisions_are_pinned_by_execution(self):
+        """The source guards can only see that `!isSelf && !isHistory` and
+        `if (isHost)` appear in handleIncomingMessage — not that the call is
+        nested inside that gate. This drives the real function and checks which
+        branch each of the four message kinds actually takes."""
+        run_js_check(self, "chat-notification-gate-decisions")
+
+    def test_chat_init_replay_classification_is_pinned_by_execution(self):
+        """The server answers a native auto-reconnect with exactly the messages
+        this client missed. The real connectChatEvents is driven with a stubbed
+        EventSource to prove the init payload is classified by whether a
+        watermark already existed, rather than blanket-marked as history."""
+        run_js_check(self, "chat-init-replay-classification")
+
+    def test_polling_catch_up_is_silent_by_execution(self):
+        """Runs the real poll body with a stubbed fetch. A string check cannot
+        tell an isCatchUp that is genuinely derived from the watermark from one
+        that is hardcoded false, nor catch a watermark re-read after the await
+        (which the batch itself advances) — so the receive path is observed
+        directly."""
+        run_js_check(self, "polling-fallback-catch-up-is-silent")
+
 
 class StreamApiProxyChecks(_SiteUnderTest):
     """Every byte the player exchanges with MediaMTX crosses this proxy."""
@@ -2595,6 +2624,232 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertIsNotNone(unmute, ".unmute-overlay rule not found")
         self.assertIn("display: none", unmute,
                       "the unmute prompt must be hidden by default and shown only by app.js")
+
+    # -- incoming chat notification (host view) ---------------------------
+
+    def test_chat_notification_fires_only_for_new_messages(self):
+        """A notification that replays history is worse than none: on every SSE
+        (re)connect the server hands the host its whole 50-message backlog, and
+        on the polling fallback path the whole 100-message window. Both arrive
+        with isHistory=true, so both must be silent."""
+        fn = self._js_function_body(self.app, "handleIncomingMessage")
+        self.assertIsNotNone(fn, "handleIncomingMessage not found")
+        self.assertIn("!isSelf && !isHistory", fn,
+                      "a replayed or self-sent message must not raise a notification")
+        self.assertIn("showChatNotification", fn,
+                      "new messages must raise the on-screen notification")
+        # The init payload is old backlog ONLY on a cold connect. After a native
+        # auto-reconnect the server replays Last-Event-ID and sends exactly the
+        # messages the client MISSED, so it must not blanket-mark them history.
+        self.assertNotIn("data.history.forEach((m) => handleIncomingMessage(m, true));",
+                         self.app,
+                         "a reconnect replay is the messages this client missed, "
+                         "not backlog; marking it history drops every message that "
+                         "arrived during a blip")
+        init_fn = self._js_function_body(self.app, "connectChatEvents")
+        self.assertIn("hadWatermark", init_fn,
+                      "the init replay must be classified by whether a watermark "
+                      "already existed, not blanket-marked as history")
+        self.assertLess(init_fn.index("const hadWatermark"), init_fn.index("data.history.forEach"),
+                        "the watermark must be sampled before the batch is applied, "
+                        "since applying it advances the variable")
+
+    def test_chat_notification_is_host_only(self):
+        """Viewers already have the log open in front of them; a card over the
+        video for every viewer message is noise, not notification. isHost is
+        only authoritative once the server's init event has been handled, which
+        is why the check lives inside the receive path rather than at the top
+        of the file."""
+        fn = self._js_function_body(self.app, "handleIncomingMessage")
+        self.assertIn("if (isHost)", fn,
+                      "only the host should get an on-screen chat notification")
+
+    def test_chat_notification_density_is_bounded(self):
+        """Each card is a composited layer drawn over live video, on the same
+        GPU budget as the decoder. A chatty room would otherwise stack one per
+        message, so the stack is capped and a burst folds into a counter."""
+        self.assertIn("MAX_CHAT_TOASTS", self.app,
+                      "concurrent chat notification cards must be capped")
+        self.assertIn("CHAT_TOAST_BURST_MS", self.app,
+                      "a burst must be folded instead of stacking a card per message")
+        fn = self._js_function_body(self.app, "showChatNotification")
+        self.assertIsNotNone(fn, "showChatNotification not found")
+        self.assertIn("liveChatToasts >= MAX_CHAT_TOASTS", fn,
+                      "the cap must be enforced at the append site")
+        # The counter is a real element, not a string that silently no-ops.
+        self.assertIn('id="chat-toast-overflow"', read_text(HTML_PATH))
+
+    def test_chat_notification_cards_leave_the_render_tree_when_idle(self):
+        """Same rule as .action-feedback / .volume-toast: an over-video layer
+        that is idle for the whole session between messages must be hidden
+        with visibility, not only opacity, or it keeps a render surface alive
+        above the video permanently."""
+        css = self._strip_comments(self.css, "css")
+        body = self._css_rule(css, ".chat-toast-layer")
+        self.assertIsNotNone(body, ".chat-toast-layer rule not found")
+        self.assertIn("visibility: hidden", body,
+                      "the empty notification layer must be hidden with visibility")
+        self.assertIn("pointer-events: none", body,
+                      "an empty layer must not swallow clicks meant for the video")
+        self.assertIn("visibility: visible", self._css_rule(css, ".chat-toast-layer.active"),
+                      "the layer must become visible while it holds cards")
+
+    def test_chat_notification_does_not_blur_the_video(self):
+        """A backdrop-filter directly over the <video> forces a render surface
+        and re-samples the video texture on every decoded frame."""
+        css = self._strip_comments(self.css, "css")
+        body = self._css_rule(css, ".chat-toast-layer")
+        self.assertNotIn("backdrop-filter: blur", body,
+                         "the notification layer is drawn over live video and must not blur it")
+        card = self._css_rule(css, ".chat-toast")
+        self.assertIsNotNone(card, ".chat-toast rule not found")
+        self.assertNotIn("backdrop-filter: blur", card,
+                         "a notification card is drawn over live video and must not blur it")
+
+    def test_clicking_a_notification_does_not_toggle_playback(self):
+        """The card is deliberately clickable (it jumps to the chat), so it sits
+        inside .video-container — which has its own click/dblclick handlers that
+        toggle play/pause and fullscreen. Without the ignore entry, answering a
+        viewer would pause the broadcast. The wheel handler needs it too: a card
+        sits under the pointer, so scrolling one changed the volume."""
+        for handler in ("click", "dblclick", "wheel"):
+            anchor = "videoContainer.addEventListener('" + handler + "'"
+            start = self.app.find(anchor)
+            self.assertGreater(start, 0, "videoContainer {} handler not found".format(handler))
+            # The guard is a chain of closest() calls joined by ||, so the scan
+            # has to span the whole `if` condition rather than stop at the
+            # first ')' — that is the end of the FIRST clause, not the chain.
+            window = self.app[start:start + 700]
+            self.assertIn("'.chat-toast-layer'", window,
+                          "the {} handler must ignore events on a chat notification "
+                          "(clicking one would pause the stream; the wheel would "
+                          "change the volume)".format(handler))
+
+    def test_chat_notification_escapes_viewer_text(self):
+        """Author and body are untrusted viewer input. A card built with
+        innerHTML would be a stored-XSS sink on every viewer's screen."""
+        code = self._js_function_body(self._strip_comments(self.app, "js"), "showChatNotification")
+        self.assertIn("innerText", code,
+                      "viewer-supplied text must be written with innerText")
+        # Comments are stripped for BOTH halves: the function's own comment
+        # explains WHY it avoids innerHTML, and it also contains the literal
+        # word "innerText" — a naive check on unstripped source is satisfied by
+        # the explanation of the fix rather than by the fix.
+        self.assertNotIn("innerHTML", code,
+                         "innerHTML on viewer text is an XSS sink")
+
+    def test_polling_fallback_catch_up_is_not_treated_as_new(self):
+        """A client whose EventSource failed falls back to polling. The FIRST
+        poll sends since=0, and the server reads 0 as 'send everything'
+        (server.js), so that response is the entire backlog rather than a
+        delta. Marking it as new made the host raise a notification for every
+        message already in the log — up to the 100-message cap — at exactly the
+        moment the connection was already struggling."""
+        fn = self._js_function_body(self.app, "startPollingFallback")
+        self.assertIsNotNone(fn, "startPollingFallback not found")
+        self.assertNotIn("handleIncomingMessage(m, false)", fn,
+                         "the since=0 catch-up response is the whole backlog, "
+                         "not new messages")
+        self.assertIn("isCatchUp", fn,
+                      "the first poll must be marked as a catch-up replay")
+        self.assertIn("handleIncomingMessage(m, isCatchUp)", fn,
+                      "the catch-up flag must actually reach the receive path")
+        # The watermark must be sampled BEFORE the await. handleIncomingMessage
+        # advances lastReceivedMessageId as the batch is applied, so a value
+        # read afterwards could already have moved and misclassify a batch that
+        # began at 0 as a delta.
+        code = self._js_function_body(self._strip_comments(self.app, "js"),
+                                      "startPollingFallback")
+        sample = code.find("const since = lastReceivedMessageId")
+        fetch = code.find("await fetch")
+        self.assertGreater(sample, -1,
+                           "the watermark must be captured into a local, not re-read later")
+        self.assertGreater(fetch, -1, "no fetch found in the poll body")
+        self.assertLess(sample, fetch,
+                        "the watermark must be captured before the await, or a "
+                        "batch that advanced it mid-apply reads as a delta")
+        # The decision must use the SNAPSHOT, not the live variable. Sampling
+        # early is pointless if the comparison still reads the mutable global
+        # after handleIncomingMessage has advanced it.
+        self.assertRegex(
+            code, r"const isCatchUp = since === 0 && !chatStreamPrimed;",
+            "isCatchUp must compare the pre-await snapshot; re-reading "
+            "lastReceivedMessageId after the fetch restores the race this fix removed")
+        # A since=0 poll is only a BACKLOG replay while nothing has ever been
+        # received. Once the client is primed, a still-zero watermark just means
+        # the log is empty, and the response is live traffic that must notify.
+        self.assertIn("chatStreamPrimed = true;", self.app,
+                      "the client must be marked primed once a baseline exists")
+        init = self._js_function_body(self.app, "connectChatEvents")
+        self.assertIn("chatStreamPrimed = true", init,
+                      "the SSE init handler must mark the stream primed")
+        # The polling path must be able to prime ITSELF. It is reachable with no
+        # init handler at all: a throwing EventSource constructor returns before
+        # the listener is attached, and a non-200 / wrong-MIME EventSource goes
+        # to CLOSED without reconnecting. With the flag written only by init,
+        # every polled message stayed classified as backlog and the host was
+        # never notified again for the whole session.
+        self.assertIn("chatStreamPrimed = true", fn,
+                      "the poll body must prime the client, or the polling-only "
+                      "path never notifies again after the first catch-up")
+        # ...and the write must come AFTER the classification, or the very
+        # first poll would stop being a catch-up. Compared on the FIRST
+        # occurrence of each: the body legitimately contains one priming write,
+        # and a last-occurrence search would sail straight past an illegally
+        # EARLY one and still find the correct one further down.
+        self.assertLess(fn.index("const isCatchUp"), fn.index("chatStreamPrimed = true"),
+                        "priming must happen after the batch is classified, or the "
+                        "first since=0 poll is no longer treated as a catch-up")
+        # The invariant the bug violated, stated against the server that serves it.
+        self.assertRegex(self.server, r"sinceId > 0 \? chatHistory\.filter",
+                         "the server treats since=0 as 'return the whole history'")
+
+    def test_chat_toast_layer_always_goes_idle(self):
+        """The layer is pointer-events:auto while `active`, over the video. The
+        folded '+N more' counter is the last thing holding it active, and
+        nothing cleared it: one burst left a permanently visible, permanently
+        clickable invisible box in the corner of the player's hit area, and the
+        pill never went away. It needs its own expiry."""
+        self.assertIn("scheduleChatOverflowRetire", self.app,
+                      "the folded counter must retire on its own clock")
+        fn = self._js_function_body(self.app, "scheduleChatOverflowRetire")
+        self.assertIsNotNone(fn, "scheduleChatOverflowRetire not found")
+        self.assertIn("chatToastOverflow = 0", fn,
+                      "the expiry must actually zero the counter")
+        self.assertIn("classList.remove('active')", fn,
+                      "the layer must be released once the counter retires")
+        # Folding must arm the timer, or the expiry above is unreachable.
+        show = self._js_function_body(self.app, "showChatNotification")
+        self.assertIn("scheduleChatOverflowRetire", show,
+                      "every folded message must arm the counter's expiry")
+        # Clicking through retires it too: the host is going to the log.
+        # Scoped to the click handler, NOT the whole file: a bare
+        # `assertIn("clearChatOverflow", self.app)` is satisfied by the function
+        # DEFINITION, so deleting the only call site left that dead function
+        # still passing — which is exactly the state the handler was once in.
+        click = self.app.index("chatToastLayer.addEventListener('click'")
+        self.assertGreater(click, -1, "the notification click handler is missing")
+        handler = self.app[click:click + 700]
+        self.assertIn("clearChatOverflow()", handler,
+                      "acting on a notification must retire the folded counter; "
+                      "a definition alone is dead code")
+        self.assertIn("clearChatUnread()", handler,
+                      "acting on a notification must retire the unread count")
+
+    def test_chat_unread_badge_is_hidden_at_zero_and_cleared_on_read(self):
+        """A '0' badge that never clears is worse than no badge: it trains the
+        host to ignore the one thing the badge exists to signal."""
+        render = self._js_function_body(self.app, "renderChatUnread")
+        self.assertIsNotNone(render, "renderChatUnread not found")
+        self.assertIn("chatUnreadBadge.hidden = true", render,
+                      "a zero count must hide the badge rather than render '0'")
+        self.assertIn("MAX_CHAT_UNREAD", self.app,
+                      "the label must be capped so it cannot reflow the tab strip")
+        tab = self._js_function_body(self.app, "activateSidebarTab")
+        self.assertIn("clearChatUnread", tab,
+                      "opening the chat by hand must retire the unread count")
+        self.assertIn('.tab-unread-badge[hidden]', self.css,
+                      "[hidden] must beat the badge's display, or '0' renders")
 
 
 if __name__ == "__main__":
