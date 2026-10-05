@@ -59,14 +59,30 @@ document.addEventListener('DOMContentLoaded', () => {
     // gathering completes, or at this cap. See awaitRoutableCandidate().
     const ICE_GATHER_CAP_MS = 6000;
     const ICE_SETTLE_MS = 400;
-    const WHIP_POST_TIMEOUT_MS = 10000;
+    // The WHIP POST budget, and it is deliberately far larger than the player's
+    // WHEP figure.
+    //
+    // MediaMTX does not write the 201 until ICE AND DTLS have completed, so a
+    // legitimate publish can take ~12s on this host: webrtcSTUNGatherTimeout
+    // (2s) is nested inside webrtcHandshakeTimeout (10s), and a first publish
+    // also pays DTLS setup. The viewer's 10s abort is right for WHEP — it is
+    // attaching to an already-live source — but reusing it here aborted
+    // handshakes that were about to succeed, so "could not start publishing"
+    // appeared on exactly the slow uplink the feature exists to serve. 25s
+    // leaves headroom over the ~12s real case while still bounding a stuck one.
+    const WHIP_POST_TIMEOUT_MS = 25000;
     // How long a transient ICE 'disconnected' is tolerated before the publish
     // is abandoned. Comfortably longer than the path blips this host actually
     // sees (a phone hotspot reassociating) and shorter than the time a viewer
     // would sit wondering whether the stream is coming back.
     const DISCONNECT_GRACE_MS = 8000;
-    // The whole publish handshake: ICE config fetch + gather + POST + ICE.
-    const PUBLISH_WATCHDOG_MS = 30000;
+    // The outer backstop for the whole publish handshake: ICE config fetch +
+    // gather (capped at ICE_GATHER_CAP_MS) + the WHIP POST + applying the
+    // answer. It must comfortably exceed the POST budget or it aborts a
+    // handshake it is supposed to be watching — which is exactly what a 30s
+    // watchdog did against a 25s POST. 75s bounds a genuinely stuck start
+    // without ever racing the steps it is watching.
+    const PUBLISH_WATCHDOG_MS = 75000;
 
     const el = {};
     const IDS = [

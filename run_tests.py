@@ -1071,6 +1071,35 @@ class BrowserBroadcasterChecks(_SiteUnderTest):
                 self.assertGreater(len(body), 0, "{} must not be empty".format(route))
                 self.assertIn("javascript", headers.get("Content-Type", ""))
 
+    def test_studio_whip_post_budget_exceeds_the_players_whep_budget(self):
+        """The two timeouts answer different questions and must not be copied.
+
+        MediaMTX does not write the WHIP 201 until ICE AND DTLS have completed,
+        so a legitimate publish answers in ~12s on this host (webrtcSTUNGather
+        Timeout 2s nested inside webrtcHandshakeTimeout 10s). The viewer's 10s
+        WHEP abort is right — it is attaching to an already-live source — but
+        reusing it in the publisher aborted handshakes that were about to
+        succeed, failing to start on exactly the slow uplink the feature exists
+        to serve.
+
+        The outer watchdog must in turn exceed the POST budget, or it aborts a
+        handshake it is supposed to be watching.
+        """
+        def constant(name):
+            match = re.search(
+                r"const\s+{}\s*=\s*(\d+)".format(re.escape(name)), self.studio_js)
+            self.assertIsNotNone(match, "{} must be declared".format(name))
+            return int(match.group(1))
+
+        post_budget = constant("WHIP_POST_TIMEOUT_MS")
+        watchdog = constant("PUBLISH_WATCHDOG_MS")
+        self.assertGreaterEqual(post_budget, 25000,
+            "the WHIP POST budget must cover the real ~12s ICE+DTLS handshake")
+        # The watchdog watches the POST, so it must outlast it with headroom.
+        self.assertGreater(watchdog, post_budget * 2,
+            "the outer watchdog must comfortably exceed the POST budget, "
+            "or it aborts a handshake that is still legitimately in flight")
+
     def test_studio_publishes_over_whip_to_the_live_path(self):
         """The offer must go to the same WHIP endpoint the player proxies.
 
