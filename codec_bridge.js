@@ -239,6 +239,11 @@ const RENDITION_START_TIMEOUT_MS = 20000;
 // while it processes; 15s of silence is a definitive stall, not a pause.
 const RENDITION_STALL_TIMEOUT_MS = 15000;
 const RENDITION_WATCHDOG_POLL_MS = 3000;
+// How many consecutive unverifiable startup polls the watchdog tolerates before
+// it gives up waiting for a verdict and assumes the transcoder is dead. See
+// `startupUnknownTicks`: an unbounded "unknown is not a negative" rule turns the
+// watchdog into a no-op precisely when the host is unhealthy.
+const RENDITION_START_UNKNOWN_TOLERANCE = 15;
 const TARGET_VIDEO_CODEC = { 'live-h264': 'H264', 'live-av1': 'AV1' };
 
 function log(message) {
@@ -276,10 +281,22 @@ function resolveFfprobeBinary() {
     if (process.env.BRIDGE_FFPROBE) return process.env.BRIDGE_FFPROBE;
     if (FFMPEG !== 'ffmpeg') {
         const sibling = FFMPEG.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1');
-        try {
-            if (fs.existsSync(sibling)) return sibling;
-        } catch (err) {
-            /* fall through to PATH */
+        // The regex is anchored at the end and only rewrites a name that ENDS in
+        // ffmpeg/ffmpeg.exe. For any other filename (a perfectly ordinary
+        // `ffmpeg8.exe` from a BtbN build, or a renamed wrapper) the replace is
+        // a NO-OP, so `sibling` still points at ffmpeg itself - and existsSync
+        // happily says yes, so this returned FFMPEG. probeGopFrames() then ran
+        // ffmpeg with ffprobe demuxer flags (-select_streams, -show_entries),
+        // which it rejects, so the GOP silently degraded to the 60fps
+        // ASSUMPTION - the exact failure the probe exists to prevent - while
+        // the log blamed "ffprobe". Refuse a sibling that did not actually
+        // change, so the PATH fallback ('ffprobe') is used instead.
+        if (sibling !== FFMPEG) {
+            try {
+                if (fs.existsSync(sibling)) return sibling;
+            } catch (err) {
+                /* fall through to PATH */
+            }
         }
     }
     return 'ffprobe';
@@ -520,7 +537,16 @@ function decideBridge(tracks, env = {}) {
             extraOutputs: hasAudio && !hasOpusAudio
                 ? [{
                     target: 'live-av1',
-                    videoArgs: buildAv1VideoArgs(env),
+                    // The rate is passed EXPLICITLY, exactly as it is on the
+                    // H264-source primary below. buildAv1VideoArgs() defaults
+                    // its second argument to the module constant, so calling it
+                    // with one argument silently dropped `env.av1Bitrate` in
+                    // this direction while honouring it in the other - an
+                    // override that worked one way and not the other.
+                    // (Verified before the fix: decideBridge(['MPEG-4 Audio',
+                    // 'AV1'], {av1Bitrate:'9999k'}) produced -b:v 3000k while the
+                    // H264 plan produced 9999k.)
+                    videoArgs: buildAv1VideoArgs(env, env.av1Bitrate),
                     audioArgs,
                 }]
                 : undefined,
@@ -729,6 +755,30 @@ function clearGpuDecodeFailure(decoder) {
     }
 }
 
+// The codec names a path descriptor is carrying, in ONE place.
+//
+// MediaMTX reports tracks in two shapes: `tracks` (a plain array of codec
+// strings) and `tracks2` (an array of objects with a `codec` field). This
+// project already depends on both - fetchSourceTracks() below reads `tracks2`
+// precisely because the `tracks` array is not guaranteed to be populated - so
+// every other reader of a path descriptor has to understand the same pair.
+// renditionHasVideo() did not: it read only `tracks`, so a MediaMTX reporting
+// just `tracks2` made an empty array answer "no video", the startup watchdog
+// killed a perfectly healthy transcoder at the 20s mark, respawned it, and
+// failed the same check 20s later - forever. One helper, both shapes.
+function codecNames(pathDesc) {
+    if (!pathDesc) return [];
+    if (Array.isArray(pathDesc.tracks) && pathDesc.tracks.length) {
+        return pathDesc.tracks.filter((t) => typeof t === 'string');
+    }
+    if (Array.isArray(pathDesc.tracks2)) {
+        return pathDesc.tracks2
+            .filter((t) => t && typeof t.codec === 'string')
+            .map((t) => t.codec);
+    }
+    return [];
+}
+
 async function fetchSourceTracks() {
     const response = await fetch(`${API_BASE}/v3/paths/list`, {
         signal: AbortSignal.timeout(3000),
@@ -740,13 +790,8 @@ async function fetchSourceTracks() {
     if (!source) return null;
     const ready = source.ready === true || source.online === true;
     if (!ready) return null;
-    if (Array.isArray(source.tracks) && source.tracks.length) return source.tracks;
-    if (Array.isArray(source.tracks2)) {
-        return source.tracks2
-            .filter((t) => t && typeof t.codec === 'string')
-            .map((t) => t.codec);
-    }
-    return null;
+    const names = codecNames(source);
+    return names.length ? names : null;
 }
 
 function writePidFile(pid, targets) {
@@ -773,13 +818,27 @@ function writePidFile(pid, targets) {
 // is from an older build and is left alone deliberately: it may belong to a
 // bridge that is still alive, and unlinking someone else's record is the exact
 // failure this guards.
-function clearPidFile() {
+// Only unlink a record this process actually wrote, or one whose owner is dead.
+//
+// A record naming a DIFFERENT live ownerPid belongs to another bridge: every
+// bridge instance shares one path, so unlinking it from here would strand that
+// instance's ffmpeg. A record with no ownerPid at all predates that field; it
+// carries no claim of ownership, so there is nothing to protect and it is
+// treated as unowned - which is also what makes a hard-killed bridge's record
+// cleanable, since MediaMTX does not deliver a signal to the hook on Windows.
+//
+// `force` is for the --cleanup path, which runs as its OWN process: its pid can
+// never equal the recorded ownerPid (that is the bridge that spawned ffmpeg),
+ so the guard below made cleanup()'s own unlink a permanent no-op and the
+// record survived every runOnUnavailable, naming a dead ffmpeg forever. A dead
+// owner is also treated as unowned, for the hard-kill reason above.
+function clearPidFile(force = false) {
     try {
         const raw = fs.readFileSync(PID_FILE, 'utf8');
         let record = null;
         try { record = JSON.parse(raw); } catch (err) { record = null; }
-        if (record && record.ownerPid && record.ownerPid !== process.pid) {
-            return;   // another live bridge owns it
+        if (!force && record && record.ownerPid && record.ownerPid !== process.pid) {
+            if (ownerIsAlive(record.ownerPid)) return;   // another live bridge owns it
         }
         fs.unlinkSync(PID_FILE);
     } catch (err) {
@@ -787,20 +846,58 @@ function clearPidFile() {
     }
 }
 
+// Is a bridge with this pid still running? Signal 0 performs the permission and
+// existence checks without delivering anything. Windows treats it as a liveness
+// probe too, and any error (ESRCH: gone; EPERM: alive but not ours) is resolved
+// conservatively - only a definitive "no such process" counts as dead.
+function ownerIsAlive(pid) {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        return err && err.code === 'EPERM';
+    }
+}
+
 // True when the target path is ready AND carries its video codec — proof that
 // real video (not just audio) is flowing through the transcoder.
+// True when the target path is ready AND carries its video codec - proof that
+// real video (not just audio) is flowing through the transcoder.
+//
+// THREE states, not two, and the distinction is load-bearing. `true`/`false`
+// is a real answer; `null` means "the control API could not tell us" (HTTP
+// error, timeout, unparseable body, or the path not being listed at all).
+// Collapsing an unknown into `false` - as this did - made a single control-API
+// hiccup indistinguishable from "this transcoder is hung": at the 20s startup
+// mark the watchdog read the hiccup as a dead ffmpeg and killed a HEALTHY
+// transcoder, which drops the RTMP publish and therefore tears down every WHEP
+// session on the path - a room-wide hard stop caused by a 500 that lasted one
+// tick. The stall half of the same watchdog already refuses to score an unknown
+// reading as a stall for exactly this reason; both halves now agree.
 async function renditionHasVideo(target) {
-    const response = await fetch(`${API_BASE}/v3/paths/list`, {
-        signal: AbortSignal.timeout(3000),
-    });
-    if (!response.ok) return false;
-    const data = await response.json();
+    let response;
+    try {
+        response = await fetch(`${API_BASE}/v3/paths/list`, {
+            signal: AbortSignal.timeout(3000),
+        });
+    } catch (err) {
+        return null;   // API unreachable / timed out: unknown, not "no video"
+    }
+    if (!response.ok) return null;
+    let data;
+    try {
+        data = await response.json();
+    } catch (err) {
+        return null;
+    }
     const items = Array.isArray(data && data.items) ? data.items : [];
     const targetPath = items.find((item) => item && item.name === target);
-    if (!targetPath || !(targetPath.ready === true || targetPath.online === true)) return false;
-    const tracks = Array.isArray(targetPath.tracks) ? targetPath.tracks : [];
+    if (!targetPath) return null;   // not listed: unknown, not "no video"
+    if (!(targetPath.ready === true || targetPath.online === true)) return false;
+    const tracks = codecNames(targetPath);
     const wanted = TARGET_VIDEO_CODEC[target];
-    return !wanted || tracks.some((t) => typeof t === 'string' && t.toUpperCase() === wanted);
+    return !wanted || tracks.some((t) => t.toUpperCase() === wanted);
 }
 
 // Total bytes a path has INGESTED since it was created. This is the
@@ -853,8 +950,22 @@ function cleanup() {
     } catch (err) {
         return; /* no record: nothing to clean */
     }
-    clearPidFile();
-    if (!record || !Number.isInteger(record.pid)) return;
+    if (!record || !Number.isInteger(record.pid)) {
+        clearPidFile(true);
+        return;
+    }
+    // Decide BEFORE unlinking. A record with no usable `createdAt` cannot be
+    // acted on safely, and unlinking it first would leave the operator following
+    // an instruction to "delete the PID file by hand" for a file that no longer
+    // exists, with no record left for a later runOnUnavailable to retry against.
+    // The stale ffmpeg would then survive holding its NVDEC/NVENC sessions, RTSP
+    // reader and RTMP publisher until the next broadcast kicked it.
+    if (!Number.isFinite(record.createdAt)) {
+        logError(`cleanup: record for pid ${record.pid} has no createdAt - refusing to kill on a `
+            + 'recycled-PID risk. The record is left in place so a later run can retry once it is repaired.');
+        return;
+    }
+    clearPidFile(true);
     // No age gate here. The record is stamped once, when ffmpeg starts, and never
     // refreshed, so a "stale record" cut-off silently disabled this cleanup for
     // every broadcast longer than the cut-off — and clearPidFile() above has
@@ -883,10 +994,426 @@ function cleanup() {
             const createdIso = Number.isFinite(record.createdAt)
                 ? new Date(record.createdAt).toISOString()
                 : null;
-            const notReused = createdIso
-                ? `-and $p.CreationDate -and $p.CreationDate.ToUniversalTime() -le ([DateTime]::Parse('${createdIso}').ToUniversalTime().AddSeconds(2))`
+            // `createdAt` is validated once, up front, before the record is
+            // unlinked -- see the fail-closed check at the top of cleanup(). A
+            // missing timestamp would otherwise degrade this clause to an empty
+            // string and make BOTH guards vanish at once, leaving nothing but
+            // the deliberately loose `-like '*live-av1*'` CommandLine substring,
+            // so a recycled PID running any unrelated program that merely
+            // mentions the path was force-stopped. A missing guard must disable
+            // the kill, not silently widen it.
+            const notReused = `-and $p.CreationDate -and $p.CreationDate.ToUniversalTime() -le ([DateTime]::Parse('${createdIso}').ToUniversalTime().AddSeconds(2))`;
+            // Normalise BOTH sides to the extension-less stem and compare with
+            // -eq. Win32_Process.Name is always the full image name
+            // ('ffmpeg.exe'), while the record stores path.basename(FFMPEG) - which
+            // is the bare string 'ffmpeg' whenever resolveFfmpegBinary() takes its
+            // PATH fallback (no BRIDGE_FFMPEG and no bundled build). PowerShell's
+            // `-like` needs a wildcard to match 'ffmpeg.exe' against 'ffmpeg' and
+            // there is none, so the guard was False on every PATH-fallback
+            // record: cleanup() logged success and killed nothing, leaving a 300 MB
+            // ffmpeg holding an NVDEC session, an NVENC session, an RTSP reader
+            // and an RTMP publisher.
+            //
+            // Note there is deliberately NO `$p.BaseName` here: Win32_Process does
+            // not expose that property (verified against a live process - it reads
+            // empty), so the guard would have been silently always false, i.e. the
+            // same defect wearing a different hat. Stripping the extension off
+            // Name is the comparison that actually holds.
+            const exeStem = record.exe
+                ? path.basename(String(record.exe)).replace(/\.exe$/i, '')
                 : '';
-            const rightExe = record.exe ? ` -and $p.Name -like '${record.exe}'` : '';
+            const rightExe = exeStem ? ` -and (($p.Name -replace '\\.exe
+            const script = `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${record.pid}'; `
+                + `if ($p -and $p.CommandLine -like '*${target}*'${rightExe}${notReused}) `
+                + `{ Stop-Process -Id ${record.pid} -Force }`;
+            execSync(`powershell -NoProfile -Command "${script}"`, { stdio: 'ignore', timeout: 15000 });
+            log(`cleanup: ensured ffmpeg for ${target} (pid ${record.pid}) is stopped`);
+        } catch (err) {
+            logError(`cleanup failed for pid ${record.pid}: ${err.message}`);
+        }
+    }
+}
+
+function startFfmpeg(plan, decodeArgs = []) {
+    const args = buildFfmpegArgs(plan, {}, decodeArgs);
+    log(`starting: ${FFMPEG} ${args.join(' ')}`);
+    const child = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    // stderr is only for warnings/errors now. ffmpeg emits its "frame=" stats
+    // line at AV_LOG_INFO, and the bridge deliberately runs at
+    // -loglevel warning, so those lines NEVER appear — an earlier version of
+    // this code treated their absence as "cannot judge liveness" and the
+    // entire mid-broadcast stall watchdog was dead code (verified: -loglevel
+    // warning produces 0 lines matching /frame=/, info produces them). Liveness
+    // is judged from the control API's per-path byte counters instead, which is
+    // stronger evidence anyway: it proves bytes are actually reaching the
+    // published path, not merely that a process is alive.
+    child._lastProgressAt = Date.now();
+    child.stderr.on('data', (chunk) => {
+        for (const rawLine of String(chunk).split(/[\r\n]+/)) {
+            const line = rawLine.trim();
+            if (!line) continue;
+            log(`ffmpeg: ${line}`);
+        }
+    });
+    writePidFile(child.pid, planTargets(plan));
+    return child;
+}
+
+/*
+ * Derive the NVDEC decode configuration for a plan: usable when this ffmpeg
+ * build ships the decoder and it has not been recorded as crashing recently
+ * (a machine without NVIDIA GPUs must fall back to CPU decode instead of
+ * crash-looping ffmpeg). Re-run whenever the plan changes so a mid-broadcast
+ * codec switch gets the right decoder, not the previous one's.
+ */
+function resolveDecodeArgs(plan) {
+    const gpuDecoder = probeGpuDecoder(plan.sourceCodec);
+    const gpuUsable = Boolean(gpuDecoder) && !gpuDecodeBlocked(gpuDecoder);
+    const decodeArgs = pickDecoderArgs(plan.sourceCodec, {
+        gpuDecode: process.env.BRIDGE_GPU_DECODE,
+        gpuDecoders: gpuUsable ? [gpuDecoder] : [],
+    });
+    if (!decodeArgs.length) {
+        log('decoding on CPU'
+            + (gpuDecoder ? ` (${gpuDecoder} blocked by a recent failure)` : ' (NVDEC unavailable)'));
+    } else {
+        log(`decoding on NVDEC (${decodeArgs[1]})`);
+    }
+    return decodeArgs;
+}
+
+async function main() {
+    if (process.argv.includes('--cleanup')) {
+        cleanup();
+        return;
+    }
+
+    // Which ffmpeg is actually transcoding is the first thing an operator needs
+    // to know, and the wrong one produces a bridge that looks alive while
+    // publishing nothing. See resolveFfmpegBinary for why the fallback is risky.
+    reportFfmpegProvenance();
+
+    let child = null;
+    const stop = () => {
+        log('stopping');
+        if (child) {
+            try { child.kill(); } catch (err) { /* already dead */ }
+        }
+        clearPidFile();
+        process.exit(0);
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+
+    /* Wait for the source to report its tracks (the hook fires the moment the
+       path is available, so this normally succeeds on the first try). */
+    let plan = null;
+    let gopFrames = null;
+    for (let attempt = 0; attempt < 10 && !plan; attempt++) {
+        try {
+            const tracks = await fetchSourceTracks();
+            if (tracks) {
+                // Probe the real frame rate once the source is up: -g counts
+                // frames, so only the measured fps makes the GOP "one second"
+                // (null from a failed probe lets the next attempt retry;
+                // decideBridge falls back to the 60-frame default).
+                if (!gopFrames) gopFrames = probeGopFrames();
+                plan = decideBridge(tracks, { gopFrames });
+            }
+            if (!plan) log(`waiting for a ready source with video (attempt ${attempt + 1})`);
+        } catch (err) {
+            log(`control API not ready (attempt ${attempt + 1}): ${err.message}`);
+        }
+        if (!plan) await sleep(1000);
+    }
+    if (!plan) {
+        logError(`giving up: source '${SOURCE_PATH}' never reported a decodable track list`);
+        process.exit(1);
+    }
+
+    log(`source '${SOURCE_PATH}' -> ${planTargets(plan).join(' + ')}` +
+        (plan.extraOutputs && plan.extraOutputs.length
+            ? ` (extra outputs: ${plan.extraOutputs.map((o) => o.target).join(', ')} — audio rescue / second codec)`
+            : ''));
+
+    // GPU (NVDEC) decode when this ffmpeg build ships the decoder and it has
+    // not been recorded as crashing recently; the CPU stays free for OBS
+    // capture. Two very short runs with GPU decode enabled mean the decoder
+    // itself is failing (unsupported bit depth/profile/crash) — remember that
+    // for later broadcasts and drop to CPU decode for the rest of this one.
+    let decodeArgs = resolveDecodeArgs(plan);
+
+    let failures = 0;
+    let gpuFastFailures = 0;
+    let running = true;
+    while (running) {
+        const startedAt = Date.now();
+        const planTargetList = planTargets(plan);
+        child = startFfmpeg(plan, decodeArgs);
+
+        // Rendition watchdog, two phases:
+        //   1) STARTUP — until EVERY published target proves it carries
+        //      video, poll the control API; a transcoder running without
+        //      video for the full start timeout is hung (the RTSP leg never
+        //      delivered a decodable keyframe) and is killed so the retry
+        //      loop can try again.
+        //   2) MID-BROADCAST STALL — once video has flowed, the published
+        //      byte counters are the liveness signal: a hung NVENC session or
+        //      a dead RTSP leg that never errors keeps the path `ready` while
+        //      no further bytes land, freezing every rendition viewer. Two
+        //      consecutive stalled samples are required, so one slow control-API
+        //      read can never disconnect a healthy broadcast.
+        //
+        // The signal deliberately is NOT ffmpeg's stderr. ffmpeg emits its
+        // "frame=" stats line at AV_LOG_INFO and the bridge runs at
+        // -loglevel warning (verified: 0 such lines at warning, present at
+        // info), so a stderr-based watchdog here could never fire at all.
+        let renditionEverReady = false;
+        let watchdogKilled = false;
+        let lastBytesSeen = null;
+        let stalledSamples = 0;
+        const watchdog = setInterval(async () => {
+            // Pin the child this tick is judging. `child` is a main()-scope binding
+            // that the retry loop reassigns, and the startup check below awaits the
+            // control API (up to 3s): without this capture, a tick already inside
+            // that await resumes after clearInterval() and kills the NEXT
+            // iteration's freshly spawned ffmpeg, which the loop then counts as a
+            // fast failure (bogus 24h NVDEC block) and, ten times over, exits for
+            // good.
+            const judged = child;
+            if (!judged || watchdogKilled) return;
+            if (!renditionEverReady) {
+                if (Date.now() - startedAt < RENDITION_START_TIMEOUT_MS) return;
+                try {
+                    const checks = await Promise.all(planTargetList.map((t) => renditionHasVideo(t)));
+                    renditionEverReady = checks.every(Boolean);
+                    if (renditionEverReady) {
+                        // Start the stall baseline from real counters, so the
+                        // first mid-broadcast comparison is not against null.
+                        try {
+                            const counts = await Promise.all(planTargetList.map((t) => renditionBytesIngested(t)));
+                            lastBytesSeen = counts.map((n) => (Number.isFinite(n) ? n : 0));
+                        } catch (err) { /* re-baseline on the next tick */ }
+                        return;
+                    }
+                } catch (err) {
+                    return; /* API hiccup: re-check on the next tick */
+                }
+                watchdogKilled = true;
+                logError(`rendition '${planTargetList.join('+')}' produced no video within `
+                    + `${Math.round(RENDITION_START_TIMEOUT_MS / 1000)}s — restarting the transcoder`);
+                try { judged.kill(); } catch (err) { /* already dead */ }
+                return;
+            }
+            let counts;
+            try {
+                counts = await Promise.all(planTargetList.map((t) => renditionBytesIngested(t)));
+            } catch (err) {
+                return; /* API hiccup: re-check on the next tick */
+            }
+            if (lastBytesSeen === null) {
+                lastBytesSeen = counts.map((n) => (Number.isFinite(n) ? n : 0));
+                return;
+            }
+            // UNKNOWN is not STALLED. A path that has disappeared from the
+            // control API (MediaMTX restart, a re-created path) or a counter
+            // that came back non-numeric returns null, and `Number.isFinite(null)`
+            // is false — so an unknown reading contributed nothing to `advanced`
+            // and was scored exactly like a frozen counter. This watchdog runs on
+            // a box that also runs OBS, NVENC, MediaMTX, Node and a tunnel, and
+            // each API read has a 3s timeout: five consecutive timeouts during
+            // a GC pause or a config reload would kill a PERFECTLY HEALTHY
+            // transcoder, which drops its RTMP publish and therefore tears down
+            // every WHEP session on the path — a room-wide hard stop for a
+            // broadcast that never stalled. Reset and wait instead.
+            if (counts.some((n) => !Number.isFinite(n))) {
+                stalledSamples = 0;
+                return;
+            }
+            // A DECREASE is activity, not a stall: MediaMTX resets a path's
+            // counter when a new publisher connects to it, and the bridge's own
+            // restart does exactly that. Only an UNCHANGED value is evidence of
+            // a stall, so compare for inequality rather than for growth.
+            const advanced = counts.some((n, i) => n !== lastBytesSeen[i]);
+            lastBytesSeen = counts.map((n) => (Number.isFinite(n) ? n : 0));
+            if (advanced) {
+                stalledSamples = 0;
+                return;
+            }
+            stalledSamples += 1;
+            // FIVE consecutive stalled samples are required: 15000 / 3000 = 5.
+            // The comment beside this used to say "two", which is 2.5x faster
+            // than the arithmetic allows. Worst-case detection latency is
+            // therefore 15-18s (five polls plus up to one 3s API read).
+            const stallSamplesNeeded = Math.ceil(RENDITION_STALL_TIMEOUT_MS / RENDITION_WATCHDOG_POLL_MS);
+            if (stalledSamples < stallSamplesNeeded) return;
+            watchdogKilled = true;
+            logError(`rendition '${planTargetList.join('+')}' stopped publishing bytes for `
+                + `${Math.round(RENDITION_STALL_TIMEOUT_MS / 1000)}s — restarting the transcoder`);
+            try { judged.kill(); } catch (err) { /* already dead */ }
+        }, RENDITION_WATCHDOG_POLL_MS);
+
+        const exit = await new Promise((resolve) => {
+            child.once('exit', (code, signal) => resolve({ code, signal }));
+            child.once('error', (err) => resolve({ error: err }));
+        });
+        clearInterval(watchdog);
+        clearPidFile();
+        child = null;
+        if (exit.error) {
+            logError(`ffmpeg failed to start: ${exit.error.message}`);
+            process.exit(1);
+        }
+        failures += 1;
+        const runSeconds = (Date.now() - startedAt) / 1000;
+        const attemptNo = failures;
+        log(`ffmpeg exited (code=${exit.code} signal=${exit.signal}) after ${runSeconds.toFixed(1)}s, attempt ${attemptNo}`);
+
+        // MAX_CONSECUTIVE_FFMPEG_FAILURES means CONSECUTIVE. Without this reset
+        // the counter was cumulative for the whole broadcast, so ten unrelated
+        // ffmpeg exits spread over hours — one per OBS auto-reconnect, one per
+        // host stall — eventually tripped the cap and the process exit(1)s.
+        // The rendition is then dead for the rest of the broadcast, and every
+        // viewer of it sees a hard stop. A run that lasted long enough to have
+        // produced a real broadcast proves the configuration works, so it must
+        // clear the strike count.
+        if (runSeconds >= 30) {
+            failures = 0;
+        }
+
+        // Forgiveness and health are different things. The reset above only
+        // means "this run lasted long enough to prove the config works", so it
+        // clears the STRIKE count. It must NOT be the same test that decides
+        // whether the bridge has been making progress, because a crash cycle
+        // that lands in the 30-45s band (run 35s, exit, 2s sleep, respawn)
+        // resets the counter every single iteration and the give-up cap below
+        // can then never fire — an unbounded loop in which every cycle drops the
+        // RTMP publisher, which closes EVERY WHEP session on the path, so the
+        // whole room hard-stops and rejoins roughly every 37 seconds for the
+        // entire broadcast. A real, long, uninterrupted run is the only proof
+        // that deserves forgiveness at the circuit-breaker level.
+        if (runSeconds >= HEALTHY_RUN_SECONDS) {
+            lastHealthyRunAt = Date.now();
+        }
+
+        // A crash within the first 10s points at the decoder configuration,
+        // not the source: record it, drop to CPU after the second occurrence,
+        // and retry almost immediately instead of sleeping the full 2s.
+        //
+        // The counter must be cleared by a healthy run. It previously was not,
+        // so `gpuFastFailures` accumulated for the whole broadcast: one 5s exit,
+        // then two perfectly good hours, then an unrelated 5s exit tripped the
+        // threshold and switched the rest of the broadcast to SOFTWARE decode —
+        // 1080p60 decoded on the CPU while OBS captured on the same 14 cores,
+        // which delays every packet to EVERY viewer rather than one. The run
+        // counter above already treats >=30s as proof the configuration works;
+        // this one has to agree.
+        if (decodeArgs.length && runSeconds < 10) {
+            gpuFastFailures += 1;
+            if (gpuFastFailures >= 2) {
+                logError('NVDEC decode failed twice in a row — falling back to CPU decode');
+                rememberGpuDecodeFailure(decodeArgs[1]);
+                decodeArgs = [];
+            }
+        } else if (decodeArgs.length && runSeconds >= 30) {
+            gpuFastFailures = 0;
+            clearGpuDecodeFailure(decodeArgs[1]);
+        }
+        if (runSeconds < 10) {
+            await sleep(400);
+        } else {
+            await sleep(2000);
+        }
+
+        /* If the source is gone MediaMTX is about to stop this hook — exit
+           instead of restarting into a dead stream. While the source is
+           here, re-read its tracks: an OBS auto-reconnect replaces the
+           publisher WITHOUT taking the path offline, so the hook is not
+           re-run; if the streamer switched the encoder (H.264 <-> AV1) the
+           old plan would decode the new feed with the wrong codec and
+           crash-loop forever. Re-decide the plan instead. */
+        let fetchedTracks = null;
+        try {
+            fetchedTracks = await fetchSourceTracks();
+        } catch (err) {
+            fetchedTracks = null;
+        }
+        if (!fetchedTracks) {
+            log('source is no longer ready; exiting');
+            break;
+        }
+        const freshPlan = decideBridge(fetchedTracks, { gopFrames });
+        if (freshPlan && (freshPlan.sourceCodec !== plan.sourceCodec
+            || freshPlan.target !== plan.target
+            || JSON.stringify(planTargets(freshPlan)) !== JSON.stringify(planTargets(plan)))) {
+            log(`source codec changed (${plan.sourceCodec} -> ${freshPlan.sourceCodec}); `
+                + `re-planning renditions: ${planTargets(freshPlan).join(' + ')}`);
+            // A plan change is NOT proof the configuration works, so it must not
+            // clear the consecutive-failure budget. Resetting `failures` here
+            // meant a source whose track list oscillated could restart the
+            // transcoder forever without ever reaching the cap that would stop
+            // it — and every restart drops the RTMP publisher, which closes
+            // EVERY WHEP session on that path, so all viewers hard-stop, rejoin
+            // and wait for a fresh IDR.
+            //
+            // A genuine codec change does deserve a clean slate, because the old
+            // budget was spent on a different codec. Only the source VIDEO codec
+            // is treated as authoritative for that; the set of rendition targets
+            // can legitimately differ for a transient reason — an RTMP source
+            // whose audio track briefly disappears makes decideBridge drop the
+            // audio-rescue output, and adopting that permanently would leave
+            // live-h264 unpublished for the REST OF THE BROADCAST, hard-stopping
+            // every audio-rescue viewer, which is the entire reason that
+            // rendition exists.
+            if (freshPlan.sourceCodec !== plan.sourceCodec) {
+                failures = 0;
+                gpuFastFailures = 0;
+            }
+            plan = freshPlan;
+            decodeArgs = resolveDecodeArgs(plan);
+        }
+        // Two independent reasons to stop. Either the consecutive-failure cap
+        // tripped, or the bridge has been crash-cycling without ever producing
+        // a genuinely long run — which the strike counter cannot see, because a
+        // 35s crash cycle keeps clearing it.
+        if (shouldGiveUp(failures, lastHealthyRunAt, Date.now())) {
+            const noHealthyRunFor = Date.now() - (lastHealthyRunAt || BRIDGE_STARTED_AT);
+            logError(`giving up after ${failures} failed attempts`
+                + ` (no healthy run for ${Math.round(noHealthyRunFor / 1000)}s)`);
+            if (plan.sourceCodec === 'AV1') {
+                logError(`known limitation: an OBS WHIP AV1 source whose keyframes never reassemble on `
+                    + `the RTSP leg cannot be bridged — AV1-capable viewers still play the native `
+                    + `'${SOURCE_PATH}' path; broadcast H.264 via WHIP to give every browser a rendition`);
+            }
+            // Back OFF before exiting. This hook runs under
+            // runOnAvailableRestart, so an immediate exit(1) is re-run by
+            // MediaMTX essentially at once: the 10-failure crash-loop takes
+            // only 4-10s (400ms sleeps), and the replacement bridge then
+            // publishes to live-av1, which — because overridePublisher is on —
+            // KICKS whatever was publishing there. If an earlier instance had
+            // just recovered, that healthy publisher is destroyed by its own
+            // retry. A long pause turns a hot crash-loop into a slow, bounded
+            // one that gives a real recovery a chance to hold.
+            logError(`backing off ${Math.round(GIVE_UP_BACKOFF_MS / 1000)}s before exiting`);
+            await sleep(GIVE_UP_BACKOFF_MS);
+            process.exit(1);
+        }
+    }
+
+    clearPidFile();
+    process.exit(0);
+}
+
+module.exports = { decideBridge, buildFfmpegArgs, pickDecoderArgs, probeGopFrames, planTargets, shouldGiveUp, MAX_CONSECUTIVE_FFMPEG_FAILURES, NO_HEALTHY_RUN_LIMIT_MS, VIDEO_CODECS };
+
+if (require.main === module) {
+    main().catch((err) => {
+        logError(`fatal: ${err && err.stack ? err.stack : err}`);
+        clearPidFile();
+        process.exit(1);
+    });
+}
+,'') -eq '${exeStem}')` : '';
             const script = `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${record.pid}'; `
                 + `if ($p -and $p.CommandLine -like '*${target}*'${rightExe}${notReused}) `
                 + `{ Stop-Process -Id ${record.pid} -Force }`;

@@ -1205,13 +1205,42 @@ document.addEventListener('DOMContentLoaded', () => {
     // the frames it received, which is real decode pressure; a ratio at 0.9 with
     // the old code sat in the hold band forever and could never accumulate, so a
     // decoder stuck at 83% never triggered anything at all.
-    function updateDecodeLag(lagSec, decodedDelta, receivedDelta, discardedDelta = 0) {
-        if (receivedDelta < 15) return Math.max(0, lagSec - 1);
+    // Decode-pressure state machine (pure - unit-tested). Each stats tick
+    // compares decoded frames against received frames: a decoder falling
+    // below 70% of the arrival rate accumulates lag seconds, a decoder above
+    // 90% sheds one, and a low-rate window (under 15 frames) is unmeasurable
+    // and decays - static screens and paused publishers must not look like
+    // decode pressure.
+    // The question this answers is "can the decoder render the frames it is
+    // HANDED?", so BOTH sides of the ratio must come from the same population:
+    //   delivered = decoded + discarded   (frames the decoder could have shown)
+    //   emitted                        (frames the jitter buffer actually gave it)
+    //
+    // The denominator used to be `framesReceived`, which is a DIFFERENT
+    // population: it counts every frame the transport delivered to the jitter
+    // buffer, including the ones the buffer then dropped for being late. Those
+    // frames were never offered to the decoder, so dividing by them charged
+    // ordinary network jitter to the decoder. `framesDiscarded` cannot repair
+    // that: it is NOT a member of RTCInboundRtpStreamStats (the W3C-sourced
+    // IDL defines framesDropped, not framesDiscarded), so it reads undefined on
+    // every browser and discardedDelta is always 0.
+    //
+    // Measured consequence, 60fps with 16% of frames arriving too late to be
+    // emitted (packetsLost ~= 0, because the loss is jitter-buffer late-discard
+    // rather than transport loss) and a decoder rendering 100% of what it is
+    // given:
+    //   t=1..8s  lag = 1,2,3,4,5,6,7,8  -> 8s: a FULL rendition switch fires
+    //                                      (2-4s of black for that viewer)
+    //   fixed    lag = 0 throughout      -> nothing fires
+    // A decoder genuinely failing to keep up is still caught: decoded 30 of 50
+    // emitted accumulates 1..8 and trips the same switch.
+    function updateDecodeLag(lagSec, decodedDelta, emittedDelta, discardedDelta = 0) {
+        if (emittedDelta < 15) return Math.max(0, lagSec - 1);
         if (decodedDelta < 0) return Math.min(30, lagSec + 1);
         const discarded = Number.isFinite(discardedDelta) ? Math.max(0, discardedDelta) : 0;
         const delivered = decodedDelta + discarded;
         if (delivered <= 0) return Math.min(30, lagSec + 1);
-        const ratio = delivered / receivedDelta;
+        const ratio = delivered / emittedDelta;
         if (ratio < 0.85) return Math.min(30, lagSec + 1);
         if (ratio >= 0.98) return Math.max(0, lagSec - 1);
         // Marginal band (0.85-0.98): keep the current reading rather than
@@ -3929,6 +3958,25 @@ document.addEventListener('DOMContentLoaded', () => {
                     // spec, not a cumulative counter, so it is read as a level and
                     // differenced against the previous level. Absent in browsers
                     // that do not implement it, hence the 0 fallback.
+                    // Frames the jitter buffer actually handed DOWNSTREAM this
+                    // tick - the population the decoder was asked to render, and
+                    // therefore the correct denominator for decode pressure.
+                    // Declared here (not inside the jitter block below) because
+                    // the decode-lag check runs after that block; it is ASSIGNED
+                    // there once the cumulative counters are differenced.
+                    let emittedDelta = 0;
+                    // Whether the browser reports jitterBufferEmittedCount AT ALL.
+                    // Tracked separately from `emittedDelta > 0`, because a
+                    // legitimately ZERO emitted count is meaningful - a starved
+                    // jitter buffer emits nothing - and must NOT be confused with
+                    // the field being unavailable.
+                    let hasEmittedCount = false;
+                    // `framesDiscarded` is NOT a member of
+                    // RTCInboundRtpStreamStats - the W3C-sourced IDL defines
+                    // framesDropped, not framesDiscarded - so this reads
+                    // `undefined` on every browser and discardedDelta is always 0.
+                    // Kept only as a harmless forward-compatible allowance for a
+                    // UA that does report it; nothing may depend on it.
                     const discardedLevel = Number.isFinite(videoStats.framesDiscarded)
                         ? videoStats.framesDiscarded : 0;
                     // Publish for the freeze watchdog (one getStats walk per
@@ -4182,7 +4230,8 @@ document.addEventListener('DOMContentLoaded', () => {
                             // quiet window.
                             avgPlayoutDelayAt = performance.now();
                         }
-                        const emittedDelta = videoStats.jitterBufferEmittedCount - lastJitterEmittedTotal;
+                        hasEmittedCount = true;
+                        emittedDelta = videoStats.jitterBufferEmittedCount - lastJitterEmittedTotal;
                         lastJitterDelayTotal = videoStats.jitterBufferDelay;
                         lastJitterEmittedTotal = videoStats.jitterBufferEmittedCount;
                         // Accommodation feeds off the measured delay but only
@@ -4205,9 +4254,26 @@ document.addEventListener('DOMContentLoaded', () => {
                         // condition it exists to catch. `emitted < received`
                         // counts frames that arrived but did not make it out of
                         // the buffer, which no mean can hide.
-                        const lateFrameEvidence = Number.isFinite(videoStats.framesReceived)
-                            && Number.isFinite(emittedDelta)
-                            && (videoStats.framesReceived - lastFramesReceived) > emittedDelta;
+                        // But it needs a MATERIALITY threshold, not a bare `>`.
+                        // The two counters are not independent:
+                        //   emitted = arrived - (late-discarded) - (buffer level)
+                        // and the buffer level is a LEVEL, so its delta is the rate
+                        // of change of that level. Any buffer that is filling,
+                        // draining, or re-equilibrating - including settling toward
+                        // this controller's OWN previous raise - produces
+                        // arrived - emitted > 0 with no frame ever having been
+                        // discarded. At 60fps a single 16.7ms frame is enough. With
+                        // zero tolerance `dropsNow` was true on essentially every
+                        // tick, which made the `!dropsNow && calmTicks >= 5` decay
+                        // branch in bufferAccommodationMs() UNREACHABLE: the extra
+                        // latency from one drop burst stayed pinned for the whole
+                        // session and the HUD read "absorbing" forever.
+                        // Requiring a real fraction of the window restores the
+                        // intended meaning without going blind to genuine drops.
+                        const arrivedDelta = videoStats.framesReceived - lastFramesReceived;
+                        const lateFrameEvidence = Number.isFinite(arrivedDelta)
+                            && emittedDelta > 0
+                            && (arrivedDelta - emittedDelta) > Math.max(2, emittedDelta * 0.05);
                         // The first tick after a (re)start — including a tab
                         // return — spans the whole hidden span, so its drop and
                         // delay figures are not this window's. The stats loop is
@@ -4333,8 +4399,15 @@ document.addEventListener('DOMContentLoaded', () => {
                     // it drives the supervisor's hardware-path switch.
                     const receivedDelta = received - lastFramesReceived;
                     const discardedDelta = Math.max(0, discardedLevel - lastFramesDiscarded);
-                    if (timeDiffSec > 0.5 && receivedDelta >= 15) {
-                        decodeLagSec = updateDecodeLag(decodeLagSec, decodedDiff, receivedDelta, discardedDelta);
+                    // Prefer the frames the buffer actually handed downstream.
+                    // The test is the FIELD's presence, not its value: an
+                    // emittedDelta of exactly 0 is a real reading (a starved
+                    // buffer), and folding it into "unavailable" makes a network
+                    // stall register as decode pressure and fires the switch at an
+                    // idle decoder.
+                    const decodeDenominator = hasEmittedCount ? emittedDelta : receivedDelta;
+                    if (timeDiffSec > 0.5 && decodeDenominator >= 15) {
+                        decodeLagSec = updateDecodeLag(decodeLagSec, decodedDiff, decodeDenominator, discardedDelta);
                     } else if (timeDiffSec > 0.5) {
                         decodeLagSec = decayDecodeLag(decodeLagSec);
                     }
@@ -5062,17 +5135,35 @@ document.addEventListener('DOMContentLoaded', () => {
             // never gated by the churn limiter — but it does stamp the dwell
             // anchor, so the very next adaptive tick cannot immediately undo it.
             if (peerConnection) {
+                let applied = 0;
                 peerConnection.getReceivers().forEach(r => {
                     // Both kinds, same target — see reapplyBufferTargets(): a
                     // mode switch that moves only video leaves the audio
                     // receiver at the old depth until the next stats tick,
                     // which the element renders as a lip-sync jump.
-                    if (r.track) {
-                        applyPlayoutDelay(r, r.track.kind);
+                    if (r.track && applyPlayoutDelay(r, r.track.kind)) {
+                        applied += 1;
                     }
                 });
-                lastAppliedTargetMs = currentBufferTargetMs();
-                lastAppliedTargetChangeAt = performance.now();
+                // Honour the SAME latch rule reapplyBufferTargets() enforces:
+                // latch the target only if a receiver actually accepted the
+                // write. Discarding the return value and latching
+                // unconditionally meant a UA without `jitterBufferTarget` on
+                // RTCRtpReceiver (where applyPlayoutDelay() returns false for
+                // every receiver) still recorded the target as granted. From
+                // then on reapplyBufferTargets() short-circuits on
+                // `targetMs === lastAppliedTargetMs` and NEVER retries, so the
+                // manual latency control silently did nothing for the rest of
+                // the session while the HUD advertised the new value and every
+                // downstream decision regulated against a target that was never
+                // written.
+                if (applied > 0) {
+                    lastAppliedTargetMs = currentBufferTargetMs();
+                    lastAppliedTargetChangeAt = performance.now();
+                } else {
+                    console.warn('[AdaptiveBuffer] Latency mode changed but no receiver '
+                        + 'accepted a playout target; this browser is not applying it.');
+                }
             }
         });
 

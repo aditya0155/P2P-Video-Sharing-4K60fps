@@ -1917,7 +1917,13 @@ Object.assign(cases, {
                 catchUpProbeDelayMs: null,
                 catchUpProvenUseless: false,
                 CATCHUP_MAX_RATE: 1.08,
-                baseBufferTargetMs: () => 1000,
+                // The code under test calls `currentBufferTargetMs()` for the
+                // settle point and reads `grantedTargetMs`. Stubbing the older
+                // `baseBufferTargetMs` name left both undefined, so the sandbox
+                // threw before the ordering/latch behaviour was ever reached.
+                // Both are provided here so the case tests what it claims to.
+                currentBufferTargetMs: () => 1000,
+                grantedTargetMs: 0,
                 catchUpPlaybackRate: (delay, base, prev, max) =>
                     Math.min(max, prev + 0.01),   // saturates after 8 ticks
                 console: quietConsole(),
@@ -1979,7 +1985,11 @@ Object.assign(cases, {
                 catchUpProbeDelayMs: null,
                 catchUpProvenUseless: false,
                 CATCHUP_MAX_RATE: 1.08,
-                baseBufferTargetMs: () => 1000,
+                // Same as the sibling case: the function under test calls
+                // `currentBufferTargetMs()` and reads `grantedTargetMs`, so the
+                // older `baseBufferTargetMs` stub alone leaves both undefined.
+                currentBufferTargetMs: () => 1000,
+                grantedTargetMs: 0,
                 catchUpPlaybackRate: (d, b, prev, max) => Math.min(max, prev + 0.01),
                 console: quietConsole(),
             };

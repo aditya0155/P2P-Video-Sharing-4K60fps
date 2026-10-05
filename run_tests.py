@@ -928,6 +928,81 @@ class JsLogicChecks(unittest.TestCase):
         different function's body."""
         run_js_check(self, "seam_survives_the_teardown_it_is_armed_across")
 
+    def test_superseded_attempt_cannot_disarm_a_live_attempt(self):
+        """Runs the real `finish()` and the real WHEP POST `finally` bodies.
+
+        `whepPostTimeout` and `gatherTimeout` are module globals purely so
+        cleanupConnection() can cancel an in-flight connectStream attempt, which
+        makes each one a slot that TWO attempts write to. Both were cleared
+        unconditionally, so a torn-down attempt's late callback disarmed the
+        attempt that replaced it: the live attempt lost its 10s POST bound (and,
+        for the gather cap, its whole routable-candidate poll loop, which
+        guarded on the very global the stale attempt nulled).
+
+        This case also asserts the OLD bodies still reproduce the fault, so it
+        cannot pass vacuously."""
+        run_js_check(self, "superseded-attempt-cannot-disarm-a-live-attempt")
+
+    def test_superseded_session_error_must_not_tear_down_the_live_session(self):
+        """A stale connectStream failure must not kill the session that replaced it.
+
+        Only the AbortError branch carried a `superseded()` guard. AbortError is
+        not the only way a torn-down attempt fails: cleanupConnection() calls
+        `pc.close()` while the attempt is still suspended on createOffer() or
+        setLocalDescription(), and those reject with InvalidStateError. That
+        landed in the generic branch, which unconditionally cleared isConnecting
+        and ran handleDisconnected() -- clearing the LIVE attempt's 26s connect
+        watchdog, closing the LIVE attempt's peer connection and painting the
+        page OFFLINE. A clean connect followed by an unexplained drop."""
+        run_js_check(self, "superseded-session-error-must-not-tear-down-the-live-session")
+
+    def test_catchup_latch_returns_the_element_to_1x(self):
+        """Live-edge catch-up must release the playbackRate it took.
+
+        Catch-up drives the media element's playbackRate above 1.0 to drain a
+        drift, and that rate is a property of the ELEMENT, not of the peer
+        connection: it survives every teardown in the player. Without an
+        explicit release a viewer whose session ended while catching up starts
+        the next one running fast, with nothing on screen to explain it."""
+        run_js_check(self, "catchup-latch-returns-the-element-to-1x")
+
+    def test_catchup_probe_is_abandoned_when_measurement_stops(self):
+        """The saturation probe must not judge a drain on a stale baseline.
+
+        Catch-up's self-verification marks the mechanism useless when the rate
+        saturates and the buffer stops draining. Clearing the probe whenever the
+        controller is NOT asking for the full cap is what keeps a long slow
+        ramp from being judged against a measurement taken minutes earlier."""
+        run_js_check(self, "catchup-probe-is-abandoned-when-measurement-stops")
+
+    def test_superseded_attempt_cannot_disarm_a_live_attempt(self):
+        """Runs the real `finish()` and the real WHEP POST `finally` bodies.
+
+        `whepPostTimeout` and `gatherTimeout` are module globals purely so
+        cleanupConnection() can cancel an in-flight connectStream attempt, which
+        makes each one a slot that TWO attempts write to. Both were cleared
+        unconditionally, so a torn-down attempt's late callback disarmed the
+        attempt that replaced it: the live attempt lost its 10s POST bound (and,
+        for the gather cap, its whole routable-candidate poll loop, which
+        guarded on the very global the stale attempt nulled).
+
+        This case also asserts the OLD bodies still reproduce the fault, so it
+        cannot pass vacuously."""
+        run_js_check(self, "superseded-attempt-cannot-disarm-a-live-attempt")
+
+    def test_superseded_session_error_must_not_tear_down_the_live_session(self):
+        """A stale connectStream failure must not kill the session that replaced it.
+
+        Only the AbortError branch carried a `superseded()` guard. AbortError is
+        not the only way a torn-down attempt fails: cleanupConnection() calls
+        `pc.close()` while the attempt is still suspended on createOffer() or
+        setLocalDescription(), and those reject with InvalidStateError. That
+        landed in the generic branch, which unconditionally cleared isConnecting
+        and ran handleDisconnected() -- clearing the LIVE attempt's 26s connect
+        watchdog, closing the LIVE attempt's peer connection and painting the
+        page OFFLINE. A clean connect followed by an unexplained drop."""
+        run_js_check(self, "superseded-session-error-must-not-tear-down-the-live-session")
+
 
 class StreamApiProxyChecks(_SiteUnderTest):
     """Every byte the player exchanges with MediaMTX crosses this proxy."""
@@ -2111,9 +2186,64 @@ class ReceiverLagFixChecks(unittest.TestCase):
 
     def test_whep_handshake_is_time_bounded(self):
         app = read_text(APP_PATH)
-        self.assertIn("whepPostTimeout = setTimeout(", app, "WHEP POST needs a timeout timer")
-        self.assertIn("signal: whepAbortController.signal", app, "WHEP POST must be abortable")
-        self.assertIn("clearTimeout(whepPostTimeout)", app, "the POST timeout must be cleared on completion/teardown")
+        self.assertIn("whepPostTimeout = myPostTimeout", app, "WHEP POST needs a timeout timer")
+        self.assertIn("signal: myAbortController.signal", app, "WHEP POST must be abortable")
+        self.assertIn("clearTimeout(myPostTimeout)", app, "the POST timeout must be cleared on completion/teardown")
+
+    def test_superseded_attempt_cannot_clear_a_live_attempts_timers(self):
+        """A torn-down connectStream attempt must not disarm the one that replaced it.
+
+        `whepPostTimeout` and `gatherTimeout` are module globals purely so
+        cleanupConnection() can cancel an in-flight attempt, which makes each one
+        a slot that two attempts write to. connectStream's `finally` block and
+        the ICE-gather window's `finish()` used to clear those slots
+        unconditionally, so this interleaving disarmed the LIVE attempt:
+
+          A arms the 10s WHEP POST bound and awaits fetch
+          A is torn down; cleanupConnection clears + nulls the global
+          B starts and arms its own 10s bound
+          A's aborted fetch rejects, A's `finally` runs
+            -> clearTimeout(B's bound); whepPostTimeout = null
+
+        B is then left with a WHEP POST that no timeout can end and that
+        teardown can no longer cancel, so it hangs to the 26s connect watchdog
+        instead of 10s. The identical shape applied to `gatherTimeout`, where
+        it additionally killed the routable-candidate poll loop - that loop
+        guarded on `gatherTimeout === null`, i.e. on the very global the stale
+        attempt had just nulled.
+
+        Both are now attempt-owned and released only under an identity check.
+        """
+        app = read_text(APP_PATH)
+        code = self._strip_comments(app, "js")
+        connect = self._js_function_body(code, "connectStream")
+        self.assertIsNotNone(connect, "connectStream not found")
+
+        # The WHEP POST bound.
+        self.assertIn("if (whepPostTimeout === myPostTimeout) whepPostTimeout = null;",
+                      connect,
+                      "the POST `finally` must release the shared slot only when it "
+                      "still holds this attempt's handle")
+        # The ICE gather cap: released under an identity check, and the window's
+        # own liveness flag is attempt-local so a foreign null cannot stop it.
+        self.assertIn("if (gatherTimeout === gatherCap) gatherTimeout = null;",
+                      connect,
+                      "the gather window must release the shared slot only when it "
+                      "still holds this attempt's cap")
+        self.assertIn("let gatherOpen = false;", connect,
+                      "the gather window's liveness must be attempt-local state, "
+                      "not the shared global a stale attempt can null")
+        self.assertIn("if (routableSettle || !gatherOpen) return;", connect,
+                      "the routable-candidate poll must guard on the attempt-local "
+                      "window flag, or a stale attempt's null silently kills it")
+        # And no unconditional clear of either shared slot may remain in the
+        # attempt body - that is the defect itself.
+        self.assertNotRegex(connect,
+                            r"if \(gatherTimeout\) \{ clearTimeout\(gatherTimeout\); gatherTimeout = null; \}",
+                            "the unconditional gatherTimeout clear is the cross-attempt bug")
+        self.assertNotRegex(connect,
+                            r"if \(whepPostTimeout\) \{[^}]*clearTimeout\(whepPostTimeout\)[^}]*\}",
+                            "the unconditional whepPostTimeout clear is the cross-attempt bug")
 
     def test_adaptive_buffer_supervision_is_wired_into_the_stats_loop(self):
         app = read_text(APP_PATH)
@@ -3796,13 +3926,24 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         # window silently degraded to "gathering complete or the cap". This is
         # the same class of bug pass 2 already found once (a flag cleared before
         # its second reader), so it is pinned explicitly.
-        armed = code.find("gatherTimeout = setTimeout(() => finish('6s cap reached')")
+        armed = code.find("gatherCap = setTimeout(() => finish('6s cap reached')")
         polled = code.find("pollRoutable();", armed - 600 if armed > 0 else 0)
         self.assertGreater(armed, 0, "the gather cap is missing")
         self.assertGreater(polled, 0, "the routable poll is never started")
         self.assertLess(armed, polled,
                         "the gather cap must be armed before pollRoutable() is first called, "
-                        "or the poll's `gatherTimeout === null` guard kills the loop on tick one")
+                        "or the poll's window guard kills the loop on tick one")
+        # The window must also be OPEN before the poll, and the poll must read
+        # that attempt-local flag rather than the shared module global: a
+        # superseded attempt can null the global out from under the live one,
+        # which silently kills this whole loop.
+        opened = code.find("gatherOpen = true;")
+        self.assertGreater(opened, 0, "the gather window is never opened")
+        self.assertLess(opened, polled,
+                        "the window must be opened before pollRoutable() is first called")
+        self.assertIn("if (routableSettle || !gatherOpen) return;", code,
+                      "the poll must guard on the attempt-local window flag, not "
+                      "the shared module global a superseded attempt can null")
 
     def test_rtcp_fb_collection_is_scoped_to_the_video_section(self):
         """The collection pass swept the WHOLE document while the injection pass
@@ -4574,6 +4715,73 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
             self.assertIn("catch", body,
                           "{} must tolerate an unwritable state file".format(name))
 
+    def test_launcher_detects_a_mediamtx_started_from_another_checkout(self):
+        """"config matches mediamtx.yml" must not be able to hide the case where
+        the running MediaMTX belongs to a DIFFERENT copy of this project.
+
+        This repo is checked out many times over (a main checkout plus one
+        worktree per task) and sibling worktrees usually sit on the SAME commit,
+        so their mediamtx.yml files are byte-identical. The launcher's guard
+        compares the running instance's VALUES against the file on disk, so in
+        that situation every comparison passes and it reports a clean match --
+        while `runOnAvailable: node "codec_bridge.js"` is a RELATIVE path
+        resolved against MediaMTX's working directory, meaning the bridge
+        actually transcoding is the other checkout's file. Editing
+        codec_bridge.js then does nothing at all, with the launcher actively
+        reassuring you that it is in effect.
+
+        So the guard has to ask WHICH config file the running process was started
+        with, which is available from its own command line.
+        """
+        ps = read_text(LAUNCHER_PATH)
+        self.assertIn("$foreignConfig", ps,
+                      "the launcher must detect a reused MediaMTX that was "
+                      "started from a different copy of this project")
+        self.assertIn("Get-CimInstance Win32_Process", ps,
+                      "the running instance's own command line is the signal that "
+                      "names the config file it was started with")
+        self.assertIn("Resolve-Path -LiteralPath $liveConfigPath", ps,
+                      "the live config path must be resolved before it can be "
+                      "compared with this checkout's")
+        self.assertIn("DIFFERENT copy of this project", ps,
+                      "the operator must be told which copy is actually serving")
+        # The reassuring message must not be reachable while a foreign config is
+        # in use, and must not claim a scope it does not have: the scalar reader
+        # is anchored at column 0, so the whole `paths:` block -- which holds the
+        # rendition hooks -- is never compared.
+        match = re.search(
+            r"if \(\$configVerified -and \$compared -gt 0 (-and -not \$foreignConfig)?\) \{",
+            ps)
+        self.assertIsNotNone(match, "the reuse-branch success condition was not found")
+        self.assertIn("-not $foreignConfig", match.group(0),
+                      "the 'config matches' message is still reachable while a "
+                      "foreign MediaMTX is running")
+        self.assertIn("are NOT compared", ps,
+                      "the reuse message must state that path-level settings, "
+                      "including the codec-bridge hooks, were not compared")
+
+    def test_launcher_derives_the_webrtc_udp_port_from_the_config(self):
+        """The UDP pre-flight must not be able to drift from the config it guards.
+
+        `$webrtcUdpPort` was the one value in the launcher that was hard-coded
+        while everything else is derived from mediamtx.yml, so editing
+        `webrtcLocalUDPAddress` left the conflict check probing a port nothing
+        binds: the guard silently went dead on exactly the edit it exists to
+        catch. It has to be parsed out of the file, with the literal kept only
+        as a fallback."""
+        ps = read_text(LAUNCHER_PATH)
+        self.assertIn("webrtcLocalUDPAddress", ps,
+                      "the WebRTC UDP port must be derived from mediamtx.yml")
+        config = read_text(ROOT / "mediamtx.yml")
+        m = re.search(r"^\s*webrtcLocalUDPAddress:\s*\S*?:(\d{1,5})\s*$", config, re.MULTILINE)
+        self.assertIsNotNone(m, "webrtcLocalUDPAddress has no parseable port")
+        self.assertIn("Select-String", ps,
+                      "the port must be read out of the config at launch time")
+        self.assertNotRegex(
+            ps, r"(?m)^\$webrtcUdpPort\s*=\s*\d+\s*$",
+            "the WebRTC UDP port is still pinned to a bare literal, so editing "
+            "webrtcLocalUDPAddress leaves the conflict check probing a dead port")
+
     def test_launcher_stale_config_is_a_warning_not_a_site_outage(self):
         """The comparison used to `throw`, and the launcher's outer catch exits
         before Node and cloudflared start — so a stale MediaMTX config took the
@@ -4772,8 +4980,8 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         connect = self._js_function_body(app, "connectStream")
         self.assertIsNotNone(connect, "connectStream not found")
         watchdog = re.search(r"connectTimeout = setTimeout\(.*?,\s*(\d+)\);", connect, re.DOTALL)
-        gather = re.search(r"gatherTimeout = setTimeout\([^,]+,\s*(\d+)\)", connect)
-        post = re.search(r"whepPostTimeout = setTimeout\([^,]+,\s*(\d+)\)", connect)
+        gather = re.search(r"gatherCap = setTimeout\([^,]+,\s*(\d+)\)", connect)
+        post = re.search(r"myPostTimeout = setTimeout\([^,]+,\s*(\d+)\)", connect)
         self.assertIsNotNone(watchdog, "the connect watchdog was not found")
         self.assertIsNotNone(gather, "the ICE gather cap was not found")
         self.assertIsNotNone(post, "the WHEP POST cap was not found")
