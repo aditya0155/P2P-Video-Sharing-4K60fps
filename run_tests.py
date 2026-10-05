@@ -4405,12 +4405,23 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
                       "the WebRTC UDP port must be derived from mediamtx.yml")
         self.assertIn("webrtcLocalUDPAddress:", read_text(ROOT / "mediamtx.yml"),
                       "the key the launcher parses must still exist in the config")
-        self.assertNotRegex(
-            ps, r"(?m)^\$webrtcUdpPort\s*=\s*8189\s*$",
-            "the WebRTC UDP port is still pinned to a literal, so editing "
-            "webrtcLocalUDPAddress leaves the conflict check probing a dead port")
         self.assertIn("Select-String", ps,
                       "the port must be read out of the config at launch time")
+        # The literal is kept deliberately, as the fallback for a missing or
+        # unreadable config, so the invariant is ORDER: the parse must come
+        # after it and overwrite it, otherwise the fallback is what survives and
+        # the guard silently probes the wrong port again.
+        fallback = re.search(r"(?m)^\$webrtcUdpPort\s*=\s*8189\s*$", ps)
+        self.assertIsNotNone(fallback,
+                             "the literal fallback for $webrtcUdpPort should stay")
+        parsed = re.search(r"\$webrtcUdpPort\s*=\s*\$parsedPort", ps)
+        self.assertIsNotNone(parsed,
+                             "the port parsed out of mediamtx.yml must be assigned "
+                             "to $webrtcUdpPort, not discarded")
+        self.assertGreater(parsed.start(), fallback.start(),
+                           "the config parse must come AFTER the literal fallback "
+                           "so it overwrites it; otherwise the hard-coded port wins "
+                           "and editing webrtcLocalUDPAddress is a silent no-op")
         # And the value it parses must be the one the config actually declares.
         config = read_text(ROOT / "mediamtx.yml")
         m = re.search(r"^\s*webrtcLocalUDPAddress:\s*\S*?:(\d{1,5})\s*$", config, re.MULTILINE)
