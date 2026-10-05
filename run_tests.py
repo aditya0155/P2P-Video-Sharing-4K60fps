@@ -527,6 +527,38 @@ class LaptopHostChecks(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("configuration file is valid", result.stdout.lower())
 
+    def test_mediamtx_runs_in_the_folder_that_owns_the_hooks(self):
+        # mediamtx.yml invokes the bridge as a RELATIVE command
+        # (`node "codec_bridge.js"`) on purpose: that config is shared by every
+        # checkout on this machine and must not embed a machine-specific
+        # absolute path. MediaMTX therefore resolves those hooks against its OWN
+        # working directory, which it inherits from the launcher.
+        #
+        # start_host.bat masks this by `cd /d "%~dp0"` first, so the launcher
+        # alone has to carry the guarantee. Without -WorkingDirectory, launching
+        # `powershell -File start_host.ps1` from anywhere else -- notably from a
+        # DIFFERENT checkout of this same repo -- makes MediaMTX run that copy's
+        # codec_bridge.js while the config and the web server still come from
+        # this folder: renditions produced by the wrong code, with nothing in
+        # the logs to say so.
+        launcher = read_text(LAUNCHER_PATH)
+        start = re.search(
+            r"Start-Process\s+-FilePath\s+\$mediamtxPath\b[^\n]*", launcher)
+        self.assertIsNotNone(start, "the MediaMTX launch line was not found")
+        self.assertIn(
+            "-WorkingDirectory $scriptDir", start.group(0),
+            "MediaMTX must be launched with -WorkingDirectory $scriptDir: the "
+            "codec_bridge.js hooks are relative, so MediaMTX resolves them "
+            "against its own cwd, which is otherwise just wherever the user "
+            "launched from (possibly another checkout of this repo)",
+        )
+        # ...and the launcher must anchor every path it hands out to its own
+        # location, not to the caller's working directory.
+        self.assertIn("$scriptDir = Split-Path -Parent $PSCommandPath", launcher,
+                      "the launcher must anchor its paths to its own location")
+        self.assertIn("$configPath = Join-Path $scriptDir 'mediamtx.yml'", launcher)
+        self.assertIn("$serverPath = Join-Path $scriptDir 'server.js'", launcher)
+
     def test_codec_bridge_is_wired_into_the_mediamtx_config(self):
         # The companion-rendition bridge must be fully reachable from the
         # config: loopback RTSP (the only protocol that can serve AV1 back
