@@ -399,7 +399,23 @@ try {
         }
 
         Write-Host 'Starting MediaMTX on this laptop...' -ForegroundColor Cyan
-        $mediamtxProcess = Start-Process -FilePath $mediamtxPath -ArgumentList "`"$configPath`"" -PassThru -NoNewWindow
+        # -WorkingDirectory is load-bearing, not tidiness. mediamtx.yml runs the
+        # bridge hooks as RELATIVE commands (`node "codec_bridge.js"`), because
+        # that config file is shared by every checkout on this machine and must
+        # not embed a machine-specific absolute path. MediaMTX therefore resolves
+        # those hooks against ITS OWN working directory, which it inherits from
+        # this launcher. Without an explicit value that is simply whichever
+        # directory the launcher was started from.
+        #
+        # start_host.bat happens to `cd /d "%~dp0"` first, which papers over it.
+        # But running `powershell -File start_host.ps1` from anywhere else -- a
+        # different project folder, or a DIFFERENT CHECKOUT of this same repo --
+        # silently runs that copy's codec_bridge.js instead of this one's, or
+        # fails to find it at all. The symptom is the confusing one: the web
+        # server and the config both come from THIS folder, the renderer does
+        # not, and the renditions look wrong with nothing in the logs to explain
+        # it.
+        $mediamtxProcess = Start-Process -FilePath $mediamtxPath -ArgumentList "`"$configPath`"" -WorkingDirectory $scriptDir -PassThru -NoNewWindow
 
         # MediaMTX's per-reader write path (pion -> UDP socket) is CPU-sensitive,
         # and this box runs OBS capture, the codec bridge's ffmpeg, MediaMTX,
