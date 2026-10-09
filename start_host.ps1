@@ -165,11 +165,34 @@ try {
         throw "Cloudflare tunnel config exists but cloudflared.exe is missing: $cloudflaredPath"
     }
 
+    # The bundled ffmpeg is a WARNING, not a throw, because a plain RTMP H.264
+    # broadcast plays fine without it — the bridge is only needed for the
+    # complementary renditions and for AV1/WHIP sources. It is checked anyway
+    # because ffmpeg_win/ is GITIGNORED: it exists in the main checkout and is
+    # absent from every git worktree and fresh clone, so starting the host from a
+    # worktree silently transcodes with whatever `ffmpeg` is first on PATH instead
+    # of the 8.1 build this project depends on. That divergence looks like
+    # "my change had no effect" or "the AV1 source stalls on the RTSP leg", and
+    # nothing downstream mentions the encoder, so it is named here at startup.
+    $bundledFfmpeg = Join-Path $scriptDir 'ffmpeg_win\ffmpeg-n8.1-latest-win64-gpl-shared-8.1\bin\ffmpeg.exe'
+    if (-not (Test-Path -LiteralPath $bundledFfmpeg -PathType Leaf)) {
+        if ($env:BRIDGE_FFMPEG) {
+            Write-Host "Using BRIDGE_FFMPEG override: $env:BRIDGE_FFMPEG" -ForegroundColor Yellow
+        } else {
+            Write-Host 'WARNING: the bundled ffmpeg is missing, so renditions will fall back to' -ForegroundColor Yellow
+            Write-Host "         whatever 'ffmpeg' is first on PATH: $bundledFfmpeg" -ForegroundColor Yellow
+            Write-Host '         ffmpeg_win/ is gitignored, so it is present in the main checkout but' -ForegroundColor Yellow
+            Write-Host '         NOT in a git worktree or a fresh clone. A different ffmpeg build changes' -ForegroundColor Yellow
+            Write-Host '         encoder output, and 8.0 lacks the AV1 RTP depacketizer fix this project needs.' -ForegroundColor Yellow
+            Write-Host '         Copy ffmpeg_win/ across, or set BRIDGE_FFMPEG, if renditions or an AV1 source misbehave.' -ForegroundColor Yellow
+        }
+    }
+
     # WHICH CHECKOUT IS ACTUALLY STARTING.
     #
-    # This launcher resolves everything against its OWN directory (`$scriptDir`),
+    # This launcher resolves everything against its OWN directory ($scriptDir),
     # so a double-click here always starts this checkout — which is correct. The
-    # trap is the opposite one: this repo has ~40 git worktrees PLUS a main
+    # trap is the opposite one: this repo has many git worktrees PLUS a main
     # checkout, every one of them carries its own copy of app.js/server.js, and
     # every port in mediamtx.yml is fixed (3000/8888/1935/8554/8889/8189). So if
     # the host is ALREADY running from a different checkout, this run fails to
@@ -177,7 +200,7 @@ try {
     # code — with no symptom except "my edit did nothing".
     #
     # Printing the absolute path makes that visible in the first line, and the
-    # two guards below catch the machine-local assets that make a worktree a
+    # guards below catch the machine-local assets that make a worktree a
     # strictly worse place to run from.
     $gitMarker = Join-Path $scriptDir '.git'
     $isWorktree = Test-Path -LiteralPath $gitMarker -PathType Leaf   # worktrees use a FILE, the main checkout a directory
@@ -185,24 +208,6 @@ try {
     Write-Host "  Starting host from: $scriptDir" -ForegroundColor White
     if ($isWorktree) {
         Write-Host '  NOTE: this is a git WORKTREE, not the main checkout.' -ForegroundColor Yellow
-    }
-
-    # Machine-local assets that .gitignore deliberately keeps out of git, and
-    # which therefore exist ONLY in the main checkout:
-    #   ffmpeg_win/              -> the ffmpeg 8.1 build the AV1 leg requires
-    #   cloudflared_config.yml   -> the tunnel remote viewers connect through
-    #   secrets.local.env        -> optional Cloudflare TURN credentials
-    # Missing ones are NOT fatal — an H.264 host with no tunnel still serves
-    # 127.0.0.1 — but they degrade silently, so they are named here rather than
-    # discovered later as "AV1 will not sync" or "remote viewers cannot connect".
-    $bundledFfmpeg = Join-Path $scriptDir 'ffmpeg_win\ffmpeg-n8.1-latest-win64-gpl-shared-8.1\bin\ffmpeg.exe'
-    if (-not (Test-Path -LiteralPath $bundledFfmpeg -PathType Leaf)) {
-        Write-Host '  WARNING: bundled ffmpeg 8.1 not found (ffmpeg_win/ is gitignored).' -ForegroundColor Yellow
-        Write-Host '           An AV1 WHIP source will NOT sync without it; run the host from the main checkout.' -ForegroundColor Yellow
-    }
-    if (-not (Test-Path -LiteralPath $tunnelConfigPath -PathType Leaf)) {
-        Write-Host '  WARNING: cloudflared_config.yml not found, so no public tunnel will start.' -ForegroundColor Yellow
-        Write-Host '           Remote viewers cannot connect; 127.0.0.1 will work. Run setup_cloudflared.ps1 from the main checkout.' -ForegroundColor Yellow
     }
     Write-Host ''
 

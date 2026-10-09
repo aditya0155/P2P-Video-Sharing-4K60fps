@@ -2416,6 +2416,37 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertIn("function resolveFfmpegBinary(", bridge, "bundled-ffmpeg resolver missing")
         self.assertIn("ffmpeg_win", bridge, "bundled ffmpeg path missing")
         self.assertIn("process.env.BRIDGE_FFMPEG", bridge, "BRIDGE_FFMPEG override missing")
+
+        # The PATH fallback must be ANNOUNCED, not taken silently.
+        #
+        # `ffmpeg_win/` is gitignored, so it is present in the main checkout and
+        # absent from every git worktree and every fresh clone — which is exactly
+        # where code gets edited. The resolver used to return a bare `'ffmpeg'`
+        # with no diagnostic, so a worktree operator silently transcoded with
+        # whatever ffmpeg was first on PATH: a different build, without the AV1
+        # RTP depacketizer fix (d12791ef) that the bridge exists to rely on. The
+        # host starts, the local page plays, and the symptom is that edits appear
+        # to do nothing — or an AV1/WHIP source stalls on the RTSP leg — neither
+        # of which points at the encoder. `FFMPEG` must also stay a plain string,
+        # because the ffprobe sibling derivation branches on `!== 'ffmpeg'`.
+        self.assertIn("reportFfmpegResolution", bridge,
+                      "the resolved ffmpeg must be reported at startup")
+        self.assertIn("reportFfmpegResolution();", bridge,
+                      "the startup report must actually be called")
+        self.assertIn("PATH fallback", bridge,
+                      "the resolver must record that it fell back to PATH")
+        self.assertIn("FALLING BACK TO PATH", bridge,
+                      "a PATH fallback must be announced loudly, naming the missing path")
+        self.assertIn("gitignored", bridge,
+                      "the fallback must explain the gitignore/worktree cause, not just the symptom")
+        self.assertIn("const FFMPEG = FFMPEG_RESOLVED.binary;", bridge,
+                      "FFMPEG must stay a plain string for the ffprobe sibling derivation")
+        # The launcher must surface the same condition before the stream starts.
+        launcher = read_text(LAUNCHER_PATH)
+        self.assertIn("ffmpeg_win", launcher,
+                      "the launcher must check for the gitignored bundled ffmpeg")
+        self.assertIn("BRIDGE_FFMPEG", launcher,
+                      "the launcher must name the override that bypasses the check")
         # The tunable env defaults are load-bearing for the mediamtx wiring test.
         self.assertIn("process.env.BRIDGE_RTMP_PORT || '1935'", bridge)
         self.assertIn("process.env.RTSP_PORT || '8554'", bridge)
@@ -3641,12 +3672,35 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         # and pinning either one turns this into a change-detector.
         switch_at = code.find("latencyModeBtn.addEventListener('click'")
         self.assertGreater(switch_at, 0, "the latency-mode switch must exist at all")
-        switch_body = code[switch_at:switch_at + 2000]
+        # Bound the window to the HANDLER BODY, not an arbitrary character
+        # count: the retarget loop sits ~2.9 KB into the listener (past the
+        # mode table, the localStorage write and the adaptive resets), so a
+        # fixed slice silently excluded it and every assertion below passed
+        # vacuously -- including on a build that only retargeted video.
+        switch_end = code.find("\n    });", switch_at)
+        self.assertGreater(switch_end, switch_at, "the latency-mode listener must be bounded")
+        switch_body = code[switch_at:switch_end]
         self.assertIn("getReceivers()", switch_body,
                       "the latency-mode switch must walk every receiver, not just one")
         self.assertIn("applyPlayoutDelay(r, r.track.kind)", switch_body,
                       "the latency-mode switch must retarget both receivers immediately, "
                       "with the same target for audio and video")
+        # ...and it must NOT filter the loop by kind. The lip-sync bug this test
+        # exists for is precisely "only the video receiver was retargeted".
+        # A regex for a guarded call misses the inline form
+        # (`if (r.track && r.track.kind === 'video' && applyPlayoutDelay(...))`),
+        # where the filter sits INSIDE the condition, so the check is structural:
+        # take the text between the receiver loop and the call and require that
+        # no kind comparison appears in it.
+        call_at = switch_body.find("applyPlayoutDelay(r, r.track.kind)")
+        self.assertGreater(call_at, 0, "the retarget call must be inside the handler")
+        loop_at = switch_body.rfind("forEach", 0, call_at)
+        self.assertGreater(loop_at, 0, "the retarget must happen inside a receiver loop")
+        between = switch_body[loop_at:call_at]
+        self.assertNotRegex(between, r"\.kind\s*===",
+                            "the latency-mode switch must not gate the playout write on a "
+                            "track kind: that retargets only one receiver and reintroduces "
+                            "the audio/video lip-sync offset")
 
     def test_stress_raise_releases_on_a_clock_not_a_quiet_streak(self):
         """The raise must not latch.
@@ -4792,10 +4846,98 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertIsNotNone(m, "webrtcLocalUDPAddress has no parseable port")
         self.assertIn("Select-String", ps,
                       "the port must be read out of the config at launch time")
-        self.assertNotRegex(
-            ps, r"(?m)^\$webrtcUdpPort\s*=\s*\d+\s*$",
-            "the WebRTC UDP port is still pinned to a bare literal, so editing "
-            "webrtcLocalUDPAddress leaves the conflict check probing a dead port")
+        # The literal survives as the FALLBACK for a missing/unreadable config,
+        # which is legitimate. What must not happen is it being the only source:
+        # the parsed value has to be able to REASSIGN it, and to be parsed from
+        # the key rather than from a second hard-coded copy of the number.
+        self.assertRegex(
+            ps, r"\$webrtcUdpPort\s*=\s*\$parsedPort",
+            "the parsed port must be assigned to $webrtcUdpPort, or the literal "
+            "is still the only source and the check can drift from the config")
+        self.assertRegex(
+            ps, r"webrtcLocalUDPAddress:\s*\\s\*",
+            "the port must be read by matching the webrtcLocalUDPAddress key, "
+            "not by assuming a fixed line number or column")
+
+    def test_launcher_detects_a_mediamtx_started_from_another_checkout(self):
+        """"config matches mediamtx.yml" must not be able to hide the case where
+        the running MediaMTX belongs to a DIFFERENT copy of this project.
+
+        This repo is checked out many times over (a main checkout plus one
+        worktree per task) and sibling worktrees usually sit on the SAME commit,
+        so their mediamtx.yml files are byte-identical. The launcher's guard
+        compares the running instance's VALUES against the file on disk, so in
+        that situation every comparison passes and it reports a clean match --
+        while `runOnAvailable: node "codec_bridge.js"` is a RELATIVE path
+        resolved against MediaMTX's working directory, meaning the bridge
+        actually transcoding is the other checkout's file. Editing
+        codec_bridge.js then does nothing at all, with the launcher actively
+        reassuring you that it is in effect.
+
+        So the guard has to ask WHICH config file the running process was started
+        with, which is available from its own command line.
+        """
+        ps = self.launcher
+        self.assertIn("$foreignConfig", ps,
+                      "the launcher must detect a reused MediaMTX that was "
+                      "started from a different copy of this project")
+        self.assertIn("Get-CimInstance Win32_Process", ps,
+                      "the running instance's own command line is the signal that "
+                      "names the config file it was started with")
+        self.assertIn("Resolve-Path -LiteralPath $liveConfigPath", ps,
+                      "the live config path must be resolved before it can be "
+                      "compared with this checkout's")
+        # The reassuring message must not be reachable while a foreign config is
+        # in use, and must not claim a scope it does not have: the scalar reader
+        # is anchored at column 0, so the whole `paths:` block -- which holds the
+        # rendition hooks -- is never compared.
+        match = re.search(
+            r"if \(\$configVerified -and \$compared -gt 0 (-and -not \$foreignConfig)?\) \{",
+            ps)
+        self.assertIsNotNone(match, "the reuse-branch success condition was not found")
+        self.assertIn("-not $foreignConfig", match.group(0),
+                      "the 'config matches' message is still reachable while a "
+                      "foreign MediaMTX is running")
+        self.assertIn("are NOT compared", ps,
+                      "the reuse message must state that path-level settings, "
+                      "including the codec-bridge hooks, were not compared")
+        self.assertIn("runOnAvailable", ps,
+                      "the warning must explain that the rendition hook is a "
+                      "relative path, since that is why the other copy wins")
+
+    def test_launcher_derives_the_webrtc_udp_port_from_the_config(self):
+        """The UDP pre-flight must not be able to drift from the config it guards.
+
+        `$webrtcUdpPort` was the one value in the launcher that was hard-coded
+        while everything else is derived from mediamtx.yml, so editing
+        `webrtcLocalUDPAddress` left the conflict check probing a port nothing
+        binds: the guard silently went dead on exactly the edit it exists to
+        catch. It has to be parsed out of the file, with the literal kept only
+        as a fallback."""
+        ps = self.launcher
+        # The literal is kept only as a fallback for a missing/unreadable file,
+        # so the thing to prove is that it is OVERRIDDEN from the config, not
+        # that it is absent.
+        self.assertIn("webrtcLocalUDPAddress", ps,
+                      "the WebRTC UDP port must be derived from mediamtx.yml")
+        self.assertIn("Select-String", ps,
+                      "the port must be read out of the config at launch time")
+        derive = re.search(
+            r"\$webrtcUdpPort\s*=\s*\$parsedPort", ps)
+        self.assertIsNotNone(derive,
+                             "the parsed port from mediamtx.yml must actually be "
+                             "assigned to $webrtcUdpPort, not merely computed")
+        # The derivation must sit after the fallback literal, not before it.
+        literal = ps.find("$webrtcUdpPort = 8189")
+        self.assertGreaterEqual(literal, 0, "the fallback literal is gone entirely")
+        self.assertLess(literal, derive.start(),
+                        "the config-derived port must override the fallback literal, "
+                        "not be overwritten by it")
+        # And the key it parses must still exist in the config.
+        config = read_text(ROOT / "mediamtx.yml")
+        self.assertIsNotNone(
+            re.search(r"^\s*webrtcLocalUDPAddress:\s*\S*?:(\d{1,5})\s*$", config, re.MULTILINE),
+            "webrtcLocalUDPAddress has no parseable port in mediamtx.yml")
 
     def test_launcher_stale_config_is_a_warning_not_a_site_outage(self):
         """The comparison used to `throw`, and the launcher's outer catch exits
