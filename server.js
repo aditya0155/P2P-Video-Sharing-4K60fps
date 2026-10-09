@@ -36,7 +36,7 @@ const STATIC_DIR = __dirname;
 let checkoutDescription = null;
 function describeCheckout() {
     // Memoised. This is called once per HTTP response to stamp a header, and
-    // re-running it would spawn `git` TWICE PER REQUEST — a synchronous child
+    // re-running it would spawn `git` TWICE PER REQUEST - a synchronous child
     // process on the same thread that serves video signaling. The values cannot
     // change while the process runs: the serving directory is __dirname and the
     // checked-out branch/SHA are fixed for its lifetime.
@@ -68,6 +68,45 @@ function describeCheckout() {
     return checkoutDescription;
 }
 
+// --- Which copy is running, for the browser side ----------------------------
+// The banner above is what the operator sees in the launcher window. This is
+// the same fact for the other place it is actually needed: a stale server from
+// another worktree answers /stream-api/** perfectly happily, so any check run
+// against localhost:3000 silently validates the OTHER checkout. Edits then
+// appear to have no effect, or worse, appear to be verified when they were never
+// exercised at all.
+//
+// Loopback-only. It reports a local filesystem path and the process id, which is
+// operator-facing diagnostics and nothing more - publishing it would tell anyone
+// who can reach the public tunnel the operator's username and directory layout.
+// isDirectLocal() is the same test that gates the HOST chat badge, so the two
+// agree on who counts as local.
+const HOST_DIR = path.resolve(__dirname);
+const HOST_STARTED_AT = new Date().toISOString();
+
+function handleHostInfo(req, res) {
+    if (!isDirectLocal(req)) {
+        res.writeHead(403, setCorsHeaders({
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL
+        }));
+        res.end(JSON.stringify({ error: 'Host diagnostics are local-only.' }));
+        return;
+    }
+    const body = JSON.stringify({
+        dir: describeCheckout().dir,
+        branch: describeCheckout().branch,
+        sha: describeCheckout().sha,
+        pid: process.pid,
+        startedAt: HOST_STARTED_AT
+    });
+    res.writeHead(200, setCorsHeaders({
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': CACHE_CONTROL,
+        'Content-Length': Buffer.byteLength(body)
+    }));
+    res.end(body);
+}
 const CACHE_CONTROL = 'no-store, no-cache, must-revalidate, max-age=0';
 // Static page assets are version-busted via ?v= in index.html, so browsers may
 // keep them but must revalidate (ETag) before reuse. This turns every repeat
@@ -361,9 +400,9 @@ function proxyToMediaMTX(req, res, requestUrl) {
             return;
         }
         console.error(`[Proxy] MediaMTX at ${MEDIAMTX_HOST}:${targetPort} is unavailable:`, error.message);
-        // setCorsHeaders matters here: without it the browser reports an opaque
-        // CORS failure and the viewer never sees the one message that tells them
-        // what to do about it.
+        // setCorsHeaders matters here as much as on any other branch: without it
+        // this 502 is an opaque CORS failure in the browser, so the one message
+        // that actually tells the operator what to do is never seen.
         res.writeHead(502, setCorsHeaders({
             'Content-Type': 'application/json; charset=utf-8',
             'Cache-Control': CACHE_CONTROL
@@ -526,31 +565,68 @@ function isDirectLocal(req) {
 // actually configured to sit behind the Cloudflare tunnel, which is the one
 // deployment that rewrites them. Otherwise the real socket address is used:
 // loopback for the tunnel, or the Tailscale/LAN address for a direct viewer.
+// Behind the Cloudflare Tunnel, cloudflared connects over LOOPBACK, so
+// req.socket.remoteAddress is 127.0.0.1 for EVERY remote viewer: keying the
+// limit on the socket put the whole room in one bucket, and a single chatty
+// viewer locked everyone else out of chat and reactions (verified: 8 messages
+// from one client produced [200,200,200,200,200,429,429,429] for every viewer).
+//
+// cf-connecting-ip is the header Cloudflare overwrites on every proxied request,
+// so its value cannot be chosen by the caller - but that guarantee comes from
+// Cloudflare, not from this process, so it is honoured ONLY when the request
+// actually arrived over loopback. server.listen() binds 127.0.0.1, so in the
+// shipped deployment the only peers are cloudflared and local tools. The loopback
+// test is what keeps that true if the bind address is ever widened to a LAN or
+// Tailscale interface: a directly-connecting client could then forge the header,
+// and it must not be believed. Trusting it unconditionally was measured to
+// reopen the bypass under a different header name (12 spoofed values produced
+// 12x200 and zero 429s).
+//
+// x-forwarded-for stays behind the explicit opt-in for the ordinary reason: any
+// client that reaches this server directly can set it to anything, and a unique
+// value per request is a unique rate-limit key per request.
 const TRUST_FORWARDED_HEADERS = Boolean(
     process.env.CF_TUNNEL_HOST || process.env.TRUST_PROXY_HEADERS === '1'
 );
 function clientIpForRateLimit(req) {
-    // `cf-connecting-ip` is the one header Cloudflare itself sets and overwrites
-    // on every request arriving through the tunnel, so a client cannot forge it
-    // THERE. Behind the tunnel it is also the only way to tell viewers apart:
-    // this server binds 127.0.0.1, so `cloudflared` dials it over loopback and
+    const remoteAddress = (req.socket && req.socket.remoteAddress) || '';
+    const fromLoopback = remoteAddress === '127.0.0.1'
+        || remoteAddress === '::1'
+        || remoteAddress === '::ffff:127.0.0.1';
+    // `cf-connecting-ip` is the one header Cloudflare itself overwrites on every
+    // request arriving through the tunnel, so a client cannot forge it THERE.
+    // Behind the tunnel it is also the only way to tell viewers apart at all:
+    // this server binds 127.0.0.1, so cloudflared dials it over loopback and
     // every remote viewer would otherwise resolve to the same rate-limit key --
     // one chatty client locking every other viewer out of chat and reactions
     // (verified: 8 messages -> 200,200,200,200,200,429,429,429).
     //
-    // It is gated on TRUST_FORWARDED_HEADERS because that flag is the explicit
-    // statement "this process really is behind the tunnel, which rewrites these
-    // headers". The peer address CANNOT be that statement: this process listens
-    // on loopback only, so the Tailscale path (`tailscale serve`, which also
-    // proxies over loopback) and any local client look identical to the tunnel
-    // here. Trusting on that basis would let a tailnet or local client mint a
-    // fresh bucket per request -- exactly the bypass the old unguarded
-    // x-forwarded-for chain had. start_host.ps1 sets CF_TUNNEL_HOST when it
-    // actually starts cloudflared, so the deployment that needs this is the one
-    // that enables it.
+    // TWO conditions are required before it is believed, and neither is
+    // sufficient on its own:
+    //
+    //   TRUST_FORWARDED_HEADERS - the peer address cannot be the signal here.
+    //     cloudflared, Tailscale serve and a local client all arrive on loopback
+    //     and look identical, so trusting the header on that basis would let a
+    //     tailnet or local client mint a fresh bucket per request -- exactly the
+    //     bypass the old unguarded x-forwarded-for chain had. start_host.ps1 sets
+    //     CF_TUNNEL_HOST only when it actually starts cloudflared, so the
+    //     deployment that needs per-viewer limits is the one that enables them.
+    //
+    //   fromLoopback - that flag keys on CONFIGURATION, not on the connection.
+    //     If the bind address is ever widened to a LAN or Tailscale interface, a
+    //     directly-connecting client reaches the server and sets the header
+    //     itself, and Cloudflare's guarantee does not extend to it. Measured
+    //     under unconditional trust: 12 spoofed values produced 12x200 and zero
+    //     429s.
+    const cfIp = req.headers['cf-connecting-ip'];
+    if (TRUST_FORWARDED_HEADERS && fromLoopback
+        && typeof cfIp === 'string' && cfIp.trim()) {
+        return cfIp.trim();
+    }
+    // x-forwarded-for stays behind the explicit opt-in for the ordinary reason:
+    // any client that reaches this server directly can set it to anything, and a
+    // unique value per request is a unique rate-limit key per request.
     if (TRUST_FORWARDED_HEADERS) {
-        const cfIp = req.headers['cf-connecting-ip'];
-        if (typeof cfIp === 'string' && cfIp.trim()) return cfIp.trim();
         const xff = req.headers['x-forwarded-for'];
         if (typeof xff === 'string' && xff) {
             // First hop only: the rest of the chain is client-supplied.
@@ -558,8 +634,7 @@ function clientIpForRateLimit(req) {
             if (first) return first;
         }
     }
-    const peer = (req.socket && req.socket.remoteAddress) || '';
-    return peer || 'unknown';
+    return remoteAddress || 'unknown';
 }
 
 // Per-IP reaction limits are only half the story: aggregate rate is
@@ -1135,6 +1210,19 @@ const server = http.createServer((req, res) => {
             handleTurnCredentials(req, res);
             return;
         }
+        if (requestUrl.pathname === '/stream-api/host-info') {
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+                res.writeHead(405, setCorsHeaders({
+                    'Allow': 'GET, HEAD',
+                    'Content-Type': 'text/plain; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL
+                }));
+                res.end('405 Method Not Allowed');
+                return;
+            }
+            handleHostInfo(req, res);
+            return;
+        }
         if (requestUrl.pathname === '/stream-api/chat' || requestUrl.pathname.startsWith('/stream-api/chat/')) {
             handleChat(req, res, requestUrl);
             return;
@@ -1142,6 +1230,13 @@ const server = http.createServer((req, res) => {
         // Everything else under /stream-api/v3/** is the MediaMTX control plane.
         // It is unauthenticated upstream and publicly reachable here, so only the
         // one read-only endpoint the player actually uses is allowed through.
+        // Verified against the real binary before this guard existed:
+        //   GET    /stream-api/v3/config/global/get       -> 200, dumped the config
+        //   PATCH  /stream-api/v3/config/global/set       -> a config WRITE
+        //   DELETE /stream-api/v3/paths/list/<p>/readystate -> kills the live stream
+        // i.e. a one-request remote config rewrite, or a one-request kill of the
+        // broadcast, from anyone on the internet - and because this process sets
+        // CORS to *, from any page the streamer visits, with no preflight.
         if (requestUrl.pathname.startsWith('/stream-api/v3/')
             && !isAllowedControlApiRequest(requestUrl.pathname, req.method)) {
             res.writeHead(403, setCorsHeaders({
@@ -1254,12 +1349,63 @@ const server = http.createServer((req, res) => {
     });
 });
 
+// Ask whoever already owns the port which copy of this project they are, and say
+// so plainly. Returns a promise the caller MUST await before exiting:
+// process.exit() discards pending I/O, so an un-awaited lookup prints nothing
+// and leaves the ambiguity exactly where it started. Bounded and best-effort -
+// this runs on the failure path of a process about to exit, so it must never
+// hang or throw. An incumbent that predates /stream-api/host-info, or is not a
+// copy of this project at all, simply does not answer and the generic message
+// stands.
+function describePortHolder(port = PORT) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; resolve(); } };
+        const request = http.request({
+            host: '127.0.0.1',
+            port,
+            path: '/stream-api/host-info',
+            method: 'GET',
+            agent: false
+        }, (response) => {
+            let raw = '';
+            response.setEncoding('utf8');
+            response.on('data', (chunk) => { raw += chunk; });
+            response.on('end', () => {
+                let info = null;
+                try { info = JSON.parse(raw); } catch (err) { info = null; }
+                if (info && typeof info.dir === 'string') {
+                    const same = path.resolve(info.dir) === HOST_DIR;
+                    console.error('  -> Port ' + port + ' is held by ' + (same
+                        ? 'ANOTHER server.js from THIS directory'
+                        : 'a server from a DIFFERENT copy of this project') + ':');
+                    console.error('     holder: ' + info.dir + ' (pid ' + info.pid
+                        + ', started ' + info.startedAt + ')');
+                    console.error('     this:   ' + HOST_DIR);
+                    if (!same) {
+                        console.error('     It is serving the OTHER copy code, so a check against');
+                        console.error('     http://127.0.0.1:' + port + '/ is NOT testing your edits.');
+                    }
+                }
+                finish();
+            });
+        });
+        request.on('error', () => finish());
+        request.setTimeout(1500, () => { request.destroy(); finish(); });
+        request.on('close', finish);
+        request.end();
+    });
+}
+
 // A second launcher (or any other process grabbing the port) must fail with
 // a readable reason, not a raw EADDRINUSE stack trace in the launcher window.
 server.on('error', (error) => {
     if (error && error.code === 'EADDRINUSE') {
         console.error(`Port ${PORT} is already in use. Stop the other site server or set PORT to a free port before starting.`);
-        process.exit(1);
+        // NAME the incumbent: with dozens of worktrees on one machine, "port 3000
+        // is in use" is ambiguous in exactly the way that causes silent wrong
+        // answers. Awaited, because process.exit() discards pending I/O.
+        describePortHolder().then(() => process.exit(1), () => process.exit(1));
         return;
     }
     // Every OTHER error used to be fatal too, which contradicts the
@@ -1331,7 +1477,7 @@ server.listen(PORT, '127.0.0.1', () => {
         + (checkout.linkedWorktree ? '  (git linked worktree)' : ''));
     if (checkout.linkedWorktree) {
         console.log('Note: this is a git LINKED WORKTREE. Sibling worktrees and the main '
-            + 'checkout serve the same ports — if the page does not reflect your edits, '
+            + 'checkout serve the same ports - if the page does not reflect your edits, '
             + 'another copy is holding the port. Compare the path above with your editor.');
     }
     console.log(`Local page:    http://127.0.0.1:${PORT}/streaming/`);
