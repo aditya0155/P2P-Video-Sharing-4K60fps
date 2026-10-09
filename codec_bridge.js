@@ -48,6 +48,7 @@
  */
 
 const { spawn, spawnSync, execSync } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -137,11 +138,44 @@ function reportFfmpegResolution() {
     logError('        or an AV1/WHIP source misbehave.');
 }
 
-// Overridable so a test (or a second bridge) can use an isolated record instead
-// of the shared per-user temp path, where two bridges would overwrite each other.
+// Per-CHECKOUT identity for this machine's shared temp directory.
+//
+// Two clones or git worktrees of this project on ONE machine must not share
+// the PID record or the GPU-decode memory, and the reason is not tidiness —
+// it is destructive. This repo currently has ~40 worktrees, so this is the
+// normal case here, not an edge case.
+//
+// The cleanup path decides whether to KILL a recorded PID by matching the
+// target process's command line against the recorded rendition target
+// (`$p.CommandLine -like '*live-av1*'`). That match key is the RTMP publish
+// URL from mediamtx.yml — `rtmp://127.0.0.1:1935/live-av1` — and BOTH the port
+// and the target name are FIXED CONSTANTS, byte-identical in every checkout.
+// So with one shared PID file, a `--cleanup` (which MediaMTX fires
+// automatically via runOnUnavailable whenever a path goes away, in ANY
+// checkout) reads the other checkout's record, its guard MATCHES, and kills a
+// live transcoder belonging to a different working tree. That publisher drop
+// closes every WHEP reader session on the path — a room-wide reconnect caused
+// by someone working in an unrelated directory.
+//
+// The GPU-decode memory has the same shape: a 24-hour "this NVDEC decoder is
+// poisoned" block recorded while debugging in one checkout silently pushed
+// every OTHER checkout onto software decode for a day.
+//
+// Hashing the resolved checkout root gives each working tree its own pair of
+// files, so neither can read, poison, or act on the other's. Lower-cased so a
+// Windows path differing only in case still resolves to one identity.
+const CHECKOUT_ROOT = path.resolve(__dirname);
+const CHECKOUT_KEY = crypto
+    .createHash('sha256')
+    .update(CHECKOUT_ROOT.toLowerCase())
+    .digest('hex')
+    .slice(0, 12);
+
+// Overridable so a test can use an isolated record instead of this checkout's
+// own, which would collide with a real broadcast from the same tree.
 const PID_FILE = process.env.BRIDGE_PID_FILE
     ? path.resolve(process.env.BRIDGE_PID_FILE)
-    : path.join(os.tmpdir(), 'rydius_codec_bridge.pid');
+    : path.join(os.tmpdir(), `rydius_${CHECKOUT_KEY}_codec_bridge.pid`);
 const VIDEO_CODECS = ['AV1', 'H264', 'H265', 'HEVC', 'VP8', 'VP9'];
 const MAX_CONSECUTIVE_FFMPEG_FAILURES = 10;
 // How long to wait before the give-up exit, so MediaMTX's runOnAvailableRestart
@@ -670,7 +704,13 @@ function buildFfmpegArgs(plan, ports = {}, decodeArgs = []) {
 // instead of repeating two crash cycles at every cold start. A successful
 // long GPU run clears the entry, so a fixed ffmpeg/driver re-enables the GPU
 // path automatically.
-const GPU_DECODE_STATE_FILE = path.join(os.tmpdir(), 'rydius_bridge_gpu_decode_state.json');
+// Per-checkout, for the same reason as PID_FILE above: the 24-hour NVDEC block
+// recorded here is a verdict about THIS machine's decoder reached from THIS
+// tree's source, and sharing it lets one checkout disable hardware decode in
+// another. `BRIDGE_GPU_STATE_FILE` overrides it for tests.
+const GPU_DECODE_STATE_FILE = process.env.BRIDGE_GPU_STATE_FILE
+    ? path.resolve(process.env.BRIDGE_GPU_STATE_FILE)
+    : path.join(os.tmpdir(), `rydius_${CHECKOUT_KEY}_bridge_gpu_decode_state.json`);
 const GPU_DECODE_BLOCK_MS = 24 * 60 * 60 * 1000;
 
 function readGpuDecodeState() {
@@ -761,6 +801,13 @@ function writePidFile(pid, targets) {
         fs.writeFileSync(PID_FILE, JSON.stringify({
             pid, targets, createdAt: Date.now(), exe: path.basename(FFMPEG),
             ownerPid: process.pid,
+            // Which checkout wrote this. The filename is already per-checkout,
+            // but BRIDGE_PID_FILE can still point two trees at one file, and
+            // cleanup() is the one place that KILLS a process. Recording the
+            // root lets it refuse a record it did not write instead of relying
+            // on the command-line match, which cannot distinguish checkouts
+            // (see CHECKOUT_KEY).
+            root: CHECKOUT_ROOT,
         }), 'utf8');
     } catch (err) {
         logError(`could not write PID file: ${err.message}`);
@@ -853,6 +900,23 @@ function cleanup() {
     }
     clearPidFile();
     if (!record || !Number.isInteger(record.pid)) return;
+    // A record naming a DIFFERENT checkout is not ours to act on. The
+    // command-line guard below cannot make this decision: its match key is the
+    // RTMP publish URL, whose port and target are fixed constants identical in
+    // every checkout, so with a shared PID file one tree's `--cleanup` would
+    // kill another tree's live transcoder — a publisher drop that closes every
+    // WHEP session on the path. With ~40 worktrees on this machine that was not
+    // hypothetical.
+    //
+    // A record with NO root predates this field and is still reclaimed: leaving
+    // it would strand the ffmpeg it describes. It can only be an orphan by the
+    // time its bridge is gone, because a live bridge now writes its own
+    // per-checkout file.
+    if (record.root && path.resolve(record.root).toLowerCase() !== CHECKOUT_ROOT.toLowerCase()) {
+        log(`cleanup: ignoring a PID record written by another checkout (${record.root}); `
+            + 'not killing its ffmpeg');
+        return;
+    }
     // No age gate here. The record is stamped once, when ffmpeg starts, and never
     // refreshed, so a "stale record" cut-off silently disabled this cleanup for
     // every broadcast longer than the cut-off — and clearPidFile() above has
