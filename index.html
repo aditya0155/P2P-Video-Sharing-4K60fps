@@ -28,7 +28,9 @@
     <!-- FontAwesome Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <!-- Custom CSS -->
-<link rel="stylesheet" href="/streaming/style.css?v=2.25.1">
+    <!-- Bumped past both parents (2.25.1 and 2.25.0): this merge changes style.css
+         AND app.js, so a viewer holding either parent's cached copy must refetch. -->
+<link rel="stylesheet" href="/streaming/style.css?v=2.26.0">
 </head>
 <body>
     <!-- Ambient Background -->
@@ -56,11 +58,12 @@
                     <span id="perf-toggle-label">Reduce effects</span>
                 </button>
 
-                <!-- Broadcast Studio: the no-install screen-share broadcaster.
-                     Kept as a real link (not a script-built click) so it opens
-                     in a new tab, works with middle-click, and is visible to
-                     a keyboard user as part of the page's normal tab order. -->
-                <a class="studio-link-btn" id="open-studio-btn" href="/streaming/studio?v=2.25.1" target="_blank" rel="noopener" title="Broadcast a screen, window or tab from this browser (opens in a new tab)" aria-label="Open the broadcast studio in a new tab">
+                <!-- Real link keeps the broadcaster reachable by keyboard and
+                     supports opening it in a separate tab. -->
+                <a class="perf-toggle-btn studio-launch-btn" id="studio-launch-btn"
+                   href="/streaming/studio?v=2.26.0" target="_blank" rel="noopener"
+                   title="Broadcast a screen, window or tab from this browser (opens in a new tab)"
+                   aria-label="Open the broadcast studio in a new tab">
                     <i class="fa-solid fa-tower-broadcast"></i>
                     <span>Broadcast</span>
                 </a>
@@ -98,6 +101,18 @@
                     <div class="volume-toast" id="volume-toast" role="status" aria-live="polite">
                         <i class="fa-solid fa-volume-high"></i>
                         <span id="volume-toast-text">100%</span>
+                    </div>
+
+                    <!-- Incoming Chat Notification Stack (host only).
+                         The host is usually watching the video, not the
+                         sidebar, so a viewer message that only lands in the
+                         chat log is one glance away from being missed.
+                         aria-hidden on purpose: #chat-messages is ALREADY an
+                         aria-live="polite" log, so a second live region would
+                         announce every message twice to a screen reader.
+                         See showChatNotification() in app.js. -->
+                    <div class="chat-toast-layer" id="chat-toast-layer" aria-hidden="true">
+                        <div class="chat-toast-more" id="chat-toast-overflow" hidden></div>
                     </div>
 
                     <!-- Floating Unmute Overlay -->
@@ -267,7 +282,7 @@
             <!-- Right Panel: Chat and Stream Info -->
             <section class="sidebar-section">
                 <div class="sidebar-tabs" role="tablist" aria-label="Stream panels">
-                    <button class="tab-btn active" id="tab-chat" role="tab" aria-selected="true" aria-controls="content-chat"><i class="fa-solid fa-comments"></i> Live Chat</button>
+                    <button class="tab-btn active" id="tab-chat" role="tab" aria-selected="true" aria-controls="content-chat"><i class="fa-solid fa-comments"></i> Live Chat<span class="tab-unread-badge" id="chat-unread-badge" hidden>0</span></button>
                     <button class="tab-btn" id="tab-info" role="tab" aria-selected="false" aria-controls="content-info" tabindex="-1"><i class="fa-solid fa-circle-info"></i> Stream info</button>
                     <div class="tab-indicator"></div>
                 </div>
@@ -347,6 +362,9 @@
                                 <h3>OBS Studio Settings</h3>
                             </div>
                             <p class="info-description">Select ingest protocol for OBS Studio setup:</p>
+                            <ul class="obs-instructions active">
+                                <li><span class="obs-key">No OBS?</span><span class="obs-val">Use the built-in <a class="studio-inline-link" id="studio-inline-link" href="/broadcast?v=2.26.0">browser broadcaster</a>. It publishes to the same <code>live</code> path over WHIP, with codec, bitrate, resolution, frame rate and keyframe controls, screen/window/tab capture, webcam picture-in-picture and system audio + mic mixing. OBS keeps working exactly as before — pick whichever you prefer.</span></li>
+                            </ul>
                             <div class="ingest-selector">
                                 <button class="ingest-tab active" id="ingest-tab-whip">RTMP (this laptop)</button>
                                 <button class="ingest-tab" id="ingest-tab-srt">SRT / WHIP options</button>
@@ -404,6 +422,6 @@
     </div>
 
     <!-- Custom JavaScript -->
-<script src="/streaming/app.js?v=2.25.1"></script>
+<script src="/streaming/app.js?v=2.26.0"></script>
 </body>
 </html>

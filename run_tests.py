@@ -33,6 +33,12 @@ JS_CHECKS_PATH = ROOT / "js_checks.js"
 BRIDGE_PATH = ROOT / "codec_bridge.js"
 LAUNCHER_PATH = ROOT / "start_host.ps1"
 MEDIAMTX_PATH = ROOT / "mediamtx_win" / "mediamtx.exe"
+# The browser broadcaster ("Rydius Studio"). Separate files from the player so
+# the player's own load path and its tests are untouched by this feature.
+BROADCAST_HTML_PATH = ROOT / "broadcast.html"
+BROADCAST_JS_PATH = ROOT / "broadcast.js"
+BROADCAST_WORKER_PATH = ROOT / "broadcast_worker.js"
+BROADCAST_WORKLET_PATH = ROOT / "broadcast_audio_worklet.js"
 
 
 class IdCollector(HTMLParser):
@@ -73,7 +79,6 @@ def start_node_server(node, env_overrides):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-
 
 class SiteStartupError(Exception):
     """server.js exited before it answered; ``output`` is everything it printed."""
@@ -130,7 +135,6 @@ def stop_process(process):
         process.kill()
         output, _ = process.communicate(timeout=3)
     return output.decode("utf-8", "replace") if output else ""
-
 
 class CaseInsensitiveHeaders(dict):
     """HTTP header names are case-insensitive, even when raw casing varies."""
@@ -223,7 +227,6 @@ def run_js_check(test_case, case_name):
         0,
         "js_checks.js case {!r} failed:\n{}{}".format(case_name, result.stdout, result.stderr),
     )
-
 
 class _QuietHTTPServer(HTTPServer):
     """Keeps proxy keep-alive resets from dumping tracebacks into the report."""
@@ -437,7 +440,6 @@ def truncated_request_outcome(port, path, timeout=5):
         except OSError:
             pass
     return outcome
-
 
 class LaptopHostChecks(unittest.TestCase):
     @classmethod
@@ -748,7 +750,6 @@ class LaptopHostChecks(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertNotIn(marker, self.app)
 
-
 class _SiteUnderTest(unittest.TestCase):
     """Boots a fresh server.js per test, wired to stub or intentionally dead upstreams.
 
@@ -781,6 +782,14 @@ class _SiteUnderTest(unittest.TestCase):
     BOOT_ATTEMPTS = 5
 
     def start_site(self, signaling_routes=None, api_routes=None, extra_env=None):
+        # Tests sometimes reconfigure the host mid-test. Retire the previous
+        # server before replacing its Popen handle so its random-port listener
+        # cannot survive into the next test.
+        previous_process = getattr(self, "server_process", None)
+        if previous_process is not None:
+            stop_process(previous_process)
+            self.server_process = None
+
         overrides = {}
         if signaling_routes is None:
             overrides["MEDIAMTX_PORT"] = find_free_port()
@@ -817,7 +826,6 @@ class _SiteUnderTest(unittest.TestCase):
                     break
         self.fail("{}\nServer output:\n{}".format(
             startup_error, (startup_error.output or "<none>").strip()))
-
 
 class JsLogicChecks(unittest.TestCase):
     """Browser-logic checks that run the real app.js functions inside js_checks.js.
@@ -987,6 +995,176 @@ class JsLogicChecks(unittest.TestCase):
         watchdog, closing the LIVE attempt's peer connection and painting the
         page OFFLINE. A clean connect followed by an unexplained drop."""
         run_js_check(self, "superseded-session-error-must-not-tear-down-the-live-session")
+
+    def test_catchup_latch_returns_the_element_to_1x(self):
+        """Live-edge catch-up must release the playbackRate it took.
+
+        Catch-up drives the media element's playbackRate above 1.0 to drain a
+        drift, and that rate is a property of the ELEMENT, not of the peer
+        connection: it survives every teardown in the player. Without an
+        explicit release a viewer whose session ended while catching up starts
+        the next one running fast, with nothing on screen to explain it."""
+        run_js_check(self, "catchup-latch-returns-the-element-to-1x")
+
+    def test_catchup_probe_is_abandoned_when_measurement_stops(self):
+        """The saturation probe must not judge a drain on a stale baseline.
+
+        Catch-up's self-verification marks the mechanism useless when the rate
+        saturates and the buffer stops draining. Clearing the probe whenever the
+        controller is NOT asking for the full cap is what keeps a long slow
+        ramp from being judged against a measurement taken minutes earlier."""
+        run_js_check(self, "catchup-probe-is-abandoned-when-measurement-stops")
+
+    def test_catchup_gate_stops_per_second_rewrites(self):
+        run_js_check(self, "catch-up-gate-stops-the-per-second-rewrite")
+
+    def test_presentation_evenness_detects_uneven_cadence(self):
+        run_js_check(self, "presentation-evenness-detects-uneven-cadence")
+
+
+    def test_chat_notification_behaviour_is_pinned_by_execution(self):
+        """Runs the real notification functions against a stub DOM, so the
+        burst cap, the hidden-at-zero badge, the 99+ clamp and the layer's
+        release after a burst are proven by observation rather than by the
+        presence of an identifier."""
+        run_js_check(self, "chat-notification-behaviour")
+
+
+    def test_chat_notification_gate_decisions_are_pinned_by_execution(self):
+        """The source guards can only see that `!isSelf && !isHistory` and
+        `if (isHost)` appear in handleIncomingMessage — not that the call is
+        nested inside that gate. This drives the real function and checks which
+        branch each of the four message kinds actually takes."""
+        run_js_check(self, "chat-notification-gate-decisions")
+
+
+    def test_chat_init_replay_classification_is_pinned_by_execution(self):
+        """The server answers a native auto-reconnect with exactly the messages
+        this client missed. The real connectChatEvents is driven with a stubbed
+        EventSource to prove the init payload is classified by whether a
+        watermark already existed, rather than blanket-marked as history."""
+        run_js_check(self, "chat-init-replay-classification")
+
+
+    def test_polling_catch_up_is_silent_by_execution(self):
+        """Runs the real poll body with a stubbed fetch. A string check cannot
+        tell an isCatchUp that is genuinely derived from the watermark from one
+        that is hardcoded false, nor catch a watermark re-read after the await
+        (which the batch itself advances) — so the receive path is observed
+        directly."""
+        run_js_check(self, "polling-fallback-catch-up-is-silent")
+
+
+
+class StudioJsLogicChecks(unittest.TestCase):
+    """Browser-logic checks for the broadcaster (broadcast.js).
+
+    These are the decisions that silently break a broadcast rather than throwing:
+    an H.264 level that under-declares the stream, an SDP fmtp attached to the
+    wrong section, a codec string the encoder cannot produce. They are extracted
+    from the shipped broadcast.js by name, so the tests cannot drift from the
+    code the browser actually runs.
+    """
+
+    def test_h264_level_matches_resolution_and_framerate(self):
+        run_js_check(self, "studio-h264-level-matches-resolution-and-framerate")
+
+    def test_h264_codec_string_is_constrained_baseline(self):
+        run_js_check(self, "studio-h264-codec-string-is-constrained-baseline")
+
+    def test_av1_level_rises_with_pixel_rate(self):
+        run_js_check(self, "studio-av1-level-rises-with-pixel-rate")
+
+    def test_odd_dimensions_are_forced_even(self):
+        run_js_check(self, "studio-odd-dimensions-are-forced-even")
+
+    def test_suggested_bitrate_is_monotonic_and_clamped(self):
+        run_js_check(self, "studio-suggested-bitrate-is-monotonic-and-clamped")
+
+    def test_publish_sdp_rewrites_only_the_h264_profile(self):
+        run_js_check(self, "studio-publish-sdp-rewrites-only-the-h264-profile")
+
+    def test_publish_sdp_forces_packetization_mode_1(self):
+        run_js_check(self, "studio-publish-sdp-forces-packetization-mode-1")
+
+    def test_publish_sdp_rejects_a_malformed_profile(self):
+        run_js_check(self, "studio-publish-sdp-rejects-a-malformed-profile")
+
+    def test_routable_candidate_rejects_mdns_obfuscation(self):
+        run_js_check(self, "studio-routable-candidate-rejects-mdns-obfuscation")
+
+    def test_worklet_emits_frames_at_the_correct_rate(self):
+        run_js_check(self, "studio-worklet-emits-frames-at-the-correct-rate")
+
+    def test_worklet_silence_path_matches_the_real_audio_rate(self):
+        run_js_check(self, "studio-worklet-silence-path-matches-the-real-audio-rate")
+
+    def test_worklet_preserves_samples_across_quantum_boundaries(self):
+        run_js_check(self, "studio-worklet-preserves-samples-across-quantum-boundaries")
+
+    def test_worklet_resets_the_accumulator_before_posting(self):
+        run_js_check(self, "studio-worklet-resets-the-accumulator-before-posting")
+
+    def test_every_js_check_case_is_reachable_from_a_unittest(self):
+        """A js_checks case that no unittest invokes never runs.
+
+        The suite is driven by hand-written `run_js_check` calls, so a case
+        added to js_checks.js is silently dead until somebody wires it up. This
+        makes that gap a failure instead of an omission. (Two pre-existing
+        cases are exempted by name; they are exercised via the exports, not
+        through runCase.)
+        """
+        script = (
+            "const m = require('./js_checks.js');"
+            "console.log(JSON.stringify(Object.keys(m.cases).sort()));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script], cwd=str(ROOT),
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        cases = set(json.loads(result.stdout.strip()))
+        self.assertTrue(cases, "js_checks.js exposed no cases")
+
+        referenced = set(re.findall(r"run_js_check\(\s*self,\s*\"([^\"]+)\"", read_text(Path(__file__))))
+        unreachable = cases - referenced
+        self.assertEqual(
+            unreachable, set(),
+            "these js_checks cases are defined but never run by run_tests.py: {}".format(
+                sorted(unreachable)))
+        # And the reverse: a unittest naming a case that does not exist is a
+        # typo that would only surface when that test runs.
+        missing = referenced - cases
+        self.assertEqual(
+            missing, set(),
+            "run_tests.py references js_checks cases that do not exist: {}".format(
+                sorted(missing)))
+
+    def test_publish_sdp_prunes_to_the_selected_codec(self):
+        # Without pruning, "AV1" can still be answered with H.264: the offer
+        # keeps every family and Pion picks the first it supports. The picture
+        # looks live and is quietly the wrong codec.
+        run_js_check(self, "studio-publish-sdp-prunes-to-the-selected-codec")
+
+    def test_negotiated_codec_is_read_back_from_the_answer(self):
+        # Silently accepting a codec the answerer refused is how a host picks
+        # AV1 and gets H.264 with no indication anything went wrong.
+        run_js_check(self, "studio-negotiated-codec-is-read-back-from-the-answer")
+
+    def test_chunk_submission_drops_instead_of_queueing(self):
+        # Queueing under backpressure converts one dropped frame into unbounded
+        # latency ending in a multi-second freeze.
+        run_js_check(self, "studio-chunk-submission-drops-instead-of-queueing")
+
+    def test_av_tracks_share_one_clock(self):
+        # Video stamped with performance.now() and audio with
+        # AudioContext.currentTime drift apart over a long broadcast.
+        run_js_check(self, "studio-av-tracks-share-one-clock")
+
+    def test_encode_period_matches_the_requested_framerate(self):
+        # The old loop used periodMs/2 as its interval and encoded on every
+        # tick, so 30 fps actually produced ~59 fps.
+        run_js_check(self, "studio-encode-period-matches-the-requested-framerate")
 
 
 class StreamApiProxyChecks(_SiteUnderTest):
@@ -1290,32 +1468,52 @@ class StreamApiProxyChecks(_SiteUnderTest):
             conn.close()
 
     def test_chat_replay_does_not_silently_drop_messages_across_a_restart(self):
-        # Message ids restart at 1 when the server restarts, so a browser
-        # reconnecting with lastId=99 while messages are numbered from 1 again
-        # used to have `m.id > 99` filter out every real message, silently and
-        # with no gap marker. The client must get the retained window instead.
+        # A browser keeps recent ids for deduplication, so the next server
+        # process must issue larger ids instead of reusing the previous range.
         self.start_site()
+        old_ids = []
         for text in ("alpha", "bravo", "charlie"):
-            http_request(
+            status, _, body = http_request(
                 self.port, "POST", "/stream-api/chat/messages",
                 body=json.dumps({"text": text, "author": "Viewer"}).encode("utf-8"),
             )
-        status, init = self._read_chat_init(self.port, "?lastId=99")
+            self.assertEqual(status, 200)
+            old_ids.append(json.loads(body.decode("utf-8"))["message"]["id"])
+
+        previous_last_id = old_ids[-1]
+        stop_process(self.server_process)
+        self.server_process = None
+        time.sleep(0.01)
+        self.start_site()
+
+        current_ids = []
+        for text in ("delta", "echo", "foxtrot"):
+            status, _, body = http_request(
+                self.port, "POST", "/stream-api/chat/messages",
+                body=json.dumps({"text": text, "author": "Viewer"}).encode("utf-8"),
+            )
+            self.assertEqual(status, 200)
+            current_ids.append(json.loads(body.decode("utf-8"))["message"]["id"])
+        self.assertGreater(current_ids[0], previous_last_id,
+                           "a restarted server must not reuse ids held by open clients")
+
+        status, init = self._read_chat_init(self.port, "?lastId={}".format(previous_last_id))
         self.assertEqual(status, 200)
         self.assertIsNotNone(init, "the init frame must be readable")
         texts = [m.get("text") for m in init["history"]]
-        for text in ("alpha", "bravo", "charlie"):
+        for text in ("delta", "echo", "foxtrot"):
             self.assertIn(
                 text, texts,
-                "an id this process never issued must fall back to the full "
+                "a previous process id must fall back to the full "
                 "retained window instead of silently dropping messages",
             )
         # A legitimate in-range replay must still replay only what followed it,
         # or the fix would just resend the whole log to every reconnecting tab.
-        status, init = self._read_chat_init(self.port, "?lastId=1")
+        status, init = self._read_chat_init(
+            self.port, "?lastId={}".format(current_ids[0]))
         self.assertEqual(status, 200)
         self.assertEqual(
-            [m.get("text") for m in init["history"]], ["bravo", "charlie"],
+            [m.get("text") for m in init["history"]], ["echo", "foxtrot"],
             "an id inside the retained window must replay only what followed it",
         )
 
@@ -1361,7 +1559,6 @@ class StreamApiProxyChecks(_SiteUnderTest):
         self.assertEqual(status, 405)
         self.assertEqual(self.signaling.requests, [], "the TURN endpoint must not reach MediaMTX")
         self.assertEqual(self.api.requests, [], "the TURN endpoint must not reach MediaMTX")
-
 
 class TurnCredentialProxyChecks(_SiteUnderTest):
     """Remote viewers receive Cloudflare TURN credentials minted by the local server.
@@ -1482,7 +1679,6 @@ class TurnCredentialProxyChecks(_SiteUnderTest):
         self.assertRegex(app, r"cachedIceServersAt (?:<=>|> |<=) 10 \* 60 \* 1000",
                          "viewer ICE cache (10 min) must stay below the mint's >=30 min validity floor")
 
-
 class MediaMtxUnavailableChecks(_SiteUnderTest):
     """MediaMTX is down before OBS starts — the page must still behave."""
 
@@ -1505,7 +1701,6 @@ class MediaMtxUnavailableChecks(_SiteUnderTest):
         status, headers, _ = http_request(self.port, "OPTIONS", "/stream-api/v3/paths/list")
         self.assertEqual(status, 204)
         self.assertEqual(headers.get("Access-Control-Allow-Origin"), "*")
-
 
 class ProxyUpstreamFailureChecks(_SiteUnderTest):
     """The proxy's failure paths, exercised against upstreams that really fail.
@@ -1613,7 +1808,6 @@ class ProxyUpstreamFailureChecks(_SiteUnderTest):
                           "a surviving process.exit() must be guarded by an explicit "
                           "fatal-error list, not reached unconditionally")
 
-
 class StaticServerHardeningChecks(_SiteUnderTest):
     """The allowlist map is the only thing standing between the page and the repo."""
 
@@ -1658,7 +1852,6 @@ class StaticServerHardeningChecks(_SiteUnderTest):
         self.start_site()
         status, _, _ = http_request(self.port, "GET", "/stream-api")
         self.assertEqual(status, 404)
-
 
 class SiteStartupDiagnosticsChecks(_SiteUnderTest):
     """A server that dies at startup must say why, in its own words.
@@ -1758,6 +1951,367 @@ class SiteStartupDiagnosticsChecks(_SiteUnderTest):
             slow.shutdown()
             slow.server_close()
 
+class BrowserBroadcasterChecks(_SiteUnderTest):
+    """Rydius Studio: the browser screen-share publisher.
+
+    The studio is a second way to publish to the SAME MediaMTX path OBS uses, so
+    these check the two things that matter: the studio is reachable and its
+    runtime assets actually load, and it publishes over WHIP through the same
+    proxy the player already uses. They also pin the "do not break OBS" rule:
+    nothing here may change the `live` path's configuration.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.studio_html = read_text(BROADCAST_HTML_PATH)
+        cls.studio_js = read_text(BROADCAST_JS_PATH)
+        cls.studio_worker = read_text(BROADCAST_WORKER_PATH)
+        cls.studio_worklet = read_text(BROADCAST_WORKLET_PATH)
+        cls.server = read_text(SERVER_PATH)
+        cls.html = read_text(HTML_PATH)
+
+    def test_studio_files_exist_and_parse(self):
+        for path in (BROADCAST_HTML_PATH, BROADCAST_JS_PATH,
+                     BROADCAST_WORKER_PATH, BROADCAST_WORKLET_PATH):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file(), "missing studio file {}".format(path.name))
+        node = shutil.which("node")
+        for path in (BROADCAST_JS_PATH, BROADCAST_WORKER_PATH, BROADCAST_WORKLET_PATH):
+            with self.subTest(path=path.name):
+                result = subprocess.run(
+                    [node, "--check", str(path)], cwd=str(ROOT),
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_studio_is_reachable_through_every_alias(self):
+        self.start_site()
+        for route in ("/studio", "/studio/", "/streaming/studio", "/streaming/studio/"):
+            with self.subTest(route=route):
+                status, headers, body = http_request(self.port, "GET", route)
+                self.assertEqual(status, 200, "{} must serve the studio".format(route))
+                self.assertIn("Rydius Studio", body.decode("utf-8"))
+                self.assertIn("html", headers.get("Content-Type", ""))
+
+    def test_studio_runtime_assets_are_served(self):
+        """The worker and the AudioWorklet are fetched by URL at runtime.
+
+        They are NOT referenced from the page's <script>/<link> tags, so a
+        missing allowlist entry would not fail an HTML asset test — it would
+        just 404 at the moment the user presses Go live. Served here explicitly.
+        """
+        self.start_site()
+        for route in ("/streaming/broadcast.js", "/streaming/broadcast_worker.js",
+                      "/streaming/broadcast_audio_worklet.js"):
+            with self.subTest(route=route):
+                status, headers, body = http_request(self.port, "GET", route)
+                self.assertEqual(status, 200, "{} must be served".format(route))
+                self.assertGreater(len(body), 0, "{} must not be empty".format(route))
+                self.assertIn("javascript", headers.get("Content-Type", ""))
+
+    def test_studio_whip_post_budget_exceeds_the_players_whep_budget(self):
+        """The two timeouts answer different questions and must not be copied.
+
+        MediaMTX does not write the WHIP 201 until ICE AND DTLS have completed,
+        so a legitimate publish answers in ~12s on this host (webrtcSTUNGather
+        Timeout 2s nested inside webrtcHandshakeTimeout 10s). The viewer's 10s
+        WHEP abort is right — it is attaching to an already-live source — but
+        reusing it in the publisher aborted handshakes that were about to
+        succeed, failing to start on exactly the slow uplink the feature exists
+        to serve.
+
+        The outer watchdog must in turn exceed the POST budget, or it aborts a
+        handshake it is supposed to be watching.
+        """
+        def constant(name):
+            match = re.search(
+                r"const\s+{}\s*=\s*(\d+)".format(re.escape(name)), self.studio_js)
+            self.assertIsNotNone(match, "{} must be declared".format(name))
+            return int(match.group(1))
+
+        post_budget = constant("WHIP_POST_TIMEOUT_MS")
+        watchdog = constant("PUBLISH_WATCHDOG_MS")
+        self.assertGreaterEqual(post_budget, 25000,
+            "the WHIP POST budget must cover the real ~12s ICE+DTLS handshake")
+        # The watchdog watches the POST, so it must outlast it with headroom.
+        self.assertGreater(watchdog, post_budget * 2,
+            "the outer watchdog must comfortably exceed the POST budget, "
+            "or it aborts a handshake that is still legitimately in flight")
+
+    def test_studio_publishes_over_whip_to_the_live_path(self):
+        """The offer must go to the same WHIP endpoint the player proxies.
+
+        If this drifted to another path, viewers polling "live" would never see
+        a browser broadcast and the codec bridge would never build renditions.
+        """
+        self.assertIn("const WHIP_PATH = '/stream-api/live/whip';", self.studio_js)
+        self.assertIn("'Content-Type': 'application/sdp'", self.studio_js)
+        # RFC 9725: the answer arrives on 201 with a Location resource.
+        self.assertIn("response.headers.get('Location')", self.studio_js)
+        self.assertIn("method: 'DELETE'", self.studio_js,
+                      "the session resource must be released on teardown")
+
+    def test_studio_teardown_always_releases_the_publisher(self):
+        """Every exit path must DELETE the WHIP resource.
+
+        `live` has overridePublisher, so a leaked publisher session is not just
+        wasted upload — it actively fights the next broadcaster, OBS included,
+        until MediaMTX's readTimeout expires.
+        """
+        for hook in ("window.addEventListener('pagehide', handlePageExit)",
+                     "window.addEventListener('beforeunload', handlePageExit)"):
+            with self.subTest(hook=hook):
+                self.assertIn(hook, self.studio_js)
+        # The browser's own "Stop sharing" bar ends the track with no JS call.
+        self.assertIn("addEventListener('ended'", self.studio_js,
+                      "an ended capture track must stop the broadcast")
+        # Every route into teardown must bump the session token so an in-flight
+        # handshake cannot resurrect the session it belongs to.
+        self.assertIn("state.sessionToken += 1;", self.studio_js)
+
+    def test_studio_drops_frames_rather_than_queueing_them(self):
+        """A live stream must lose frames under load, not accumulate delay.
+
+        Bounding the encode queue and refusing a chunk while the transport's
+        writer still has no room is what keeps latency flat; an unbounded queue
+        converts a momentary uplink shortfall into unbounded delay that ends in a
+        multi-second freeze long after the link recovered.
+        """
+        # Backpressure comes from the TransformStream's own writer: desiredSize
+        # <= 0 means the packetizer has not consumed the previous chunk.
+        self.assertIn("writer.desiredSize <= 0", self.studio_js)
+        self.assertIn("state.framesDropped += 1", self.studio_js)
+        # pipeTo is what carries that backpressure from the packetizer up to the
+        # main-thread writer.
+        self.assertIn("readable.pipeTo(writable)", self.studio_worker)
+
+    def test_studio_audio_drop_counter_is_reported_not_write_only(self):
+        """A counter nobody can read is not telemetry, it is dead state.
+
+        audioFramesDropped was incremented and reset but never rendered, so a
+        test that only asserted the increment "passed" while audio could be
+        audibly breaking up with nothing on screen to show it.
+        """
+        self.assertIn("state.audioFramesDropped += 1", self.studio_js)
+        self.assertIn("state.audioFramesDropped", self.studio_html + self.studio_js)
+        # The counter must be READ into the DOM, not merely mentioned.
+        self.assertIn("el['tele-audio-dropped'].textContent = String(state.audioFramesDropped)",
+                      self.studio_js)
+        self.assertIn('id="tele-audio-dropped"', self.studio_html)
+
+    def test_first_encoded_frame_is_a_keyframe_and_later_ones_are_not(self):
+        run_js_check(self, "studio-first-encoded-frame-is-a-keyframe-and-later-ones-are-not")
+
+    def test_a_new_gop_forces_a_keyframe_again(self):
+        run_js_check(self, "studio-a-new-gop-forces-a-keyframe-again")
+
+    def test_encode_queue_overflow_drops_the_frame(self):
+        run_js_check(self, "studio-encode-queue-overflow-drops-the-frame")
+
+    def test_a_video_frame_failure_is_counted_not_swallowed(self):
+        run_js_check(self, "studio-a-video-frame-failure-is-counted_not_swallowed")
+
+    def test_studio_audio_tap_is_wired_in_the_right_direction(self):
+        """The PCM tap READS the mix; it has no audio output of its own.
+
+        The tap was built with numberOfOutputs: 0 and then connected with
+        `node.connect(state.audioDest)` — the wrong direction. A zero-output
+        node has nothing to connect FROM, so the call was a no-op, and nothing
+        was ever connected TO the node either. The worklet's `inputs[0]` was
+        therefore permanently empty, it took its silence branch on every render
+        quantum, and the WebCodecs engine published a stream that was LIVE BUT
+        MUTED while the UI meters (which read the same mix) showed healthy
+        levels. Silent broadcast with visible meters is the most confusing
+        possible failure, so the direction is pinned here.
+        """
+        self.assertIn("numberOfOutputs: 0", self.studio_js)
+        self.assertIn("state.audioDest.connect(node)", self.studio_js,
+                      "the mix destination must feed the tap")
+        # Scoped to executable lines, exactly as the postMessage test does: the
+        # one remaining mention of the wrong direction is inside the comment
+        # that explains why it was wrong, and asserting on the raw text would
+        # forbid documenting the bug.
+        self.assertEqual(
+            [line for line in self.studio_js.splitlines()
+             if "node.connect(state.audioDest)" in line
+             and not line.lstrip().startswith(("//", "*"))],
+            [],
+            "a zero-output tap cannot be the source of a connection")
+
+        # Teardown must sever the SOURCE side. `node.disconnect()` only
+        # disconnects outputs, of which the tap has none, so on its own it
+        # leaves the tap attached to a mix that keeps running.
+        idx = self.studio_js.find("state.audioWorkletNode) {")
+        self.assertGreater(idx, 0, "the worklet teardown block was not found")
+        window = self.studio_js[idx:idx + 700]
+        self.assertIn("state.audioDest.disconnect(state.audioWorkletNode)", window,
+                      "teardown must disconnect the tap from the mix destination")
+
+    def test_studio_pcm_tap_never_stalls_or_discards_a_partial_frame(self):
+        """The tap must always complete a frame, and must never throw away
+        samples it already has.
+
+        Two separate ways it used to go wrong, both silent:
+        - `inputs[0]` present but holding an empty channel (`[[]]`) gave
+          length 0, so the copy loop never ran, `filled` never advanced and the
+          encoder's clock stalled for the rest of the session.
+        - The silence path completed a frame and emitted unconditionally,
+          ignoring the accumulator, so it emitted 10 ms of audio per 2.67 ms
+          render quantum — 3.75x the correct rate. Playback ran fast, underran,
+          and drifted ~730 ms against video every second of broadcast.
+        """
+        self.assertIn("padAndEmit", self.studio_worklet)
+        # The pad writes only the REMAINDER, starting at the accumulated offset.
+        # Zeroing the whole buffer would discard real samples already gathered.
+        self.assertIn("this.buffers[c].fill(0, this.filled, this.filled + take)",
+                      self.studio_worklet,
+                      "only the remainder of a partial frame may be zeroed")
+        # And it advances the same accumulator the real-audio path uses, which
+        # is what keeps the two paths at the same frame rate. The behavioural
+        # proof is in js_checks (studio-worklet-silence-path-matches-the-real-audio-rate).
+        self.assertIn("this.filled += take;", self.studio_worklet,
+                      "the silence path must advance the shared accumulator")
+        # A present-but-empty channel counts as no input.
+        self.assertRegex(
+            self.studio_worklet,
+            r"length === 0\)\s*\{",
+            "an empty channel array must be treated as silence, not as a stall")
+        # Every emitted frame is the configured size, which is what AudioData
+        # requires and what the encoder is configured for.
+        self.assertIn("frameSize: OPUS_FRAME_SAMPLES", self.studio_js)
+        self.assertIn("const OPUS_FRAME_SAMPLES = 480;", self.studio_js,
+                      "480 samples at 48 kHz is the 10 ms Opus frame")
+
+    def test_studio_teardown_never_stops_the_shared_audio_mix(self):
+        """Only PLACEHOLDER tracks may be stopped at teardown.
+
+        releaseBlankTracks() runs over both engines, but in the NATIVE engine
+        `state.audioSender.track` is the real mix output — the only audio track
+        of state.audioDest.stream, which is shared and deliberately kept alive
+        across sessions. Stopping it sets readyState='ended' while leaving it in
+        the stream, and because buildAudioGraph() early-returns for the life of
+        the page and audioDest is never rebuilt, the SECOND Go live would
+        addTransceiver an ended track. Result: a permanently silent broadcast
+        with the UI still showing the mic as On and a moving fader, and nothing
+        anywhere logged. A silent stream is worse than a failed one, so the
+        stop() is gated on the track actually being a placeholder.
+        """
+        idx = self.studio_js.find("function releaseBlankTracks()")
+        self.assertGreater(idx, 0, "releaseBlankTracks() was not found")
+        body = self.studio_js[idx:idx + 1400]
+        # The placeholder marker must be captured BEFORE it is cleared, and
+        # must gate the stop().
+        self.assertIn("const isBlank = !!(track.blankNodes || track.blankCanvas);", body,
+                      "the placeholder check must run before the markers are cleared")
+        stop_at = body.find("track.stop()")
+        guard_at = body.find("if (isBlank) {")
+        self.assertGreater(stop_at, 0, "the placeholder track must still be stopped")
+        self.assertGreater(guard_at, 0, "track.stop() must be gated on the placeholder check")
+        self.assertLess(guard_at, stop_at, "the guard must precede the stop()")
+
+        # And the mix output must be rebuilt if it is ever found dead.
+        self.assertIn("readyState === 'live'", self.studio_js,
+                      "a dead mix output must be detected and rebuilt, not reused")
+
+    def test_studio_encoded_chunks_reach_the_sender_by_transfer_not_postmessage(self):
+        """Encoded chunks are NOT structured-cloneable.
+
+        Pushing an EncodedVideoChunk over a MessagePort throws DataCloneError
+        before a single byte moves, which would kill the WebCodecs engine on its
+        very first frame. The only supported route is the `transfer` argument of
+        the RTCRtpScriptTransform constructor, so this is pinned as a contract.
+        """
+        self.assertIn("new TransformStream()", self.studio_js)
+        self.assertIn("new RTCRtpScriptTransform(worker, { name }, [transport.readable])",
+                      self.studio_js,
+                      "the readable must be transferred into the transform constructor")
+        # No postMessage CALL may survive. The one surviving mention is the
+        # comment explaining why it cannot be used, so executable calls are
+        # what is ruled out, not the word itself.
+        self.assertEqual(
+            [line for line in self.studio_js.splitlines()
+             if "postMessage" in line and not line.lstrip().startswith(("//", "*"))],
+            [],
+            "encoded chunks must never travel by postMessage")
+
+    def test_studio_captures_system_audio_and_microphone(self):
+        for needle in ("getDisplayMedia", "systemAudio: 'include'",
+                       "getUserMedia", "audioWorklet.addModule"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.studio_js)
+        # The mic needs echo cancellation: it sits in the same room as the
+        # speakers whose audio it is mixing, which without AEC is a feedback
+        # loop in every viewer's speakers.
+        self.assertIn("echoCancellation: true", self.studio_js)
+        # Opus in WebRTC is 48 kHz; a 44.1 kHz context would need resampling.
+        self.assertIn("OPUS_SAMPLE_RATE = 48000", self.studio_js)
+
+    def test_studio_falls_back_to_the_native_engine_and_says_so(self):
+        """A silent downgrade is the most confusing failure there is.
+
+        The user picks WebCodecs, gets something else, and has no idea why the
+        keyframe setting does nothing. So the resolved engine is always reported
+        in the UI and the reason is always logged.
+        """
+        self.assertIn("supports.fullWebCodecs", self.studio_js)
+        self.assertIn("el['engine-hint'].textContent = resolved.reason", self.studio_js)
+        self.assertIn("log('Engine: ' + resolved.engine", self.studio_js)
+
+    def test_studio_does_not_change_the_obs_pipeline(self):
+        """OBS support must be exactly as it was.
+
+        The studio is a publisher, never a reconfiguration of the stack: it must
+        not add or alter a MediaMTX path, touch the bridge's hooks, or change the
+        WHIP instructions the player page shows OBS users.
+        """
+        config = read_text(CONFIG_PATH)
+        # No new paths: publishing to an undeclared path would be accepted only
+        # by the default config, not this one.
+        for path in ("live-test", "browser", "studio"):
+            with self.subTest(path=path):
+                self.assertNotRegex(
+                    config, r"^\s*{}:".format(re.escape(path)),
+                    "the studio must not require a new MediaMTX path")
+        # The existing OBS-facing instructions and hooks are untouched.
+        self.assertIn("rtmp://127.0.0.1:1935/live", self.html)
+        self.assertIn("http://127.0.0.1:8889/live/whip", self.html)
+        self.assertIn('runOnAvailable: node "codec_bridge.js"', config)
+        self.assertIn("overridePublisher: yes", config)
+
+    def test_studio_is_reachable_from_the_player(self):
+        """A broadcaster should not have to know a URL to find the studio."""
+        self.assertIn('id="studio-launch-btn"', self.html)
+        self.assertIn('href="/streaming/studio', self.html)
+
+    def test_studio_html_ids_are_unique_and_all_referenced(self):
+        parser = IdCollector()
+        parser.feed(self.studio_html)
+        self.assertEqual(len(parser.ids), len(set(parser.ids)),
+                         "broadcast.html contains duplicate IDs")
+        html_ids = set(parser.ids)
+        referenced = set(re.findall(r"getElementById\(['\"]([^'\"]+)['\"]\)", self.studio_js))
+        # The studio resolves elements through an ID table, so this has to read
+        # the table rather than bare getElementById calls.
+        table = re.search(r"const IDS = \[(.*?)\];", self.studio_js, re.DOTALL)
+        self.assertIsNotNone(table, "broadcast.js must declare its element ID table")
+        for element_id in re.findall(r"'([^']+)'", table.group(1)):
+            with self.subTest(element_id=element_id):
+                self.assertIn(element_id, html_ids,
+                              "broadcast.js references an id absent from broadcast.html")
+        self.assertEqual(referenced - html_ids, set())
+
+    def test_studio_assets_share_the_player_cache_version(self):
+        versions = set(re.findall(r"/streaming/(?:style\.css|broadcast\.js)\?v=([^\"']+)",
+                                  self.studio_html))
+        self.assertEqual(len(versions), 1,
+                         "both studio assets must share one cache version, got {}".format(versions))
+        self.assertRegex(versions.pop(), r"^\d+\.\d+\.\d+$", "cache version must be semver-like")
+        # And it must be the same version the player uses, so one bump covers all.
+        player_version = re.search(r"/streaming/app\.js\?v=([^\"']+)", self.html)
+        studio_version = re.search(r"/streaming/broadcast\.js\?v=([^\"']+)", self.studio_html)
+        self.assertEqual(player_version.group(1), studio_version.group(1),
+                         "the player and the studio must be bumped together")
+
+
 
 class StartupConfigurationChecks(unittest.TestCase):
     """A bad PORT must abort at boot instead of silently binding something else."""
@@ -1801,7 +2355,6 @@ class StartupConfigurationChecks(unittest.TestCase):
         returncode, output = self._boot({"PORT": find_free_port(), "MEDIAMTX_PORT": 8889, "MEDIAMTX_API_PORT": "abc"})
         self.assertNotEqual(returncode, 0)
         self.assertIn("MEDIAMTX_API_PORT must be a valid TCP port", output)
-
 
 class CrossFileConsistencyChecks(unittest.TestCase):
     """Ports, stream names and asset URLs are each written down in several files."""
@@ -1890,7 +2443,7 @@ class CrossFileConsistencyChecks(unittest.TestCase):
                 self.assertIsNotNone(version, "{} has no ?v= cache buster".format(reference))
                 versions.add(version.group(1))
         self.assertEqual(len(versions), 1,
-                         "all assets must share one cache version, got {}".format(sorted(versions)))
+                         "all page assets must share one cache version, got {}".format(sorted(versions)))
 
     def test_query_selectors_used_by_app_exist_in_html(self):
         selectors = re.findall(r"querySelector(?:All)?\(\s*['\"]([^'\"]+)['\"]\s*\)", self.app)
@@ -1914,7 +2467,6 @@ class CrossFileConsistencyChecks(unittest.TestCase):
                                   "id {} used by app.js is absent from index.html".format(selector[1:]))
                 else:
                     self.fail("unsupported selector {!r} — extend this check".format(selector))
-
 
 class MediaMTXControlApiContractChecks(unittest.TestCase):
     """Locks the MediaMTX behaviour app.js depends on (this breaks on upgrades).
@@ -2103,7 +2655,6 @@ class MediaMTXControlApiContractChecks(unittest.TestCase):
             stop_process(process)
             config_path.unlink(missing_ok=True)
 
-
 class ReceiverLagFixChecks(unittest.TestCase):
     """Guards for the receiver-side lag fixes, each one verified live.
 
@@ -2171,28 +2722,9 @@ class ReceiverLagFixChecks(unittest.TestCase):
 
     def test_whep_handshake_is_time_bounded(self):
         app = read_text(APP_PATH)
-        connect = ViewerSmoothnessRegressionChecks._js_function_body(app, "connectStream")
-        self.assertIsNotNone(connect, "connectStream not found")
-        # The timer and the controller are still published to the module
-        # globals so cleanupConnection() can cancel an in-flight attempt...
-        self.assertIn("whepPostTimeout = myPostTimeout", connect,
-                      "the POST timeout must be published for teardown to cancel")
-        self.assertIn("whepAbortController = myAbortController", connect,
-                      "the POST controller must be published for teardown to abort")
-        self.assertIn("clearTimeout(myPostTimeout)", connect,
-                      "the POST timeout must be cleared on completion/teardown")
-        # ...but the fetch must ride THIS attempt's own controller, and the
-        # finally must release the shared slots only while they still hold this
-        # attempt's handle. Without the identity check a superseded attempt
-        # clears the live attempt's bound (see
-        # test_superseded_attempt_cannot_clear_a_live_attempts_timers).
-        self.assertIn("signal: myAbortController.signal", connect,
-                      "the POST must ride this attempt's own AbortSignal")
-        self.assertRegex(connect, r"if \(whepPostTimeout === myPostTimeout\)",
-                         "the finally must only clear the shared slot while it "
-                         "still holds THIS attempt's timer")
-        self.assertIn("myAbortController.abort()", connect,
-                      "the POST timeout must abort this attempt's own controller")
+        self.assertIn("whepPostTimeout = myPostTimeout", app, "WHEP POST needs a timeout timer")
+        self.assertIn("signal: myAbortController.signal", app, "WHEP POST must be abortable")
+        self.assertIn("clearTimeout(myPostTimeout)", app, "the POST timeout must be cleared on completion/teardown")
 
     def test_superseded_attempt_cannot_clear_a_live_attempts_timers(self):
         """A torn-down connectStream attempt must not disarm the one that replaced it.
@@ -2212,7 +2744,7 @@ class ReceiverLagFixChecks(unittest.TestCase):
         B is then left with a WHEP POST that no timeout can end and that
         teardown can no longer cancel, so it hangs to the 26s connect watchdog
         instead of 10s. The identical shape applied to `gatherTimeout`, where
-        it additionally killed the routable-candidate poll loop -- that loop
+        it additionally killed the routable-candidate poll loop - that loop
         guarded on `gatherTimeout === null`, i.e. on the very global the stale
         attempt had just nulled.
 
@@ -2220,32 +2752,32 @@ class ReceiverLagFixChecks(unittest.TestCase):
         """
         app = read_text(APP_PATH)
         code = ViewerSmoothnessRegressionChecks._strip_comments(app, "js")
-        connect_code = ViewerSmoothnessRegressionChecks._js_function_body(code, "connectStream")
-        self.assertIsNotNone(connect_code, "connectStream not found")
+        connect = ViewerSmoothnessRegressionChecks._js_function_body(code, "connectStream")
+        self.assertIsNotNone(connect, "connectStream not found")
 
         # The WHEP POST bound.
         self.assertIn("if (whepPostTimeout === myPostTimeout) whepPostTimeout = null;",
-                      connect_code,
+                      connect,
                       "the POST `finally` must release the shared slot only when it "
                       "still holds this attempt's handle")
         # The ICE gather cap: released under an identity check, and the window's
         # own liveness flag is attempt-local so a foreign null cannot stop it.
         self.assertIn("if (gatherTimeout === gatherCap) gatherTimeout = null;",
-                      connect_code,
+                      connect,
                       "the gather window must release the shared slot only when it "
                       "still holds this attempt's cap")
-        self.assertIn("let gatherOpen = false;", connect_code,
+        self.assertIn("let gatherOpen = false;", connect,
                       "the gather window's liveness must be attempt-local state, "
                       "not the shared global a stale attempt can null")
-        self.assertIn("if (routableSettle || !gatherOpen) return;", connect_code,
+        self.assertIn("if (routableSettle || !gatherOpen) return;", connect,
                       "the routable-candidate poll must guard on the attempt-local "
                       "window flag, or a stale attempt's null silently kills it")
         # And no unconditional clear of either shared slot may remain in the
-        # attempt body -- that is the defect itself.
-        self.assertNotRegex(connect_code,
+        # attempt body - that is the defect itself.
+        self.assertNotRegex(connect,
                             r"if \(gatherTimeout\) \{ clearTimeout\(gatherTimeout\); gatherTimeout = null; \}",
                             "the unconditional gatherTimeout clear is the cross-attempt bug")
-        self.assertNotRegex(connect_code,
+        self.assertNotRegex(connect,
                             r"if \(whepPostTimeout\) \{[^}]*clearTimeout\(whepPostTimeout\)[^}]*\}",
                             "the unconditional whepPostTimeout clear is the cross-attempt bug")
 
@@ -2420,6 +2952,37 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertIn("function resolveFfmpegBinary(", bridge, "bundled-ffmpeg resolver missing")
         self.assertIn("ffmpeg_win", bridge, "bundled ffmpeg path missing")
         self.assertIn("process.env.BRIDGE_FFMPEG", bridge, "BRIDGE_FFMPEG override missing")
+
+        # The PATH fallback must be ANNOUNCED, not taken silently.
+        #
+        # `ffmpeg_win/` is gitignored, so it is present in the main checkout and
+        # absent from every git worktree and every fresh clone — which is exactly
+        # where code gets edited. The resolver used to return a bare `'ffmpeg'`
+        # with no diagnostic, so a worktree operator silently transcoded with
+        # whatever ffmpeg was first on PATH: a different build, without the AV1
+        # RTP depacketizer fix (d12791ef) that the bridge exists to rely on. The
+        # host starts, the local page plays, and the symptom is that edits appear
+        # to do nothing — or an AV1/WHIP source stalls on the RTSP leg — neither
+        # of which points at the encoder. `FFMPEG` must also stay a plain string,
+        # because the ffprobe sibling derivation branches on `!== 'ffmpeg'`.
+        self.assertIn("reportFfmpegResolution", bridge,
+                      "the resolved ffmpeg must be reported at startup")
+        self.assertIn("reportFfmpegResolution();", bridge,
+                      "the startup report must actually be called")
+        self.assertIn("PATH fallback", bridge,
+                      "the resolver must record that it fell back to PATH")
+        self.assertIn("FALLING BACK TO PATH", bridge,
+                      "a PATH fallback must be announced loudly, naming the missing path")
+        self.assertIn("gitignored", bridge,
+                      "the fallback must explain the gitignore/worktree cause, not just the symptom")
+        self.assertIn("const FFMPEG = FFMPEG_RESOLVED.binary;", bridge,
+                      "FFMPEG must stay a plain string for the ffprobe sibling derivation")
+        # The launcher must surface the same condition before the stream starts.
+        launcher = read_text(LAUNCHER_PATH)
+        self.assertIn("ffmpeg_win", launcher,
+                      "the launcher must check for the gitignored bundled ffmpeg")
+        self.assertIn("BRIDGE_FFMPEG", launcher,
+                      "the launcher must name the override that bypasses the check")
         # The tunable env defaults are load-bearing for the mediamtx wiring test.
         self.assertIn("process.env.BRIDGE_RTMP_PORT || '1935'", bridge)
         self.assertIn("process.env.RTSP_PORT || '8554'", bridge)
@@ -2888,8 +3451,6 @@ class ChatFeatureChecks(_SiteUnderTest):
         self.assertTrue(data.get("ok"))
         self.assertGreaterEqual(data.get("count", 0), 1)
 
-
-
 class StreamingHardeningChecks(unittest.TestCase):
     """Hardening pass: audio-rescue renditions, codec-change re-planning,
     viewer count, route HUD, single-path volume, network-change recovery and
@@ -3170,7 +3731,6 @@ class StreamingHardeningChecks(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("ok", result.stdout)
 
-
 class ViewerCountRuntimeChecks(_SiteUnderTest):
     def test_viewer_count_broadcasts_on_join_and_leave(self):
         self.start_site()
@@ -3224,8 +3784,6 @@ class ViewerCountRuntimeChecks(_SiteUnderTest):
         self.assertIn(b'"count":1', leave_event, "leave must broadcast the dropped count")
         conn_a.close()
 
-
-
 class EndToEndBridgeChecks(unittest.TestCase):
     """Opt-in END-TO-END check on the real machine: boots the bundled
     MediaMTX with free ports, lets the runOnAvailable hook launch
@@ -3257,7 +3815,6 @@ class EndToEndBridgeChecks(unittest.TestCase):
             0,
             "E2E bridge check failed: " + result.stdout[-4000:] + " " + result.stderr[-2000:],
         )
-
 
 class ViewerSmoothnessRegressionChecks(unittest.TestCase):
     """Regression guards for the viewer-smoothness audit.
@@ -3634,8 +4191,46 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         # the 1s stats tick is never the only thing keeping the two in step.
         self.assertIn("applyPlayoutDelay(event.receiver, event.track.kind)",
                       code, "ontrack must target both kinds as they arrive")
-        self.assertRegex(code, r"(?s)latencyModeBtn\.addEventListener\('click'.*?if \(r\.track\) \{\s*applyPlayoutDelay\(r, r\.track\.kind\);",
-                         "the latency-mode switch must retarget both receivers immediately")
+        # The latency-mode switch must retarget EVERY receiver, immediately, with
+        # the SAME target for both kinds -- an override argument here would
+        # re-introduce exactly the lip-sync offset this test exists to prevent.
+        #
+        # This asserts the property, not one spelling of the call. The call is
+        # currently written `if (r.track && applyPlayoutDelay(r, r.track.kind))`
+        # so the boolean return can drive the latch rule; an earlier form was
+        # `if (r.track) { applyPlayoutDelay(...); }`. Both satisfy the invariant,
+        # and pinning either one turns this into a change-detector.
+        switch_at = code.find("latencyModeBtn.addEventListener('click'")
+        self.assertGreater(switch_at, 0, "the latency-mode switch must exist at all")
+        # Bound the window to the HANDLER BODY, not an arbitrary character
+        # count: the retarget loop sits ~2.9 KB into the listener (past the
+        # mode table, the localStorage write and the adaptive resets), so a
+        # fixed slice silently excluded it and every assertion below passed
+        # vacuously -- including on a build that only retargeted video.
+        switch_end = code.find("\n    });", switch_at)
+        self.assertGreater(switch_end, switch_at, "the latency-mode listener must be bounded")
+        switch_body = code[switch_at:switch_end]
+        self.assertIn("getReceivers()", switch_body,
+                      "the latency-mode switch must walk every receiver, not just one")
+        self.assertIn("applyPlayoutDelay(r, r.track.kind)", switch_body,
+                      "the latency-mode switch must retarget both receivers immediately, "
+                      "with the same target for audio and video")
+        # ...and it must NOT filter the loop by kind. The lip-sync bug this test
+        # exists for is precisely "only the video receiver was retargeted".
+        # A regex for a guarded call misses the inline form
+        # (`if (r.track && r.track.kind === 'video' && applyPlayoutDelay(...))`),
+        # where the filter sits INSIDE the condition, so the check is structural:
+        # take the text between the receiver loop and the call and require that
+        # no kind comparison appears in it.
+        call_at = switch_body.find("applyPlayoutDelay(r, r.track.kind)")
+        self.assertGreater(call_at, 0, "the retarget call must be inside the handler")
+        loop_at = switch_body.rfind("forEach", 0, call_at)
+        self.assertGreater(loop_at, 0, "the retarget must happen inside a receiver loop")
+        between = switch_body[loop_at:call_at]
+        self.assertNotRegex(between, r"\.kind\s*===",
+                            "the latency-mode switch must not gate the playout write on a "
+                            "track kind: that retargets only one receiver and reintroduces "
+                            "the audio/video lip-sync offset")
 
     def test_stress_raise_releases_on_a_clock_not_a_quiet_streak(self):
         """The raise must not latch.
@@ -3945,9 +4540,9 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertGreater(opened, 0, "the gather window is never opened")
         self.assertLess(opened, polled,
                         "the window must be opened before pollRoutable() is first called")
-        self.assertIn("if (routableSettle || !gatherOpen) return;",
-                      self._js_function_body(code, "connectStream"),
-                      "the poll must guard on the attempt-local window flag")
+        self.assertIn("if (routableSettle || !gatherOpen) return;", code,
+                      "the poll must guard on the attempt-local window flag, not "
+                      "the shared module global a superseded attempt can null")
 
     def test_rtcp_fb_collection_is_scoped_to_the_video_section(self):
         """The collection pass swept the WHOLE document while the injection pass
@@ -4737,19 +5332,18 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         So the guard has to ask WHICH config file the running process was started
         with, which is available from its own command line.
         """
-        ps = read_text(LAUNCHER_PATH)
+        ps = self.launcher
         self.assertIn("$foreignConfig", ps,
                       "the launcher must detect a reused MediaMTX that was "
                       "started from a different copy of this project")
         self.assertIn("Get-CimInstance Win32_Process", ps,
                       "the running instance's own command line is the signal that "
                       "names the config file it was started with")
-        self.assertRegex(ps, r"\\\.ya\?ml",
-                         "the config path must be extracted from the quoted yml "
-                         "argument of the running process's command line")
         self.assertIn("Resolve-Path -LiteralPath $liveConfigPath", ps,
                       "the live config path must be resolved before it can be "
                       "compared with this checkout's")
+        self.assertIn("DIFFERENT copy of this project", ps,
+                      "the operator must be told which copy is actually serving")
         # The reassuring message must not be reachable while a foreign config is
         # in use, and must not claim a scope it does not have: the scalar reader
         # is anchored at column 0, so the whole `paths:` block -- which holds the
@@ -4764,6 +5358,9 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertIn("are NOT compared", ps,
                       "the reuse message must state that path-level settings, "
                       "including the codec-bridge hooks, were not compared")
+        self.assertIn("runOnAvailable", ps,
+                      "the warning must explain that the rendition hook is a "
+                      "relative path, since that is why the other copy wins")
 
     def test_launcher_derives_the_webrtc_udp_port_from_the_config(self):
         """The UDP pre-flight must not be able to drift from the config it guards.
@@ -4774,32 +5371,36 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         binds: the guard silently went dead on exactly the edit it exists to
         catch. It has to be parsed out of the file, with the literal kept only
         as a fallback."""
-        ps = read_text(LAUNCHER_PATH)
+        ps = self.launcher
+        # The literal is kept only as a fallback for a missing/unreadable file,
+        # so the thing to prove is that it is OVERRIDDEN from the config, not
+        # that it is absent.
         self.assertIn("webrtcLocalUDPAddress", ps,
                       "the WebRTC UDP port must be derived from mediamtx.yml")
-        self.assertIn("webrtcLocalUDPAddress:", read_text(ROOT / "mediamtx.yml"),
-                      "the key the launcher parses must still exist in the config")
         self.assertIn("Select-String", ps,
                       "the port must be read out of the config at launch time")
-        # The literal is kept deliberately, as the fallback for a missing or
-        # unreadable config, so the invariant is ORDER: the parse must come
-        # after it and overwrite it, otherwise the fallback is what survives and
-        # the guard silently probes the wrong port again.
-        fallback = re.search(r"(?m)^\$webrtcUdpPort\s*=\s*8189\s*$", ps)
-        self.assertIsNotNone(fallback,
-                             "the literal fallback for $webrtcUdpPort should stay")
-        parsed = re.search(r"\$webrtcUdpPort\s*=\s*\$parsedPort", ps)
-        self.assertIsNotNone(parsed,
-                             "the port parsed out of mediamtx.yml must be assigned "
-                             "to $webrtcUdpPort, not discarded")
-        self.assertGreater(parsed.start(), fallback.start(),
-                           "the config parse must come AFTER the literal fallback "
-                           "so it overwrites it; otherwise the hard-coded port wins "
-                           "and editing webrtcLocalUDPAddress is a silent no-op")
-        # And the value it parses must be the one the config actually declares.
+        derive = re.search(
+            r"\$webrtcUdpPort\s*=\s*\$parsedPort", ps)
+        self.assertIsNotNone(derive,
+                             "the parsed port from mediamtx.yml must actually be "
+                             "assigned to $webrtcUdpPort, not merely computed")
+        # The derivation must sit after the fallback literal, not before it.
+        literal = ps.find("$webrtcUdpPort = 8189")
+        self.assertGreaterEqual(literal, 0, "the fallback literal is gone entirely")
+        self.assertLess(literal, derive.start(),
+                        "the config-derived port must override the fallback literal, "
+                        "not be overwritten by it")
+        # And it must be read by matching the KEY, not by assuming a fixed line
+        # number or column - the same class of drift the fallback literal caused.
+        self.assertRegex(
+            ps, r"webrtcLocalUDPAddress:\s*\\s\*",
+            "the port must be read by matching the webrtcLocalUDPAddress key, "
+            "not by assuming a fixed line number or column")
+        # And the key it parses must still exist in the config.
         config = read_text(ROOT / "mediamtx.yml")
-        m = re.search(r"^\s*webrtcLocalUDPAddress:\s*\S*?:(\d{1,5})\s*$", config, re.MULTILINE)
-        self.assertIsNotNone(m, "webrtcLocalUDPAddress has no parseable port")
+        self.assertIsNotNone(
+            re.search(r"^\s*webrtcLocalUDPAddress:\s*\S*?:(\d{1,5})\s*$", config, re.MULTILINE),
+            "webrtcLocalUDPAddress has no parseable port in mediamtx.yml")
 
     def test_launcher_stale_config_is_a_warning_not_a_site_outage(self):
         """The comparison used to `throw`, and the launcher's outer catch exits
@@ -4999,9 +5600,6 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         connect = self._js_function_body(app, "connectStream")
         self.assertIsNotNone(connect, "connectStream not found")
         watchdog = re.search(r"connectTimeout = setTimeout\(.*?,\s*(\d+)\);", connect, re.DOTALL)
-        # The gather cap and the POST cap are attempt-owned handles that are
-        # then published to the module globals, so match the arming site and
-        # not the publication line.
         gather = re.search(r"gatherCap = setTimeout\([^,]+,\s*(\d+)\)", connect)
         post = re.search(r"myPostTimeout = setTimeout\([^,]+,\s*(\d+)\)", connect)
         self.assertIsNotNone(watchdog, "the connect watchdog was not found")
@@ -5105,6 +5703,249 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         # No removal timer should be left behind for the bump.
         self.assertNotIn("classList.remove('count-bump')", code,
                          "the bump ends at its natural state, so it needs no timer")
+
+
+    def test_chat_notification_fires_only_for_new_messages(self):
+        """A notification that replays history is worse than none: on every SSE
+        (re)connect the server hands the host its whole 50-message backlog, and
+        on the polling fallback path the whole 100-message window. Both arrive
+        with isHistory=true, so both must be silent."""
+        fn = self._js_function_body(self.app, "handleIncomingMessage")
+        self.assertIsNotNone(fn, "handleIncomingMessage not found")
+        self.assertIn("!isSelf && !isHistory", fn,
+                      "a replayed or self-sent message must not raise a notification")
+        self.assertIn("showChatNotification", fn,
+                      "new messages must raise the on-screen notification")
+        # The init payload is old backlog ONLY on a cold connect. After a native
+        # auto-reconnect the server replays Last-Event-ID and sends exactly the
+        # messages the client MISSED, so it must not blanket-mark them history.
+        self.assertNotIn("data.history.forEach((m) => handleIncomingMessage(m, true));",
+                         self.app,
+                         "a reconnect replay is the messages this client missed, "
+                         "not backlog; marking it history drops every message that "
+                         "arrived during a blip")
+        init_fn = self._js_function_body(self.app, "connectChatEvents")
+        self.assertIn("hadWatermark", init_fn,
+                      "the init replay must be classified by whether a watermark "
+                      "already existed, not blanket-marked as history")
+        self.assertLess(init_fn.index("const hadWatermark"), init_fn.index("data.history.forEach"),
+                        "the watermark must be sampled before the batch is applied, "
+                        "since applying it advances the variable")
+
+
+    def test_chat_notification_is_host_only(self):
+        """Viewers already have the log open in front of them; a card over the
+        video for every viewer message is noise, not notification. isHost is
+        only authoritative once the server's init event has been handled, which
+        is why the check lives inside the receive path rather than at the top
+        of the file."""
+        fn = self._js_function_body(self.app, "handleIncomingMessage")
+        self.assertIn("if (isHost)", fn,
+                      "only the host should get an on-screen chat notification")
+
+
+    def test_chat_notification_density_is_bounded(self):
+        """Each card is a composited layer drawn over live video, on the same
+        GPU budget as the decoder. A chatty room would otherwise stack one per
+        message, so the stack is capped and a burst folds into a counter."""
+        self.assertIn("MAX_CHAT_TOASTS", self.app,
+                      "concurrent chat notification cards must be capped")
+        self.assertIn("CHAT_TOAST_BURST_MS", self.app,
+                      "a burst must be folded instead of stacking a card per message")
+        fn = self._js_function_body(self.app, "showChatNotification")
+        self.assertIsNotNone(fn, "showChatNotification not found")
+        self.assertIn("liveChatToasts >= MAX_CHAT_TOASTS", fn,
+                      "the cap must be enforced at the append site")
+        # The counter is a real element, not a string that silently no-ops.
+        self.assertIn('id="chat-toast-overflow"', read_text(HTML_PATH))
+
+
+    def test_chat_notification_cards_leave_the_render_tree_when_idle(self):
+        """Same rule as .action-feedback / .volume-toast: an over-video layer
+        that is idle for the whole session between messages must be hidden
+        with visibility, not only opacity, or it keeps a render surface alive
+        above the video permanently."""
+        css = self._strip_comments(self.css, "css")
+        body = self._css_rule(css, ".chat-toast-layer")
+        self.assertIsNotNone(body, ".chat-toast-layer rule not found")
+        self.assertIn("visibility: hidden", body,
+                      "the empty notification layer must be hidden with visibility")
+        self.assertIn("pointer-events: none", body,
+                      "an empty layer must not swallow clicks meant for the video")
+        self.assertIn("visibility: visible", self._css_rule(css, ".chat-toast-layer.active"),
+                      "the layer must become visible while it holds cards")
+
+
+    def test_chat_notification_does_not_blur_the_video(self):
+        """A backdrop-filter directly over the <video> forces a render surface
+        and re-samples the video texture on every decoded frame."""
+        css = self._strip_comments(self.css, "css")
+        body = self._css_rule(css, ".chat-toast-layer")
+        self.assertNotIn("backdrop-filter: blur", body,
+                         "the notification layer is drawn over live video and must not blur it")
+        card = self._css_rule(css, ".chat-toast")
+        self.assertIsNotNone(card, ".chat-toast rule not found")
+        self.assertNotIn("backdrop-filter: blur", card,
+                         "a notification card is drawn over live video and must not blur it")
+
+
+    def test_clicking_a_notification_does_not_toggle_playback(self):
+        """The card is deliberately clickable (it jumps to the chat), so it sits
+        inside .video-container — which has its own click/dblclick handlers that
+        toggle play/pause and fullscreen. Without the ignore entry, answering a
+        viewer would pause the broadcast. The wheel handler needs it too: a card
+        sits under the pointer, so scrolling one changed the volume."""
+        for handler in ("click", "dblclick", "wheel"):
+            anchor = "videoContainer.addEventListener('" + handler + "'"
+            start = self.app.find(anchor)
+            self.assertGreater(start, 0, "videoContainer {} handler not found".format(handler))
+            # The guard is a chain of closest() calls joined by ||, so the scan
+            # has to span the whole `if` condition rather than stop at the
+            # first ')' — that is the end of the FIRST clause, not the chain.
+            window = self.app[start:start + 700]
+            self.assertIn("'.chat-toast-layer'", window,
+                          "the {} handler must ignore events on a chat notification "
+                          "(clicking one would pause the stream; the wheel would "
+                          "change the volume)".format(handler))
+
+
+    def test_chat_notification_escapes_viewer_text(self):
+        """Author and body are untrusted viewer input. A card built with
+        innerHTML would be a stored-XSS sink on every viewer's screen."""
+        code = self._js_function_body(self._strip_comments(self.app, "js"), "showChatNotification")
+        self.assertIn("innerText", code,
+                      "viewer-supplied text must be written with innerText")
+        # Comments are stripped for BOTH halves: the function's own comment
+        # explains WHY it avoids innerHTML, and it also contains the literal
+        # word "innerText" — a naive check on unstripped source is satisfied by
+        # the explanation of the fix rather than by the fix.
+        self.assertNotIn("innerHTML", code,
+                         "innerHTML on viewer text is an XSS sink")
+
+
+    def test_polling_fallback_catch_up_is_not_treated_as_new(self):
+        """A client whose EventSource failed falls back to polling. The FIRST
+        poll sends since=0, and the server reads 0 as 'send everything'
+        (server.js), so that response is the entire backlog rather than a
+        delta. Marking it as new made the host raise a notification for every
+        message already in the log — up to the 100-message cap — at exactly the
+        moment the connection was already struggling."""
+        fn = self._js_function_body(self.app, "startPollingFallback")
+        self.assertIsNotNone(fn, "startPollingFallback not found")
+        self.assertNotIn("handleIncomingMessage(m, false)", fn,
+                         "the since=0 catch-up response is the whole backlog, "
+                         "not new messages")
+        self.assertIn("isCatchUp", fn,
+                      "the first poll must be marked as a catch-up replay")
+        self.assertIn("handleIncomingMessage(m, isCatchUp)", fn,
+                      "the catch-up flag must actually reach the receive path")
+        # The watermark must be sampled BEFORE the await. handleIncomingMessage
+        # advances lastReceivedMessageId as the batch is applied, so a value
+        # read afterwards could already have moved and misclassify a batch that
+        # began at 0 as a delta.
+        code = self._js_function_body(self._strip_comments(self.app, "js"),
+                                      "startPollingFallback")
+        sample = code.find("const since = lastReceivedMessageId")
+        fetch = code.find("await fetch")
+        self.assertGreater(sample, -1,
+                           "the watermark must be captured into a local, not re-read later")
+        self.assertGreater(fetch, -1, "no fetch found in the poll body")
+        self.assertLess(sample, fetch,
+                        "the watermark must be captured before the await, or a "
+                        "batch that advanced it mid-apply reads as a delta")
+        # The decision must use the SNAPSHOT, not the live variable. Sampling
+        # early is pointless if the comparison still reads the mutable global
+        # after handleIncomingMessage has advanced it.
+        self.assertRegex(
+            code, r"const isCatchUp = since === 0 && !chatStreamPrimed;",
+            "isCatchUp must compare the pre-await snapshot; re-reading "
+            "lastReceivedMessageId after the fetch restores the race this fix removed")
+        # A since=0 poll is only a BACKLOG replay while nothing has ever been
+        # received. Once the client is primed, a still-zero watermark just means
+        # the log is empty, and the response is live traffic that must notify.
+        self.assertIn("chatStreamPrimed = true;", self.app,
+                      "the client must be marked primed once a baseline exists")
+        init = self._js_function_body(self.app, "connectChatEvents")
+        self.assertIn("chatStreamPrimed = true", init,
+                      "the SSE init handler must mark the stream primed")
+        # The polling path must be able to prime ITSELF. It is reachable with no
+        # init handler at all: a throwing EventSource constructor returns before
+        # the listener is attached, and a non-200 / wrong-MIME EventSource goes
+        # to CLOSED without reconnecting. With the flag written only by init,
+        # every polled message stayed classified as backlog and the host was
+        # never notified again for the whole session.
+        self.assertIn("chatStreamPrimed = true", fn,
+                      "the poll body must prime the client, or the polling-only "
+                      "path never notifies again after the first catch-up")
+        # ...and the write must come AFTER the classification, or the very
+        # first poll would stop being a catch-up. Compared on the FIRST
+        # occurrence of each: the body legitimately contains one priming write,
+        # and a last-occurrence search would sail straight past an illegally
+        # EARLY one and still find the correct one further down.
+        self.assertLess(fn.index("const isCatchUp"), fn.index("chatStreamPrimed = true"),
+                        "priming must happen after the batch is classified, or the "
+                        "first since=0 poll is no longer treated as a catch-up")
+        # A cursor from before a restart is outside the new history window, so
+        # the server returns retained messages instead of filtering them away.
+        self.assertRegex(self.server, r"const replayable = Number\.isFinite\(sinceId\)",
+                         "the server must decide replayability before it filters")
+        self.assertRegex(
+            self.server,
+            r"replayable \? chatHistory\.filter\(\(m\) => m\.id > sinceId\) : chatHistory",
+            "a since=0 poll is not replayable, so it must return the whole history")
+
+
+    def test_chat_toast_layer_always_goes_idle(self):
+        """The layer is pointer-events:auto while `active`, over the video. The
+        folded '+N more' counter is the last thing holding it active, and
+        nothing cleared it: one burst left a permanently visible, permanently
+        clickable invisible box in the corner of the player's hit area, and the
+        pill never went away. It needs its own expiry."""
+        self.assertIn("scheduleChatOverflowRetire", self.app,
+                      "the folded counter must retire on its own clock")
+        fn = self._js_function_body(self.app, "scheduleChatOverflowRetire")
+        self.assertIsNotNone(fn, "scheduleChatOverflowRetire not found")
+        self.assertIn("chatToastOverflow = 0", fn,
+                      "the expiry must actually zero the counter")
+        self.assertIn("classList.remove('active')", fn,
+                      "the layer must be released once the counter retires")
+        # Folding must arm the timer, or the expiry above is unreachable.
+        show = self._js_function_body(self.app, "showChatNotification")
+        self.assertIn("scheduleChatOverflowRetire", show,
+                      "every folded message must arm the counter's expiry")
+        # Clicking through retires it too: the host is going to the log.
+        # Scoped to the click handler, NOT the whole file: a bare
+        # `assertIn("clearChatOverflow", self.app)` is satisfied by the function
+        # DEFINITION, so deleting the only call site left that dead function
+        # still passing — which is exactly the state the handler was once in.
+        click = self.app.index("chatToastLayer.addEventListener('click'")
+        self.assertGreater(click, -1, "the notification click handler is missing")
+        handler = self.app[click:click + 700]
+        self.assertIn("clearChatOverflow()", handler,
+                      "acting on a notification must retire the folded counter; "
+                      "a definition alone is dead code")
+        self.assertIn("clearChatUnread()", handler,
+                      "acting on a notification must retire the unread count")
+
+
+    def test_chat_unread_badge_is_hidden_at_zero_and_cleared_on_read(self):
+        """A '0' badge that never clears is worse than no badge: it trains the
+        host to ignore the one thing the badge exists to signal."""
+        render = self._js_function_body(self.app, "renderChatUnread")
+        self.assertIsNotNone(render, "renderChatUnread not found")
+        self.assertIn("chatUnreadBadge.hidden = true", render,
+                      "a zero count must hide the badge rather than render '0'")
+        self.assertIn("MAX_CHAT_UNREAD", self.app,
+                      "the label must be capped so it cannot reflow the tab strip")
+        tab = self._js_function_body(self.app, "activateSidebarTab")
+        self.assertIn("clearChatUnread", tab,
+                      "opening the chat by hand must retire the unread count")
+        self.assertIn('.tab-unread-badge[hidden]', self.css,
+                      "[hidden] must beat the badge's display, or '0' renders")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 
 
 class StudioOverlayVisibilityChecks(unittest.TestCase):

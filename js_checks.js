@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 /*
  * Unit checks for the browser-only logic inside app.js.
@@ -19,6 +19,12 @@ const vm = require('vm');
 const crypto = require('crypto');
 
 const APP_SOURCE = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
+// The browser broadcaster is a separate page with its own logic. Its pure
+// helpers (codec strings, level math, bitrate budget, SDP munging) are held to
+// the same standard as the player's: extracted from the shipped source by name
+// and evaluated against a stub sandbox, so the tests can never drift from the
+// code that actually runs in the browser.
+const BROADCAST_SOURCE = fs.readFileSync(path.join(__dirname, 'broadcast.js'), 'utf8');
 
 /* --------------------------------------------------------------------------
    Assertion helpers
@@ -170,7 +176,144 @@ function quietConsole() {
     return { log() {}, warn() {}, error() {}, info() {} };
 }
 
-module.exports = { APP_SOURCE, assert, assertEqual, countLine, extractFunction, extractConst, evaluateConst, compileFunction, quietConsole };
+module.exports = { APP_SOURCE, BROADCAST_SOURCE, assert, assertEqual, countLine, extractFunction, extractConst, evaluateConst, compileFunction, quietConsole };
+
+/* --------------------------------------------------------------------------
+   Studio (broadcast.js) helpers
+
+   The studio's pure functions close over a few module constants, so they are
+   compiled together into one sandbox rather than one function at a time. The
+   table is passed in explicitly, which also means a change to the level
+   thresholds cannot silently change what the tests assert.
+   -------------------------------------------------------------------------- */
+function compileStudioFns(names, extraGlobals) {
+    const sandbox = Object.assign({
+        console: quietConsole(),
+        Math,
+        Set,
+        Object,
+        Array,
+        JSON,
+        Number,
+        String,
+    }, extraGlobals || {});
+    // vm.createContext() returns the CONTEXTIFIED object, and that is what
+    // runInContext must be handed — passing the original plain object back
+    // throws "must be a vm.Context".
+    const context = vm.createContext(sandbox, { name: 'broadcast.js#studio' });
+    for (const name of names) {
+        const source = extractFunction(name, BROADCAST_SOURCE);
+        vm.runInContext(`globalThis.${name} = (${source});`, context, { filename: `broadcast.js#${name}` });
+    }
+    return context;
+}
+
+// The level table is plain data, so it is evaluated in an empty context and
+// copied back out. `{}` is NOT a context — handing one to runInContext throws
+// "must be a vm.Context" — hence the explicit createContext here.
+function studioLevelTable() {
+    const context = vm.createContext({}, { name: 'broadcast.js#H264_LEVEL_TABLE' });
+    return vm.runInContext(`(${extractConst('H264_LEVEL_TABLE', BROADCAST_SOURCE)})`, context);
+}
+
+// A harness for encodeOnce, the per-frame encode step.
+//
+// This exists because the only alternative was grepping the source for a string
+// like "value: true", which a reviewer showed is satisfied by deleting the very
+// thing it claims to test: lastKeyframeAt is initialised to 0, so the steady
+// state path `now - lastKeyframeAt >= gopMs` forces a keyframe on the very
+// first tick anyway. Running the real function is the only way the "first frame
+// is a keyframe, later frames are not" behaviour is actually pinned.
+//
+// The module-scoped `let`s the function reads and writes (lastKeyframeAt,
+// videoFrameFailures) are declared on the vm context as plain globals. A
+// function expression's free variables resolve against the context, and an
+// assignment to an undeclared-in-scope name writes straight back to it — so
+// the real source runs verbatim with no rewriting.
+// The AudioWorklet processor runs on a real-time audio thread in the browser,
+// where nothing can be diagnosed after the fact: a bad accumulator either plays
+// audio at the wrong rate or hangs the thread outright. So the class is
+// extracted and driven here with synthetic render quanta.
+//
+// This is not a convenience. The version this replaced emitted a full 480-sample
+// (10 ms) frame once per 128-sample (2.67 ms) render quantum on the silence
+// path — 3.75x the correct rate — which played audio fast, underran, and drifted
+// roughly 730 ms against video every second of broadcast. Only a test that
+// actually counts emitted frames catches that.
+function compileWorklet(frameSize, channels) {
+    const posted = [];
+    const workletSource = fs.readFileSync(path.join(__dirname, 'broadcast_audio_worklet.js'), 'utf8');
+    // Take the class body only, then stub the two browser globals it touches.
+    const classBody = workletSource.slice(
+        workletSource.indexOf('class StudioPcmTap'),
+        workletSource.indexOf('registerProcessor')
+    );
+    const sandbox = {
+        Float32Array,
+        Math,
+        registerProcessor: () => {},
+        // The audio clock the processor stamps frames with.
+        currentTime: 0,
+        AudioWorkletProcessor: class {
+            constructor() { this.port = { postMessage: (msg) => posted.push(msg) }; }
+        },
+    };
+    const context = vm.createContext(sandbox, { name: 'broadcast_audio_worklet.js' });
+    // A `class` declaration is lexically scoped to the script, so it is NOT
+    // placed on the context object. It is assigned to a global explicitly so
+    // the test can construct it.
+    vm.runInContext(`${classBody}\nglobalThis.StudioPcmTap = StudioPcmTap;`, context,
+        { filename: 'broadcast_audio_worklet.js' });
+    const instance = new context.StudioPcmTap({
+        processorOptions: { frameSize, channels },
+    });
+    return { instance, posted, context };
+}
+
+// One render quantum of `length` samples, all set to `value`.
+function quantum(length, value) {
+    const buf = new Float32Array(length);
+    if (value !== undefined) buf.fill(value);
+    return [buf];
+}
+
+function compileEncodeOnce(overrides) {
+    const opts = overrides || {};
+    const calls = [];
+
+    const sandbox = {
+        console: quietConsole(),
+        Math,
+        Number,
+        isFinite,
+        // A clock the test drives, so GOP expiry is deterministic.
+        performance: { now: () => (opts.now !== undefined ? opts.now : 0) },
+        state: {
+            videoEncoder: {
+                state: 'configured',
+                encodeQueueSize: (opts.encodeQueueSize !== undefined ? opts.encodeQueueSize : 0),
+                encode: (frame, options) => { calls.push(options); },
+            },
+            lastMediaClockSeconds: 0,
+            audioContext: null,
+            framesDropped: 0,
+        },
+        // `el` is a flat id -> element map; the canvas is all encodeOnce reads.
+        el: { 'studio-canvas': { width: 1920, height: 1080 } },
+        log: () => {},
+        mediaTimestampUs: () => 1000,
+    };
+    sandbox.VideoFrame = opts.videoFrameThrows
+        ? function () { throw new Error('canvas is zero-sized'); }
+        : function () { this.close = () => {}; };
+
+    const context = vm.createContext(sandbox, { name: 'broadcast.js#encodeOnce' });
+    vm.runInContext('var lastKeyframeAt = 0; var videoFrameFailures = 0;'
+        + ' var lastFrameFailureLoggedAt = 0;', context);
+    vm.runInContext(`globalThis.encodeOnce = (${extractFunction('encodeOnce', BROADCAST_SOURCE)});`,
+        context, { filename: 'broadcast.js#encodeOnce' });
+    return { fn: context.encodeOnce, calls, sandbox, context };
+}
 
 /* --------------------------------------------------------------------------
    Shared fixtures
@@ -216,6 +359,43 @@ function compileOptimizeSdp() {
     const { fn } = compileFunction('optimizeSdp', { console: quietConsole() });
     return fn;
 }
+
+// A SENDonly offer as Chrome produces it, for the studio's publishing munger:
+// CRLF, an H.264 payload carrying the browser's own fmtp (packetization-mode=0
+// and a High-profile level, both of which the studio must overwrite), a VP8
+// and an AV1 payload that must keep their own parameters, an audio section with
+// its own fmtp that must never be touched, and a routable host candidate.
+const PUBLISH_SDP = [
+    'v=0',
+    'o=- 8123456789012345678 2 IN IP4 127.0.0.1',
+    's=-',
+    't=0 0',
+    'a=group:BUNDLE 0 1',
+    'm=video 9 UDP/TLS/RTP/SAVPF 96 98 99',
+    'c=IN IP4 0.0.0.0',
+    'a=rtcp:9 IN IP4 0.0.0.0',
+    'a=ice-ufrag:abcd',
+    'a=ice-pwd:password',
+    'a=fingerprint:sha-256 AA:BB:CC',
+    'a=setup:actpass',
+    'a=mid:0',
+    'a=sendonly',
+    'a=rtcp-fb:96 nack',
+    'a=rtpmap:96 H264/90000',
+    'a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=640c1f',
+    'a=rtpmap:98 VP8/90000',
+    'a=rtpmap:99 AV1/90000',
+    'a=fmtp:99 level-idx=5;profile=0;tier=0',
+    'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+    'c=IN IP4 0.0.0.0',
+    'a=mid:1',
+    'a=sendonly',
+    'a=rtpmap:111 opus/48000/2',
+    'a=fmtp:111 minptime=10;useinbandfec=1',
+    'a=candidate:1 1 udp 2130706431 192.168.1.50 54321 typ host',
+    'a=end-of-candidates',
+    ''
+].join('\r\n');
 
 function sectionOf(lines, startMarker, endMarker) {
     const start = lines.findIndex((line) => line.startsWith(startMarker));
@@ -1178,6 +1358,280 @@ Object.assign(cases, {
         assertEqual(fn(NaN), null, 'a NaN frame duration is not measurable');
         assertEqual(fn(-5), null, 'a negative frame duration is not measurable');
     },
+    // Presentation evenness — the detector for the "0% loss but not smooth"
+    // report. It has to satisfy two opposing requirements at once: it must stay
+    // SILENT on a steady stream (a false positive widens the buffer of every
+    // healthy viewer) and it must FIRE on a genuinely uneven one (a false
+    // negative is the bug it exists to fix).
+    'presentation-evenness-detects-uneven-cadence'() {
+        const { fn } = compileFunction('frameGapUnevenness', {});
+        const { fn: note } = compileFunction('noteFramePresentation', {});
+        const WINDOW = 90;
+
+        // Build a realistic window the way rVFC would: feed gaps one at a time
+        // through the same windowing the player uses.
+        const feed = (gaps) => {
+            let w = [];
+            for (const g of gaps) w = note(g, w);
+            return fn(w);
+        };
+        const steady = (ms) => feed(new Array(200).fill(ms));
+        const alternating = (a, b) => feed(new Array(200).fill(0).map((_, i) => (i % 2 ? b : a)));
+        const wobble = (ms, amp) => feed(new Array(200).fill(0)
+            .map((_, i) => ms + (i % 3 === 0 ? amp : (i % 3 === 1 ? -amp : 0))));
+
+        // MUST NOT FIRE — these are all healthy viewers, and a false positive
+        // widens the buffer of every one of them once per session.
+        assert(steady(16.7) < 0.05, `a steady 60fps stream must read as even, got ${steady(16.7)}`);
+        assert(steady(33.3) < 0.05, `a steady 30fps stream must read as even, got ${steady(33.3)}`);
+        assert(wobble(16.7, 2.5) < 0.35,
+            `ordinary +/-2.5ms vsync wobble must not be called uneven, got ${wobble(16.7, 2.5)}`);
+        // A single dropped frame is a blip. The reported symptom is explicitly
+        // CONTINUOUS, so an isolated hitch must not trip the detector.
+        const oneOutlier = new Array(200).fill(33.3);
+        oneOutlier[100] = 90;
+        assert(feed(oneOutlier) < 0.35,
+            `a single dropped frame must not be called continuous unevenness, got ${feed(oneOutlier)}`);
+
+        // THE OUTLIER CASE THAT MATTERS. A lone 700ms hitch (a keyframe wait or a
+        // GC pause) at 30fps: mean-absolute-deviation is dominated by outlier
+        // MAGNITUDE, so without a plausibility bound this produced a hot reading
+        // for three consecutive samples — exactly the 3-tick streak — and the
+        // one-shot widen was spent on a blip. Measured on a steady 30fps stream,
+        // 33fps of frame time is ~33ms, so 700ms is >20x the cadence and is a
+        // stall (the freeze watchdog's domain), not unevenness.
+        for (const hitch of [700, 400, 250]) {
+            const withHitch = new Array(200).fill(33.3);
+            withHitch[100] = hitch;
+            assert(feed(withHitch) < 0.35,
+                `a single ${hitch}ms hitch must not be called continuous unevenness, `
+                + `got ${feed(withHitch)}`);
+        }
+
+        // MUST FIRE — continuously uneven cadence, with zero packet loss.
+        const rough30 = alternating(16, 48);
+        const rough60 = alternating(10, 24);
+        assert(rough30 > 0.35, `a 3:1 alternating cadence must read as uneven, got ${rough30}`);
+        assert(rough60 > 0.35, `a 2.4:1 alternating cadence must read as uneven, got ${rough60}`);
+
+        // Cadence-independent: the same SHAPE of irregularity must score the same
+        // at any frame rate, or a 30fps viewer is judged by a 60fps threshold.
+        assert(Math.abs(rough30 - rough60) < 0.2,
+            `unevenness must be cadence-independent, 30fps=${rough30} 60fps=${rough60}`);
+
+        // The window must actually slide: a stream that is rough and then settles
+        // must stop reading as uneven, or a single bad minute marks the session.
+        let w = [];
+        for (const g of new Array(200).fill(0).map((_, i) => (i % 2 ? 48 : 16))) w = note(g, w);
+        const whileRough = fn(w);
+        for (let i = 0; i < 200; i++) w = note(16.7, w);
+        const afterSettling = fn(w);
+        assert(whileRough > 0.35 && afterSettling < 0.35,
+            `the window must slide: rough=${whileRough} afterSettling=${afterSettling}`);
+
+        // Degenerate inputs must not produce a number that could arm the detector.
+        assertEqual(fn(null), null, 'a non-array must not produce a reading');
+        assertEqual(fn([]), null, 'an empty window must not produce a reading');
+        assertEqual(fn([16, 16]), null, 'fewer than 4 samples must not produce a reading');
+        assertEqual(fn([16, 16, NaN, -1, 0, 16]), null,
+            'a window of unusable samples must not produce a reading');
+        // noteFramePresentation must ignore junk rather than poison the window.
+        assertEqual(note(NaN, [1, 2, 3]), [1, 2, 3], 'a NaN gap must be ignored');
+        assertEqual(note(0, [1, 2, 3]), [1, 2, 3], 'a zero gap must be ignored');
+        assertEqual(note(-5, [1, 2, 3]), [1, 2, 3], 'a negative gap must be ignored');
+        // The window is bounded: it must not grow without limit over a long session.
+        let big = [];
+        for (let i = 0; i < 100000; i++) big = note(16.7, big);
+        assertEqual(big.length, WINDOW, `the gap window must stay bounded at ${WINDOW}, got ${big.length}`);
+    },
+    // The catch-up gate exists because the rate law is deliberately left as-is:
+    // its dead band is SYMMETRIC and avgPlayoutDelayMs is a windowed mean over
+    // emitted frames, so on a real link it crosses that band between consecutive
+    // 1s windows (119ms one tick, 121ms the next). Simulated end to end, the
+    // ungated controller wrote playbackRate once per second forever with zero
+    // packet loss and zero drops in the stats. The gate is what makes it settle.
+    'catch-up-gate-stops-the-per-second-rewrite'() {
+        const { fn: law } = compileFunction('catchUpPlaybackRate', {});
+        const ENGAGE_BAND_MS = 180;
+        const ENGAGE_CLEAR_MS = 120;
+        const ENGAGE_TICKS = 2;
+        const ENGAGE_DWELL_MS = 2000;
+        const TICK_MS = 1000;
+
+        // This models the SHIPPED gate in updateLiveEdgeCatchUp. An earlier version
+        // of this test re-implemented the gate, and the re-implementation put the
+        // engage-streak update OUTSIDE the `wanted !== rate` branch while the real
+        // code had it INSIDE — so the test passed against an algorithm the file
+        // does not contain, and the shipped controller was still doing 59
+        // playbackRate writes per 120s and stranding the element at 1.01.
+        //
+        // The ordering below is the point of the test: the streak is counted
+        // before the branch, exactly as it must be in app.js. If that ever moves
+        // back inside the branch in app.js, this model no longer describes it —
+        // so the structural check below is the real guard, and this model is the
+        // behavioural specification of what the corrected order must produce.
+        const initialState = () => ({ rate: 1, above: 0, lastWrite: -Infinity, writes: 0 });
+        const simulate = (delays, target, state = initialState(), tickOffset = 0) => {
+            delays.forEach((delay, i) => {
+                const now = (tickOffset + i) * TICK_MS;
+                const wanted = law(delay, target, state.rate, 1.08);
+                const engaged = wanted > state.rate;
+                const excess = delay - target;
+                // Streak FIRST, then the write branch. This ordering is load-bearing.
+                // The DEAD GAP is load-bearing too: the law's own dead band is 120ms,
+                // and engaging at that same boundary means acting on the law's own
+                // indecision. Measured against the real law, engaging at 120 (with or
+                // without a 60ms reset hysteresis) writes 59 times in 120s and leaves
+                // the element flipping 1.00 <-> 1.01 forever. The gap is 120..180.
+                if (excess > ENGAGE_BAND_MS) state.above += 1;
+                else if (excess < ENGAGE_CLEAR_MS) state.above = 0;
+                if (wanted !== state.rate) {
+                    const streakOk = !engaged || state.above >= ENGAGE_TICKS;
+                    const dwellOk = !engaged || (now - state.lastWrite) >= ENGAGE_DWELL_MS;
+                    if (streakOk && dwellOk) {
+                        state.rate = wanted;
+                        state.lastWrite = now;
+                        state.writes += 1;
+                    }
+                }
+            });
+            return state;
+        };
+
+        // STRUCTURAL: the shipped source must count the streak outside the branch.
+        // A behavioural model of an algorithm the code does not implement is worse
+        // than no test, so this assertion is what actually pins the fix.
+        const body = APP_SOURCE.slice(APP_SOURCE.indexOf('function updateLiveEdgeCatchUp('),
+            APP_SOURCE.indexOf('function resetLiveEdgeCatchUp('));
+        const streakAt = body.indexOf('catchUpAboveBandTicks += 1');
+        const branchAt = body.indexOf('if (wanted !== catchUpRate)');
+        assert(streakAt > 0 && branchAt > 0,
+            'could not locate the engage streak and the write branch in updateLiveEdgeCatchUp');
+        assert(streakAt < branchAt,
+            'the engage streak must be counted BEFORE the `wanted !== catchUpRate` branch; '
+            + 'inside it, a down-tick clears the streak and the gate can never engage');
+
+        // ...and the engage threshold must clear the rate law's own 120ms dead band
+        // with room to spare. Engaging AT the law's boundary means acting on the
+        // law's own indecision, and the behavioural assertions above are what
+        // caught it: 59 writes per 120s and a permanent 1.00<->1.01 flip.
+        const lawBody = compileFunction('catchUpPlaybackRate', {}).src
+            || APP_SOURCE.slice(APP_SOURCE.indexOf('function catchUpPlaybackRate('),
+                APP_SOURCE.indexOf('function updateLiveEdgeCatchUp('));
+        const deadBand = /DEAD_BAND_MS\s*=\s*(\d+)/.exec(lawBody);
+        assert(deadBand !== null, 'could not read the rate law dead band');
+        const engage = /ENGAGE_BAND_MS\s*=\s*(\d+)/.exec(body);
+        const clear = /ENGAGE_CLEAR_MS\s*=\s*(\d+)/.exec(body);
+        assert(engage !== null && clear !== null,
+            'updateLiveEdgeCatchUp must define both ENGAGE_BAND_MS and ENGAGE_CLEAR_MS');
+        const lawBand = Number(deadBand[1]);
+        assert(Number(engage[1]) > lawBand,
+            `ENGAGE_BAND_MS (${engage[1]}) must sit ABOVE the rate law's DEAD_BAND_MS `
+            + `(${lawBand}); engaging at the law's own boundary reproduces the 0.5 Hz `
+            + 'playbackRate rewrite this gate exists to prevent');
+        assert(Number(clear[1]) < Number(engage[1]),
+            'ENGAGE_CLEAR_MS must sit BELOW ENGAGE_BAND_MS, or the "dead gap" is a '
+            + 'single line and a delay oscillating across it resets the streak forever');
+        // The gap must be wide enough to absorb the window-to-window swing of a
+        // windowed mean, and it sits entirely ABOVE the law's own dead band: a
+        // genuinely settled delay (inside the law's 120ms) is then also below
+        // ENGAGE_CLEAR_MS, so it clears the streak and catch-up disengages, while a
+        // delay oscillating just above the law's band cannot keep re-arming it.
+        assert(Number(engage[1]) - Number(clear[1]) >= 40,
+            `the dead gap is too narrow to absorb window-to-window jitter `
+            + `(${clear[1]}..${engage[1]})`);
+        assert(Number(clear[1]) >= lawBand,
+            `ENGAGE_CLEAR_MS (${clear[1]}) must sit ABOVE the rate law's DEAD_BAND_MS `
+            + `(${lawBand}), so a delay oscillating just inside the law's own dead band `
+            + 'cannot keep re-arming the engage streak');
+
+        // THE REGRESSION: a delay dithering either side of the band edge. The old
+        // controller wrote on essentially every one of these 120 ticks.
+        const dither = [];
+        for (let i = 0; i < 120; i++) dither.push(300 + (i % 2 === 0 ? 119 : 121));
+        const dithered = simulate(dither, 300);
+        assert(dithered.writes <= 2,
+            `a delay dithering across the band edge must settle, saw ${dithered.writes} `
+            + 'playbackRate writes in 120s');
+        assertEqual(dithered.rate, 1,
+            `a dithering delay must settle back at 1.0x, got ${dithered.rate}`);
+        // The gate must NOT have disabled the mechanism it protects. ONE continuous
+        // simulation with state carried across ticks, exactly as the controller
+        // runs: calling simulate() per tick would reset the rate, the streak and the
+        // dwell each tick, which is not what happens at runtime.
+        //
+        // Traced against the real law, the gate engages at 1.01 after 2 ticks, ramps
+        // to the 1.08 cap, drains 1.5s of drift, then ramps back down and settles at
+        // 1.0x. Both directions are asserted, because a gate that stopped the
+        // oscillation by never engaging would pass a "must not write" test alone.
+        let delay = 1680;    // 180ms target + 1.5s of accumulated drift
+        let peak = 1;
+        let ticks = 0;
+        const live = initialState();
+        while (delay > 180 && ticks < 120) {
+            simulate([delay], 180, live, ticks);
+            peak = Math.max(peak, live.rate);
+            delay -= (live.rate - 1) * 1000;
+            ticks += 1;
+        }
+        assert(peak > 1.05,
+            `a genuinely drifted session must ramp catch-up up, peak was ${peak}`);
+        // The law stops ramping down inside its own 120ms dead band, so the delay
+        // settles at target + dead band rather than exactly at the target. That is
+        // correct and intended: the surplus below the dead band is the cushion.
+        assert(delay <= 180 + 120 + 1,
+            `catch-up must drain the drift into the dead band, ended at ${Math.round(delay)}ms `
+            + `after ${ticks}s`);
+
+        // Once the drift is gone the rate must come back to rest rather than
+        // parking above 1.0x — a permanent fast picture is the exact defect the
+        // original catch-up bug produced. The delay is at the target (excess 0),
+        // which is inside the law's dead band, so every tick asks to ramp down and
+        // the release is ungated.
+        for (let i = 0; i < 20 && live.rate > 1; i++) {
+            simulate([180], 180, live, ticks + i);
+        }
+        assertEqual(live.rate, 1,
+            `once the drift is gone the rate must return to 1.0x, got ${live.rate}`);
+
+        // A gate that stops the oscillation by NEVER ENGAGING would pass every
+        // assertion above, because "writes <= 2" and "rate settles at 1.0" are also
+        // what a permanently-disabled controller produces. This is the case that
+        // tells the two apart.
+        //
+        // The dither case above is NOT this case: at 119/121 the law is asking to
+        // come back down on half those ticks, so silence is correct there. Here the
+        // excess is 400ms — well clear of the 240ms engage band and far beyond
+        // anything the law would call "settled" — so silence means the gate is
+        // broken. This is the shape a hidden tab leaves (1.5-3s), so it is the case
+        // that actually matters to a viewer.
+        const heldAbove = initialState();
+        for (let i = 0; i < 12; i++) simulate([700], 300, heldAbove, i);
+        assert(heldAbove.rate > 1,
+            `a delay held 400ms over target MUST engage catch-up; rate stayed `
+            + `${heldAbove.rate} — the gate is suppressing a real drift`);
+
+        // The dead gap must not be a black hole. An earlier revision set the
+        // engage threshold at 240ms, which silently stranded EVERY drift between
+        // 121ms and 240ms: the law calls that band drainable, the streak never
+        // reached 2, and a viewer sitting 200ms behind live got no remedy and no
+        // diagnostic, forever. The gap is now 120..180, so anything at or beyond
+        // 180ms of excess is treated. 200ms is the case that regressed.
+        const moderate = initialState();
+        for (let i = 0; i < 12; i++) simulate([500], 300, moderate, i);
+        assert(moderate.rate > 1,
+            `200ms of sustained drift MUST engage catch-up; rate stayed `
+            + `${moderate.rate} — the dead gap is swallowing real drift`);
+
+        // ...and the gap is still a gap: a delay INSIDE it must not be engaged,
+        // or we are back to rewriting the element for noise.
+        const insideGap = initialState();
+        for (let i = 0; i < 60; i++) simulate([300 + (i % 2 === 0 ? 119 : 121)], 300, insideGap, i);
+        assertEqual(insideGap.rate, 1,
+            `a delay oscillating inside the dead gap must rest at 1.0x, got ${insideGap.rate}`);
+        assert(insideGap.writes === 0,
+            `a delay inside the dead gap must produce no writes at all, got ${insideGap.writes}`);
+    },
     // `lastLossPct` used to be dLost/(dRx+dLost). packetsReceived INCLUDES
     // retransmissions per the stats spec, so a link that loses 20% of its
     // packets and repairs 100% of them by RTX reads ~0% loss — the ABR ladder
@@ -1349,6 +1803,12 @@ Object.assign(cases, {
                 // throws. See the other ABR sandbox above.
                 ADAPTIVE_RAISE_MS: 350,
                 switchRendition(path) { recoverySandbox.switchedTo = path; },
+                // Presentation evenness: superviseAdaptiveBuffer() reads these on
+                // every tick, so the sandbox must provide them or the extracted
+                // function throws "frameGapUnevenness is not defined" before any
+                // of this case's own assertions ever run.
+                frameGapWindow: [],
+                frameGapUnevenness: compileFunction('frameGapUnevenness', {}).fn,
                 catchUpProvenUseless: true,
                 updateLiveEdgeCatchUp() { return false; },
                 resetLiveEdgeCatchUp() {}
@@ -1478,7 +1938,7 @@ Object.assign(cases, {
         const { fn } = compileFunction('bufferAccommodationMs', {});
 
         // Late frames actually discarded AND the measured buffer 1.2s past the
-        // 180ms base: grant what Chrome needs (+100ms headroom, 50ms steps).
+        // 180ms base: grant what Chrome needs (+100ms headroom, 100ms steps).
         assertEqual(fn(1200, 0, 180, true, 0), 1300,
             'a real late-frame discard raises to the measured need + 100ms');
         assertEqual(fn(3000, 0, 180, true, 0), 2200,
@@ -1517,19 +1977,24 @@ Object.assign(cases, {
         assertEqual(fn(700, 450, 180, true, 0), 800,
             'a measured need well beyond the current grant must still raise');
         // And the drain still works.
-        assertEqual(fn(400, 400, 180, false, 5), 350,
-            'sustained calm still drains one 50ms step');
+        assertEqual(fn(400, 400, 180, false, 5), 300,
+            'sustained calm still drains one 100ms step');
 
         // Decode/GPU-pressure drops with the buffer at the target are not a
         // buffer problem: the 150ms margin keeps them from inflating latency.
         assertEqual(fn(260, 0, 180, true, 0), 0,
             'drops with the buffer barely above the target must not raise');
 
-        // Sustained calm (>=5 drop-free ticks) drains one 50ms step per tick.
+        // Sustained calm (>=5 drop-free ticks) drains one 100ms step per tick.
+        // The quantum is 100ms, not 50ms, and that is load-bearing: the 50ms
+        // quantum was EXACTLY equal to BUFFER_TARGET_BAND_MS, and reapplyBufferTargets
+        // filters with a strict `<`, so a 50ms step was never filtered and every
+        // accommodation increment became a real jitterBufferTarget write on both
+        // receivers. A 100ms step is a decisive correction rather than noise.
         assertEqual(fn(1300, 1300, 180, false, 4), 1300,
             'fewer than 5 calm ticks must hold');
-        assertEqual(fn(1300, 1300, 180, false, 5), 1250,
-            'calm ticks drain the accommodation 50ms per tick');
+        assertEqual(fn(1300, 1300, 180, false, 5), 1200,
+            'calm ticks drain the accommodation 100ms per tick');
         assertEqual(fn(1300, 30, 180, false, 5), 0,
             'the drain floors at zero');
 
@@ -1584,6 +2049,12 @@ Object.assign(cases, {
                 // supervisor's sandbox has to model it. Stubbed (not real) so
                 // these cases keep testing the supervisor's own state machine;
                 // the catch-up law itself is covered separately.
+                // Presentation evenness: superviseAdaptiveBuffer() reads these on
+                // every tick, so the sandbox must provide them or the extracted
+                // function throws "frameGapUnevenness is not defined" before any
+                // of this case's own assertions ever run.
+                frameGapWindow: [],
+                frameGapUnevenness: compileFunction('frameGapUnevenness', {}).fn,
                 catchUpProvenUseless: true,
                 updateLiveEdgeCatchUp() { return false; },
                 resetLiveEdgeCatchUp() { sandbox.catchUpReset = (sandbox.catchUpReset || 0) + 1; },
@@ -1702,6 +2173,8 @@ Object.assign(cases, {
                 switchRendition(path) { sandbox.switchedTo = path; },
                 // Live-edge catch-up runs before the drift branch; stubbed so
                 // this case keeps testing the ABR ladder's own state machine.
+                frameGapWindow: [],
+                frameGapUnevenness: compileFunction('frameGapUnevenness', {}).fn,
                 catchUpProvenUseless: true,
                 updateLiveEdgeCatchUp() { return false; },
                 resetLiveEdgeCatchUp() {},
@@ -1904,20 +2377,36 @@ Object.assign(cases, {
         // sequence -- ramp, saturate, fail to drain, latch off -- is exercised
         // rather than a restatement of the source text.
         const make = ({ delayMs = 1500, nowMs = 0 } = {}) => {
+            // A mutable clock. The shipped updateLiveEdgeCatchUp advances one
+            // REAL second per stats tick, so the engage-band streak accumulates
+            // on consecutive ticks and the 2s dwell between writes is measured
+            // against an advancing performance.now(). Pinning now() to a single
+            // value would leave the dwell permanently at its initial gap and
+            // every self-verification probe frozen, so neither the ramp nor the
+            // latch could ever be exercised.
+            let clock = nowMs;
             const player = { paused: false, playbackRate: 1 };
             const sandbox = {
                 isConnected: true,
                 player,
                 document: { hidden: false },
-                performance: { now: () => nowMs },
+                performance: { now: () => clock },
                 avgPlayoutDelayMs: delayMs,
                 avgPlayoutDelayAt: nowMs,      // a fresh reading
                 catchUpRate: 1,
                 catchUpProbeAt: 0,
                 catchUpProbeDelayMs: null,
                 catchUpProvenUseless: false,
+                catchUpAboveBandTicks: 0,
+                lastCatchUpWriteAt: 0,
                 CATCHUP_MAX_RATE: 1.08,
-                baseBufferTargetMs: () => 1000,
+                // The code under test calls `currentBufferTargetMs()` for the
+                // settle point and reads `grantedTargetMs`. Stubbing the older
+                // `baseBufferTargetMs` name left both undefined, so the sandbox
+                // threw before the ordering/latch behaviour was ever reached.
+                // Both are provided here so the case tests what it claims to.
+                currentBufferTargetMs: () => 1000,
+                grantedTargetMs: 0,
                 catchUpPlaybackRate: (delay, base, prev, max) =>
                     Math.min(max, prev + 0.01),   // saturates after 8 ticks
                 console: quietConsole(),
@@ -1929,26 +2418,45 @@ Object.assign(cases, {
             return { sandbox, player, run: fn };
         };
 
-        // Ramp to saturation: 8 ticks of +0.01 reaches the 1.08x cap.
-        const s = make({ nowMs: 1000 });
-        for (let i = 0; i < 8; i++) {
+        // Ramp to saturation: advance the clock 3s per tick so the engage
+        // dwell (2s between writes) actually elapses and the writes land, and
+        // stamp the reading to "now" each tick so it never reads stale. Two
+        // ticks build the above-band streak, then each further write adds
+        // 0.01 until the 1.08x cap. Break the instant it saturates so the ramp
+        // does not run long enough for the self-verification probe to latch
+        // "useless" while we are still trying to get there.
+        const s = make({ nowMs: 0 });
+        let clock = 0;
+        s.sandbox.performance = { now: () => clock };
+        for (let i = 0; i < 12; i++) {
+            clock += 3000;
             s.sandbox.avgPlayoutDelayMs = 1500;
-            s.sandbox.avgPlayoutDelayAt = 1000;
+            s.sandbox.avgPlayoutDelayAt = clock;      // a fresh reading
             s.run();
+            if (s.player.playbackRate >= 1.08) break;
         }
         assertEqual(s.player.playbackRate, 1.08,
             'a sustained 500ms overshoot must ramp the element to the 1.08x cap');
 
-        // Now hold the delay flat and let more than 5s pass: the mechanism is
-        // saturated and NOT draining, which is exactly the trigger. The ramp
-        // loop above already opened the probe at t=1000, so this single call is
-        // the verdict. Assert immediately after it -- in the real supervisor the
-        // very next call is short-circuited by the flag, so calling again here
-        // would re-ramp and prove nothing.
+        // Now hold the delay flat and let the probe run its three stages. The
+        // merged updateLiveEdgeCatchUp opens the probe the tick the rate first
+        // saturates, takes the delay baseline on the NEXT tick, and only judges
+        // once more than 5s have elapsed with the delay not falling -- so two
+        // ticks are required here, not one. Each tick stamps the reading to
+        // "now" so the freshness gate (3s) does not reset the probe and return
+        // early. The mechanism is saturated and NOT draining, which is exactly
+        // the trigger. Assert immediately after the judge tick -- in the real
+        // supervisor the very next call is short-circuited by the flag, so
+        // calling again here would re-ramp and prove nothing.
+        clock += 3000;                       // baseline tick
         s.sandbox.avgPlayoutDelayMs = 1500;
-        s.sandbox.avgPlayoutDelayAt = 20000;
-        s.sandbox.performance = { now: () => 20000 };
-        s.run();  // >5s after the probe opened, delay unchanged -> "proven useless"
+        s.sandbox.avgPlayoutDelayAt = clock;
+        s.run();
+
+        clock += 6000;                       // >5s after the probe opened
+        s.sandbox.avgPlayoutDelayMs = 1500;  // unchanged -> not draining
+        s.sandbox.avgPlayoutDelayAt = clock;
+        s.run();                             // the verdict: "proven useless"
 
         assertEqual(s.sandbox.catchUpProvenUseless, true,
             'a saturated controller that does not drain must disable itself');
@@ -1967,7 +2475,14 @@ Object.assign(cases, {
         // it never earned.
         const make = ({ paused = false, hidden = false, isConnected = true,
                         delayMs = 1500, nowMs = 0 } = {}) => {
-            const player = { paused, playbackRate: 1 };
+            // The shipped updateLiveEdgeCatchUp re-derives catchUpRate from the
+            // element itself at the top of every tick (see the element-rate
+            // reconciliation block), so a sandbox whose element sits at 1.0
+            // while catchUpRate claims 1.08 has the latter overwritten to 1
+            // before the probe logic runs -- the controller is then not
+            // saturated and no probe ever opens. Start the element AT the rate
+            // the case asserts is already engaged.
+            const player = { paused, playbackRate: 1.08 };
             const sandbox = {
                 isConnected, player,
                 document: { hidden },
@@ -1978,8 +2493,17 @@ Object.assign(cases, {
                 catchUpProbeAt: 0,
                 catchUpProbeDelayMs: null,
                 catchUpProvenUseless: false,
+                // Declared for the same reason as the sibling case: the shipped
+                // updateLiveEdgeCatchUp reads and writes these while gating an
+                // engage (the above-band streak and the 2s write dwell).
+                catchUpAboveBandTicks: 0,
+                lastCatchUpWriteAt: 0,
                 CATCHUP_MAX_RATE: 1.08,
-                baseBufferTargetMs: () => 1000,
+                // Same as the sibling case: the function under test calls
+                // `currentBufferTargetMs()` and reads `grantedTargetMs`, so the
+                // older `baseBufferTargetMs` stub alone leaves both undefined.
+                currentBufferTargetMs: () => 1000,
+                grantedTargetMs: 0,
                 catchUpPlaybackRate: (d, b, prev, max) => Math.min(max, prev + 0.01),
                 console: quietConsole(),
             };
@@ -1992,9 +2516,17 @@ Object.assign(cases, {
         // assert the baseline was abandoned. A brand-new sandbox already has
         // catchUpProbeAt === 0, so running the gated tick first asserts nothing
         // -- the test has to put something there to lose.
+        //
+        // The shipped probe is two-stage: the tick the rate is first seen
+        // saturated only stamps catchUpProbeAt (baseline deliberately left null,
+        // because that tick's write has not been answered yet), and the baseline
+        // is recorded on the NEXT tick. Both ticks run at the same frozen clock,
+        // so the >5s judge is never reached and the probe is simply left open
+        // with its baseline recorded -- exactly the state these cases need.
         const openProbe = () => {
             const s = make({ nowMs: 1000 });
-            s.run();
+            s.run();                            // saturation observed -> probe stamped
+            s.run();                            // baseline recorded
             assertEqual(s.sandbox.catchUpProbeDelayMs, 1500,
                 'a saturated controller must open a probe and record its baseline');
             assertEqual(s.sandbox.catchUpProbeAt, 1000,
@@ -2297,6 +2829,8 @@ Object.assign(cases, {
                 switchRendition(path) { sandbox.switchedTo = path; },
                 // Live-edge catch-up runs before the drift branch; stubbed so
                 // this case keeps testing the decode-pressure state machine.
+                frameGapWindow: [],
+                frameGapUnevenness: compileFunction('frameGapUnevenness', {}).fn,
                 catchUpProvenUseless: true,
                 updateLiveEdgeCatchUp() { return false; },
                 resetLiveEdgeCatchUp() {},
@@ -3056,7 +3590,1090 @@ Object.assign(cases, {
         console.log(`    the guard can only fire at saturation (${moduleCap}x), `
             + `so it cannot judge a slow ramp`);
     },
+    'chat-notification-behaviour'() {
+        function makeEl(tag) {
+            const el = {
+                tagName: tag,
+                className: '',
+                innerText: '',
+                innerHTML: undefined,
+                hidden: false,
+                dataset: {},
+                children: [],
+                classes: new Set(),
+                parentNode: null,
+                attrs: {},
+                setAttribute(k, v) { this.attrs[k] = v; },
+                appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
+                removeChild(child) {
+                    const i = this.children.indexOf(child);
+                    if (i !== -1) this.children.splice(i, 1);
+                    child.parentNode = null;
+                    return child;
+                },
+                classList: {
+                    add(...names) { names.forEach((n) => el.classes.add(n)); },
+                    remove(...names) { names.forEach((n) => el.classes.delete(n)); },
+                    contains(name) { return el.classes.has(name); }
+                }
+            };
+            return el;
+        }
+
+        const doc = {
+            createElement: makeEl,
+            getElementById: (id) => (id === 'chat-toast-overflow' ? overflowEl : null)
+        };
+        const layer = makeEl('div');
+        const overflowEl = makeEl('div');
+        overflowEl.hidden = true;
+        const badge = makeEl('span');
+        badge.hidden = true;
+        // Live Chat is the default tab, so the badge must stay DOWN while the
+        // host is watching the log render in front of them. Flip this to model
+        // the host being on the Stream Info tab instead.
+        const tabChat = makeEl('button');
+        tabChat.classes.add('active');
+
+        const timers = [];
+        const sandbox = {
+            document: doc,
+            chatToastLayer: layer,
+            chatToastOverflowEl: overflowEl,
+            chatUnreadBadge: badge,
+            tabChat: tabChat,
+            liveChatToasts: 0,
+            chatUnreadCount: 0,
+            lastChatToastAt: -1e9,
+            chatToastOverflow: 0,
+            CHAT_TOAST_LIFETIME_MS: 7000,
+            CHAT_TOAST_EXIT_MS: 260,
+            CHAT_TOAST_BURST_MS: 1200,
+            MAX_CHAT_TOASTS: 3,
+            MAX_CHAT_UNREAD: 99,
+            Date: { now: () => clock },
+            setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+            // cancelable, like the real one: the counter's expiry is re-armed
+            // on every folded message, so it must be possible to cancel.
+            clearTimeout: (id) => { if (id) timers[id - 1] = null; },
+            console: quietConsole()
+        };
+        let clock = 1e9;
+        sandbox.Date.now = () => clock;
+
+        // Compile the real functions against ONE shared context. Each
+        // compileFunction() call creates its own vm context, and a primitive
+        // like chatUnreadCount is a per-context binding, not a property of the
+        // sandbox object — so four separate contexts would each get their own
+        // copy and no function could observe another's writes.
+        // A primitive that a function assigns to (`chatUnreadCount += 1`) is a
+        // CONTEXT BINDING in a vm, not a property of the sandbox object. Seeding
+        // it in the object literal creates only a property, so the function's
+        // free reference resolves to nothing. Declare the mutable state as real
+        // bindings in the context first, then let the functions own them.
+        const context = vm.createContext(sandbox, { name: 'app.js#chat-notification' });
+        vm.runInContext(
+            'var chatUnreadCount = 0, liveChatToasts = 0, chatToastOverflow = 0, lastChatToastAt = -1e9, chatOverflowTimer = null;',
+            context);
+        const load = (name) => vm.runInContext(`(${extractFunction(name)})`, context,
+            { filename: `app.js#${name}` });
+        // showChatNotification CALLS renderChatUnread, and clearChatUnread calls
+        // it too, so these names must be real globals inside the context — a
+        // bare expression statement would leave them unbound. Declare them all
+        // in one pass from a temporary holder object.
+        context.__fns = {
+            showChatNotification: load('showChatNotification'),
+            renderChatUnread: load('renderChatUnread'),
+            clearChatUnread: load('clearChatUnread'),
+            clearChatOverflow: load('clearChatOverflow'),
+            updateChatToastOverflow: load('updateChatToastOverflow'),
+            scheduleChatOverflowRetire: load('scheduleChatOverflowRetire'),
+            dismissChatToast: load('dismissChatToast')
+        };
+        vm.runInContext(
+            'for (const k in __fns) this[k] = __fns[k];', context);
+        const show = context.showChatNotification;
+        const render = context.renderChatUnread;
+        const clear = context.clearChatUnread;
+        const updateOverflow = context.updateChatToastOverflow;
+
+        // Read state back out of the context, not off the sandbox literal.
+        const state = () => vm.runInContext(
+            '({ live: liveChatToasts, unread: chatUnreadCount })', context);
+
+        // -- 1. Isolated messages each build a card -------------------------
+        show('Ann', 'first', 'USER');
+        assertEqual(state().live, 1, 'an isolated message must build one card');
+        assert(layer.classList.contains('active'), 'the layer must be visible while it holds a card');
+        const card = layer.children[0];
+        assert(card.innerHTML === undefined, 'card text must never be assigned innerHTML');
+
+        // -- 2. A burst must NOT stack a card per message ------------------
+        for (let i = 0; i < 25; i++) {
+            clock += 100;               // inside CHAT_TOAST_BURST_MS
+            show('Ann', 'burst ' + i, 'USER');
+        }
+        assertEqual(state().live, 1,
+            'a burst inside the window must fold into one card, not stack 26');
+        assertEqual(overflowEl.hidden, false, 'the folded counter must be shown');
+        assertEqual(overflowEl.innerText, '+25 more',
+            'the counter must report how many messages it absorbed');
+
+        // -- 3. Even spread out, the stack is capped at MAX_CHAT_TOASTS ----
+        for (let i = 0; i < 10; i++) {
+            clock += 5000;              // outside the burst window
+            show('Ann', 'spread ' + i, 'USER');
+        }
+        assertEqual(state().live, 3,
+            'the concurrent card count must never exceed MAX_CHAT_TOASTS');
+
+        // -- 4. Unread badge: shown while unread, hidden at zero ----------
+        // Steps 1-3 ran with the chat tab visible, so nothing was unread and the
+        // badge never rose. Model the host sitting on Stream Info instead.
+        assertEqual(badge.hidden, true,
+            'with Live Chat open the host is already reading the log, so the badge '
+            + 'must NOT count those messages');
+        assertEqual(state().unread, 0,
+            'messages rendered in the open chat tab are not unread');
+        tabChat.classes.delete('active');            // host switches to Stream Info
+        show('Ann', 'while away', 'USER');
+        assertEqual(badge.hidden, false,
+            'a message arriving while the chat tab is hidden MUST raise the badge');
+        assertEqual(state().unread, 1, 'exactly one message, exactly one unread');
+        clear();
+        assertEqual(badge.hidden, true, 'clearing the count must HIDE the badge, not show 0');
+        assertEqual(state().unread, 0, 'clearing must zero the count');
+
+        // -- 5. The label is clamped so it cannot reflow the tab strip ----
+        vm.runInContext('chatUnreadCount = 100', context);
+        render();
+        assertEqual(badge.innerText, '99+', 'a runaway count must clamp to 99+');
+        vm.runInContext('chatUnreadCount = 99', context);
+        render();
+        assertEqual(badge.innerText, '99', 'a count at the cap renders exactly');
+
+        // -- 6. The counter is cleared once the burst is retired -----------
+        vm.runInContext('chatToastOverflow = 0', context);
+        updateOverflow();
+        assertEqual(overflowEl.hidden, true, 'a zero counter must be hidden');
+
+        // -- 7. The layer MUST fully go idle after a burst ----------------
+        // The regression: nothing ever cleared chatToastOverflow, and it is the
+        // last thing holding the layer `active` — which is pointer-events:auto
+        // over the video. One burst therefore left a permanent invisible
+        // click-eater in the corner of the player's hit area.
+        // Start from a clean stack: earlier steps deliberately left 3 live
+        // cards and a folded count, and step 7 is about the retire path.
+        layer.children.length = 0;
+        vm.runInContext('liveChatToasts = 0; chatToastOverflow = 0; lastChatToastAt = -1e9;', context);
+        timers.length = 0;
+        clock += 5000;
+        show('Ann', 'kicks off a fold', 'USER');   // alone -> 1 card
+        clock += 10;
+        show('Ann', 'folds', 'USER');               // inside burst window
+        assertEqual(vm.runInContext('chatToastOverflow', context), 1,
+            'the second close message must fold into the counter');
+
+        // Fire the card's dismissal and the counter's own retire timer.
+        const foldedCard = layer.children[layer.children.length - 1];
+        context.dismissChatToast(foldedCard);
+        let guard = 0;
+        while (timers.length && guard++ < 60) {
+            const t = timers.shift();
+            if (t) t.fn();
+        }
+
+        assertEqual(vm.runInContext('chatToastOverflow', context), 0,
+            'the folded counter must retire on its own, not stay forever');
+        assertEqual(layer.classList.contains('active'), false,
+            'the layer must be released, or it stays a permanent click-eater over the video');
+        assertEqual(overflowEl.hidden, true, 'the pill must be hidden once retired');
+
+        // -- 8. Clicking through retires the counter ----------------------
+        // The host clicked the card, so they are going to the log that already
+        // holds every folded message; leaving a stale "+N more" behind would
+        // be a permanent artifact they can only clear by reloading.
+        clock += 5000;
+        show('Ann', 'another fold', 'USER');
+        clock += 10;
+        show('Ann', 'folds again', 'USER');
+        assertEqual(vm.runInContext('chatToastOverflow', context), 1,
+            'precondition: a message is folded');
+        const liveBefore = vm.runInContext('liveChatToasts', context);
+        context.clearChatOverflow();
+        assertEqual(vm.runInContext('chatToastOverflow', context), 0,
+            'acting on a notification must clear the folded counter');
+        assertEqual(overflowEl.hidden, true, 'the pill must be hidden after click-through');
+        // A visible card legitimately keeps the layer active; the assertion is
+        // that clearChatOverflow did not leave a STALE counter behind.
+        assertEqual(layer.classList.contains('active'), liveBefore > 0,
+            'the layer must be released only once no card remains on screen');
+        // Drain the remaining card so the layer must then go idle.
+        let g3 = 0;
+        while (timers.length && g3++ < 60) { const t = timers.shift(); if (t) t.fn(); }
+        assertEqual(layer.classList.contains('active'), false,
+            'the layer must be released once the last card is gone');
+
+        // -- 9. A SOLO card must also release the layer --------------------
+        // A distinct failure mode from step 7: nothing is ever folded here, so
+        // the counter is 0 and ONLY the dismissal path can release the layer.
+        // If that path is skipped, one ordinary message leaves a dead,
+        // click-eating box over the video for the rest of the session — and
+        // most messages are solo, so this is the common way to hit the bug.
+        layer.children.length = 0;
+        vm.runInContext('liveChatToasts = 0; chatToastOverflow = 0; lastChatToastAt = -1e9;', context);
+        timers.length = 0;
+        clock += 5000;
+        show('Ann', 'just one message', 'USER');
+        assertEqual(layer.children.length, 1, 'precondition: one card is up');
+        assertEqual(layer.classList.contains('active'), true, 'precondition: layer is active');
+        let g4 = 0;
+        while (timers.length && g4++ < 60) { const t = timers.shift(); if (t) t.fn(); }
+        assertEqual(layer.children.length, 0, 'the solo card must be removed');
+        assertEqual(vm.runInContext('chatToastOverflow', context), 0,
+            'no fold happened, so the counter must still be zero');
+        assertEqual(layer.classList.contains('active'), false,
+            'a single message must not leave the layer active over the video');
+    },
+    'polling-fallback-catch-up-is-silent'() {
+        function stubEl() {
+            const classes = new Set();
+            return { innerText: '', hidden: false, dataset: {}, children: [], style: {}, classes,
+                setAttribute() {}, appendChild(c) { this.children.push(c); return c; },
+                removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c; },
+                classList: { add(...n) { n.forEach(x => classes.add(x)); },
+                    remove(...n) { n.forEach(x => classes.delete(x)); },
+                    contains: n => classes.has(n) } };
+        }
+
+        // Run the REAL startPollingFallback with a controllable watermark and
+        // a fetch that reports what `since` it was asked for.
+        function runPoll(initialWatermark, backlog, primed) {
+            const asked = [];
+            const seen = [];
+            let tick = null;
+            // A single array is reused for every poll; a nested array is a queue
+            // of per-poll responses, so a multi-poll scenario can hand back a
+            // different batch on each tick.
+            const batches = Array.isArray(backlog[0]) ? backlog.slice() : [backlog];
+            // The watermark is a real vm BINDING, not a sandbox property:
+            // `const since = lastReceivedMessageId` reads a free variable, and
+            // the mutated version must observe whatever the body assigns to it.
+            // As a plain object property it would still read the initial value,
+            // and the test could not tell the two implementations apart.
+            const ctx = vm.createContext({
+                console: quietConsole(),
+                setInterval: (fn) => { tick = fn; return 1; },
+                fallbackPollTimer: null,
+                window: { location: { origin: 'http://127.0.0.1:1' } },
+                handleIncomingMessage: (m, isHistory) => {
+                    seen.push({ id: m.id, isHistory });
+                    // Mirror the real receive path: it advances the watermark.
+                    vm.runInContext('lastReceivedMessageId = ' + m.id, ctx);
+                },
+                fetch: (url) => {
+                    asked.push(url);
+                    // `batches` is either one array reused for every poll, or a
+                    // queue of per-poll arrays so a multi-poll scenario can hand
+                    // back a different response on each tick.
+                    const batch = Array.isArray(batches[0])
+                        ? (batches.length > 1 ? batches.shift() : batches[0])
+                        : batches[0];
+                    return Promise.resolve({
+                        ok: true,
+                        json: () => Promise.resolve({ ok: true, messages: batch || [] })
+                    });
+                }
+            });
+            vm.runInContext('var lastReceivedMessageId = ' + initialWatermark + ';', ctx);
+            vm.runInContext('var chatStreamPrimed = ' + Boolean(primed) + ';', ctx);
+            const fn = vm.runInContext('(' + extractFunction('startPollingFallback') + ')', ctx);
+            fn();
+            const isPrimed = () => vm.runInContext('chatStreamPrimed', ctx);
+            // The real driver calls the interval body every 3s.
+            const runOnce = () => { tick(); return settle(); };
+            runOnce();
+            return { asked, seen, runOnce, isPrimed };
+        }
+
+        // The interval body is async: it runs up to the first await before the
+        // fetch is even called, so the URL is recorded on a later microtask.
+        // `settle` flushes enough of the queue for the body to finish.
+        const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+        // -- Catch-up: watermark 0 means the server returns the WHOLE history.
+        const backlog = [{ id: 1 }, { id: 2 }, { id: 3 }];
+        const first = runPoll(0, backlog);
+        return settle().then(() => {
+            assertEqual(first.asked.length, 1, 'exactly one poll request must be issued');
+            assertEqual(first.asked[0].includes('since=0'), true,
+                'a watermark of 0 must ask the server for since=0');
+            assertEqual(first.seen.length, 3, 'every backlog message must be delivered');
+            assertEqual(first.seen.every((m) => m.isHistory === true), true,
+                'a since=0 response is the whole backlog, so EVERY message in it '
+                + 'must be marked as history — otherwise the host is notified for '
+                + 'messages it already has');
+        }).then(() => {
+            // -- Steady state: a non-zero watermark is a genuine delta.
+            const delta = runPoll(7, [{ id: 8 }, { id: 9 }]);
+            return settle().then(() => {
+                assertEqual(delta.asked[0].includes('since=7'), true,
+                    'a known watermark must be sent as since=<id>');
+                assertEqual(delta.seen.length, 2, 'the delta must be delivered');
+                assertEqual(delta.seen.every((m) => m.isHistory === false), true,
+                    'messages after a known watermark are genuinely new and must notify');
+            });
+        }).then(() => {
+            // -- Primed stream: a still-zero watermark means the log is EMPTY,
+            //    not that this is backlog. Keying the catch-up decision on
+            //    `since === 0` alone silently swallowed the first live message
+            //    after every fallback engagement, because the watermark only
+            //    moves once a message lands.
+            const primed = runPoll(0, [{ id: 42 }], true);
+            return settle().then(() => {
+                assertEqual(primed.asked[0].includes('since=0'), true,
+                    'an empty log still asks for since=0');
+                assertEqual(primed.seen.length, 1, 'the live message must be delivered');
+                assertEqual(primed.seen[0].isHistory, false,
+                    'once init has landed, a since=0 response is NEW traffic and '
+                    + 'must notify; treating it as backlog drops the first live message');
+            });
+        }).then(() => {
+            // -- The client must be able to prime ITSELF off a poll ---------
+            // chatStreamPrimed was written only by the SSE `init` handler, but
+            // a failed EventSource constructor returns BEFORE that listener is
+            // attached, and an EventSource handed a non-200 or a non
+            // event-stream MIME type goes straight to CLOSED without ever
+            // reconnecting. Polling is then the only transport all session and
+            // the flag stayed false, so with a still-zero watermark EVERY
+            // message was classified as backlog and the host was notified
+            // never. Poll 1 here is empty (nothing to sync), poll 2 carries a
+            // genuinely live message that must notify.
+            const twoPoll = runPoll(0, [[], [{ id: 77 }]], false);
+            return twoPoll.runOnce().then(() => {
+                assertEqual(twoPoll.seen.length, 1, 'the live message must be delivered');
+                assertEqual(twoPoll.seen[0].id, 77, 'it must be the second poll batch');
+                assertEqual(twoPoll.seen[0].isHistory, false,
+                    'a live message on the polling-only path MUST notify; if this '
+                    + 'is silent the host is never told anything again');
+                assertEqual(twoPoll.isPrimed(), true,
+                    'applying a poll response must prime the client, or every later '
+                    + 'message is misread as backlog');
+            });
+        }).then(() => {
+            // -- The watermark must be sampled BEFORE the await. Reading it
+            //    after would see the value this very batch just advanced, and
+            //    the batch would be misclassified as a delta.
+            const racy = runPoll(0, [{ id: 1 }, { id: 2 }]);
+            return settle().then(() => {
+                assertEqual(racy.seen.every((m) => m.isHistory === true), true,
+                    'the batch must be classified from the watermark as it was '
+                    + 'BEFORE the fetch, not after handleIncomingMessage advanced it');
+            });
+        });
+    },
+    'chat-notification-gate-decisions'() {
+        function makeEl(tag) {
+            const classes = new Set();
+            return {
+                tag, className: '', innerText: '', innerHTML: undefined, hidden: false,
+                dataset: {}, children: [], style: {}, attrs: {}, offsetWidth: 1, parentNode: null,
+                classes,
+                setAttribute(k, v) { this.attrs[k] = v; },
+                appendChild(c) { c.parentNode = this; this.children.push(c); return c; },
+                removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c; },
+                get firstChild() { return this.children[0] || null; },
+                classList: {
+                    add(...n) { n.forEach(x => classes.add(x)); },
+                    remove(...n) { n.forEach(x => classes.delete(x)); },
+                    contains: (n) => classes.has(n)
+                }
+            };
+        }
+
+        // (isHost, isHistory, clientId is ours) -> did a card get built?
+        function decide(isHost, isHistory, isSelf) {
+            const layer = makeEl('div');
+            const badge = makeEl('span');
+            const sfx = [];
+            const ctx = {
+                console: { log() {}, warn() {}, error() {} },
+                document: { createElement: makeEl, getElementById: () => null },
+                chatMessages: makeEl('div'), activityEmpty: makeEl('div'),
+                chatToastLayer: layer, chatUnreadBadge: badge, chatToastOverflowEl: null,
+                tabChat: makeEl('button'),        // no `active` -> badge would rise
+                myClientId: 'c_host',
+                addMessage() {},
+                playSfx: (t) => sfx.push(t),
+                requestAnimationFrame() {},
+                Date: { now: () => 1e9 }
+            };
+            vm.createContext(ctx);
+            vm.runInContext(
+                'var lastReceivedMessageId = 0, liveChatToasts = 0, chatUnreadCount = 0, '
+                + 'lastChatToastAt = -1e9, chatToastOverflow = 0, chatOverflowTimer = null, '
+                + 'isHost = ' + isHost + ';'
+                // The receive path also consults the dedupe sets before it ever
+                // reaches the notification branch.
+                + 'var seenMessageIds = new Set(), seenClientMsgIds = new Set();', ctx);
+            // The notification helpers are stubbed: the point is WHICH branch
+            // the real receive path takes, not how a card is painted.
+            ctx.__notified = 0;
+            vm.runInContext('var showChatNotification = () => { __notified += 1; }, '
+                + 'updateChatToastOverflow = () => {}, scheduleChatOverflowRetire = () => {}, '
+                + 'renderChatUnread = () => {};', ctx);
+            const fn = vm.runInContext('(' + extractFunction('handleIncomingMessage') + ')', ctx);
+            fn({
+                id: 1, author: 'Viewer', text: 'hello', badge: 'USER',
+                clientId: isSelf ? 'c_host' : 'c_viewer'
+            }, isHistory);
+            return { notified: ctx.__notified, sfx };
+        }
+
+        const cases = [
+            ['a NEW viewer message, as HOST', true, false, false, 1, 'chime'],
+            ['a REPLAYED history message, as HOST', true, true, false, 0, null],
+            ["the host's own echo", true, false, true, 0, null],
+            ['a NEW viewer message, as a VIEWER', false, false, false, 0, 'pop']
+        ];
+        for (const [label, isHost, isHistory, isSelf, expect, sfx] of cases) {
+            const r = decide(isHost, isHistory, isSelf);
+            assertEqual(r.notified, expect,
+                `${label} must ${expect ? 'raise a card' : 'stay silent'}`);
+            if (sfx) {
+                assertEqual(r.sfx.length > 0 && r.sfx[0] === sfx, true,
+                    `${label} must play '${sfx}', got [${r.sfx}]`);
+            } else {
+                assertEqual(r.sfx.length, 0,
+                    `${label} must not play a notification sound, got [${r.sfx}]`);
+            }
+        }
+    },
+    'chat-init-replay-classification'() {
+        function runInit(history, watermark) {
+            const seen = [];
+            let listeners = {};
+            class FakeEventSource {
+                constructor(url) { this.url = url; }
+                addEventListener(name, fn) { listeners[name] = fn; }
+                close() {}
+            }
+            const ctx = {
+                console: { log() {}, warn() {}, error() {} },
+                EventSource: FakeEventSource,
+                window: { location: { origin: 'http://127.0.0.1:1', hostname: '127.0.0.1' } },
+                document: { getElementById: () => null },
+                chatSource: null, fallbackPollTimer: null,
+                viewerNum: null, tabChat: null,
+                updateViewerCount() {}, clearChatUnread() {},
+                isHost: false, userBadge: 'USER', hasCustomNick: false,
+                userNick: 'Host', updateNickDisplay() {},
+                handleIncomingMessage: (m, isHistory) => {
+                    seen.push({ id: m.id, isHistory });
+                    vm.runInContext('lastReceivedMessageId = ' + m.id, ctx);
+                },
+                startPollingFallback() {},
+                JSON, Array, Object, Number, parseInt
+            };
+            vm.createContext(ctx);
+            vm.runInContext(
+                'var lastReceivedMessageId = ' + watermark
+                + ', chatStreamPrimed = ' + (watermark > 0) + ';', ctx);
+            const fn = vm.runInContext('(' + extractFunction('connectChatEvents') + ')', ctx);
+            fn();
+            listeners.init({ data: JSON.stringify({ isHost: true, history, reactionCounts: {} }) });
+            return { seen, primed: () => vm.runInContext('chatStreamPrimed', ctx) };
+        }
+
+        // Cold connect: no watermark, so the server sent slice(-50) of old
+        // backlog. It must be silent.
+        const cold = runInit([{ id: 1 }, { id: 2 }, { id: 3 }], 0);
+        assertEqual(cold.seen.length, 3, 'the init backlog must still be rendered');
+        assertEqual(cold.seen.every((m) => m.isHistory === true), true,
+            'a COLD connect replays old backlog; it must stay silent or the host '
+            + 'gets a wall of cards for messages from before they arrived');
+        assertEqual(cold.primed(), true, 'init must prime the client');
+
+        // Auto-reconnect: a watermark exists, so the server sent exactly the
+        // messages this client missed. They are new and must notify.
+        const missed = runInit([{ id: 41 }, { id: 42 }], 40);
+        assertEqual(missed.seen.length, 2, 'the missed messages must be rendered');
+        assertEqual(missed.seen.every((m) => m.isHistory === false), true,
+            'a RECONNECT replay is the messages this client missed, not backlog; '
+            + 'marking it history drops every message that arrived during a blip');
+    },
+
+    /* ==================================================================
+       Studio (broadcast.js) — the browser broadcaster
+       ================================================================== */
+
+    'studio-h264-level-matches-resolution-and-framerate'() {
+        const scope = compileStudioFns(
+            ['macroblocksFor', 'h264LevelIdcFor', 'h264CodecString'],
+            { H264_LEVEL_TABLE: studioLevelTable() }
+        );
+        // Macroblocks are 16x16, so 1920x1080 is 120*68 = 8160 MB.
+        assertEqual(scope.macroblocksFor(1920, 1080), 8160, '1920x1080 macroblock count');
+        assertEqual(scope.macroblocksFor(1280, 720), 3600, '1280x720 macroblock count');
+
+        // 1080p60 = 8160 MB * 60 = 489600 MB/s, which only level 4.2 (522240)
+        // covers. Claiming 4.0/4.1 would under-declare the stream and a decoder
+        // that trusts profile-level-id would refuse it.
+        assertEqual(scope.h264LevelIdcFor(1920, 1080, 60), 0x2a, '1080p60 -> level 4.2');
+        // 1080p30 halves the rate and fits level 4.0.
+        assertEqual(scope.h264LevelIdcFor(1920, 1080, 30), 0x28, '1080p30 -> level 4.0');
+        // 720p30 = 3600 * 30 = 108000 MB/s -> level 3.1.
+        assertEqual(scope.h264LevelIdcFor(1280, 720, 30), 0x1f, '720p30 -> level 3.1');
+        // 2160p60 = 32400 MB * 60 = 1944000 -> level 5.2 (2073600).
+        assertEqual(scope.h264LevelIdcFor(3840, 2160, 60), 0x34, '4K60 -> level 5.2');
+    },
+
+    'studio-h264-codec-string-is-constrained-baseline'() {
+        const scope = compileStudioFns(
+            ['macroblocksFor', 'h264LevelIdcFor', 'h264CodecString', 'profileLevelIdFromCodec'],
+            { H264_LEVEL_TABLE: studioLevelTable() }
+        );
+        // Constrained baseline (42) is the profile MediaMTX documents for
+        // browser publishing, and the only one guaranteed not to emit B-frames.
+        const codec = scope.h264CodecString(1920, 1080, 30);
+        assert(/^avc1\.42e0[0-9a-f]{2}$/.test(codec), `constrained-baseline codec string, got ${codec}`);
+        assertEqual(scope.profileLevelIdFromCodec(codec), '42e028', 'profile-level-id parsed back out');
+
+        // The reverse direction must be a clean 6-digit lowercase hex triple.
+        assertEqual(scope.profileLevelIdFromCodec('avc1.42E02A'), '42e02a', 'uppercase input is normalised');
+    },
+    'studio-av1-level-rises-with-pixel-rate'() {
+        const scope = compileStudioFns(
+            ['macroblocksFor', 'h264LevelIdcFor', 'av1CodecString', 'codecStringFor'],
+            { H264_LEVEL_TABLE: studioLevelTable() }
+        );
+        // av01.P.LLT.DD: P is profile, LL is a two-digit level index, T is tier.
+        assert(/^av01\.0\.\d{2}M\.08$/.test(scope.av1CodecString(1920, 1080, 30)),
+            'AV1 codec string shape');
+
+        const levelOf = (w, h, f) => parseInt(scope.av1CodecString(w, h, f).split('.')[2], 10);
+        // The declared level must be monotonic: a bigger frame or a faster frame
+        // rate can never lower it, or a 4K60 broadcast would announce 4K30's
+        // level and under-declare itself exactly like the H.264 case.
+        const ladder = [
+            levelOf(640, 480, 30),
+            levelOf(1280, 720, 30),
+            levelOf(1920, 1080, 30),
+            levelOf(1920, 1080, 60),
+            levelOf(3840, 2160, 60),
+        ];
+        for (let i = 1; i < ladder.length; i += 1) {
+            assert(ladder[i] >= ladder[i - 1],
+                `AV1 level must not fall as the picture grows: ${ladder.join(' -> ')}`);
+        }
+        assert(ladder[ladder.length - 1] > ladder[0], '4K60 must outrank 480p30');
+        // The family dispatcher must agree with the per-family builders.
+        assertEqual(scope.codecStringFor('av1', 1920, 1080, 30), scope.av1CodecString(1920, 1080, 30),
+            'codecStringFor routes AV1 to the AV1 builder');
+        assertEqual(scope.codecStringFor('vp8', 1920, 1080, 30), 'vp8', 'VP8 has no level suffix');
+    },
+
+    'studio-odd-dimensions-are-forced-even'() {
+        const scope = compileStudioFns(['evenDimensionsFor']);
+        // Chrome's software H.264 encoder rejects odd dimensions outright, and an
+        // odd height also breaks the packetizer's 16-pixel macroblock maths.
+        assertEqual(scope.evenDimensionsFor(1921, 1081), { width: 1920, height: 1080 },
+            'odd dimensions are floored to even');
+        assertEqual(scope.evenDimensionsFor(1920, 1080), { width: 1920, height: 1080 },
+            'even dimensions pass through unchanged');
+        // Degenerate input must still yield something an encoder accepts.
+        assertEqual(scope.evenDimensionsFor(1, 1), { width: 16, height: 16 },
+            'tiny input is raised to the 16x16 macroblock floor');
+    },
+
+    'studio-suggested-bitrate-is-monotonic-and-clamped'() {
+        const scope = compileStudioFns(['suggestedBitrateBps']);
+        const at = (w, h, f, c) => scope.suggestedBitrateBps(w, h, f, c);
+
+        // More pixels or more frames can only cost more.
+        assert(at(1920, 1080, 60, 'h264') > at(1920, 1080, 30, 'h264'), '60fps beats 30fps');
+        assert(at(3840, 2160, 30, 'h264') > at(1920, 1080, 30, 'h264'), '4K beats 1080p');
+        // AV1 is the whole reason to pick it: cheaper per pixel than H.264.
+        assert(at(1920, 1080, 30, 'av1') < at(1920, 1080, 30, 'h264'), 'AV1 suggests less than H.264');
+
+        // Clamped to the band this uplink can actually carry. An unclamped
+        // 4K60 H.264 suggestion would be ~24 Mbps, which this hotspot cannot.
+        assert(at(3840, 2160, 60, 'h264') <= 20000000, 'ceiling is 20 Mbps');
+        assert(at(320, 240, 15, 'h264') >= 250000, 'floor is 250 kbps');
+        // Rounded to whole kbps so the UI slider and the encoder agree exactly.
+        assertEqual(at(1920, 1080, 30, 'h264') % 1000, 0, 'bitrate is a whole number of kbps');
+    },
+    // The codec selector is only real if the OFFER carries exactly one codec.
+    // Re-ordering is not enough: MediaMTX's answerer (Pion) picks the first
+    // family it supports, so leaving VP8/VP9/AV1 in the offer alongside H.264
+    // means "pick AV1" can still be answered with H.264 — a live-looking
+    // broadcast that is quietly the wrong codec, with the bridge then building
+    // renditions for the wrong source.
+    'studio-publish-sdp-prunes-to-the-selected-codec'() {
+        const scope = compileStudioFns(['optimizePublishSdp']);
+
+        // --- AV1 selected: every other video codec must be gone. ---
+        const av1 = scope.optimizePublishSdp(PUBLISH_SDP, { onlyCodecName: 'AV1' });
+        const av1Video = sectionOf(av1.split('\r\n'), 'm=video', 'm=audio');
+        assert(av1Video.lines.some((line) => line === 'a=rtpmap:99 AV1/90000'),
+            'the selected codec survives');
+        assert(!av1Video.lines.some((line) => /^a=rtpmap:\d+ H264\//.test(line)),
+            'H.264 is pruned when AV1 is selected');
+        assert(!av1Video.lines.some((line) => /^a=rtpmap:\d+ VP8\//.test(line)),
+            'VP8 is pruned when AV1 is selected');
+        assert(!av1Video.lines.some((line) => /^a=rtpmap:\d+ VP9\//.test(line)),
+            'VP9 is pruned when AV1 is selected');
+
+        // A payload type left in the m= line after its rtpmap was removed is a
+        // malformed offer: the answerer indexes its format table by that list
+        // and fails the whole handshake.
+        const listedPts = av1Video.lines[0].trim().split(/\s+/).slice(3);
+        assert(listedPts.indexOf('0') === -1, 'the m= line carries no bare 0 placeholder');
+        assert(listedPts.length > 0, 'the m= line still lists the surviving codec');
+        for (const pt of listedPts) {
+            assert(av1Video.lines.indexOf('a=rtpmap:' + pt + ' AV1/90000') !== -1,
+                'payload ' + pt + ' listed in m= has a matching rtpmap');
+        }
+
+        // --- H.264 selected: rtx must follow its apt parent. ---
+        // rtx is loss recovery; dropping it while keeping the media codec is
+        // legal but throws away the cheapest repair there is. rtx is addressed
+        // by `apt=<media pt>`, so it survives exactly when its parent does.
+        //
+        // Built locally rather than reusing PUBLISH_SDP: that fixture carries
+        // no rtx payload at all, and the apt-following rule is the whole point
+        // of this half of the test.
+        const withRtx = [
+            'v=0',
+            'm=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99',
+            'c=IN IP4 0.0.0.0',
+            'a=mid:0',
+            'a=sendonly',
+            'a=rtpmap:96 H264/90000',
+            'a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f',
+            // rtx for the H.264 payload (pt 96)
+            'a=rtpmap:97 rtx/90000',
+            'a=fmtp:97 apt=96',
+            'a=rtpmap:98 VP8/90000',
+            // a rtx whose parent is VP8 — must be dropped even though rtx
+            // itself is "kept", because its apt parent did not survive
+            'a=rtpmap:100 rtx/90000',
+            'a=fmtp:100 apt=98',
+            'a=rtpmap:99 AV1/90000',
+            'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+            'c=IN IP4 0.0.0.0',
+            'a=rtpmap:111 opus/48000/2',
+            'a=fmtp:111 minptime=10;useinbandfec=1',
+        ].join('\r\n');
+        const h264 = scope.optimizePublishSdp(withRtx, {
+            onlyCodecName: 'H264',
+            h264ProfileLevelId: '42e028',
+        });
+        const h264Video = sectionOf(h264.split('\r\n'), 'm=video', 'm=audio');
+        assert(h264Video.lines.some((line) => /^a=rtpmap:\d+ H264\//.test(line)),
+            'H.264 survives when H.264 is selected');
+
+        // The rtx whose apt parent is the surviving H.264 payload is kept.
+        const rtxPt = h264Video.lines
+            .find((line) => line === 'a=rtpmap:97 rtx/90000');
+        assert(rtxPt, 'the RTX payload is kept alongside its H.264 parent');
+        assert(h264Video.lines.indexOf('a=fmtp:97 apt=96') !== -1,
+            'the surviving RTX keeps its apt= line');
+        assert(h264Video.lines.indexOf('a=rtpmap:97 rtx/90000') !== -1,
+            'RTX apt= still points at a payload the offer keeps');
+
+        // The rtx whose apt parent was pruned goes with it. Keeping an rtx
+        // that references a payload type no longer in the offer is a dangling
+        // reference — the answerer cannot resolve apt=96's neighbour and the
+        // retransmission stream is simply broken.
+        assert(h264Video.lines.indexOf('a=rtpmap:100 rtx/90000') === -1,
+            'an RTX whose apt parent was pruned is dropped with it');
+        assert(h264Video.lines.indexOf('a=fmtp:100 apt=98') === -1,
+            "the dropped RTX's apt= line goes with it");
+
+        assert(!h264Video.lines.some((line) => /^a=rtpmap:\d+ (AV1|VP8)\//.test(line)),
+            'non-H.264 codecs are pruned when H.264 is selected');
+
+        // Every payload still listed in the m= line must still have an rtpmap.
+        const h264Pts = h264Video.lines[0].trim().split(/\s+/).slice(3);
+        for (const pt of h264Pts) {
+            assert(h264Video.lines.some((line) => line.startsWith('a=rtpmap:' + pt + ' ')),
+                'payload ' + pt + ' listed in m= has a matching rtpmap');
+        }
+
+        // --- The audio section must be completely untouched. ---
+        // Pruning is scoped to the video m-line; it must never touch the audio
+        // section's Opus parameters, which the packetizer needs.
+        assert(h264.includes('a=rtpmap:111 opus/48000/2'),
+            'the Opus rtpmap survives video pruning');
+        assert(h264.includes('a=fmtp:111 minptime=10;useinbandfec=1'),
+            'the Opus fmtp survives video pruning');
+
+        // --- No pruning when no codec is named (the native engine path). ---
+        assertEqual(scope.optimizePublishSdp(PUBLISH_SDP, {}), PUBLISH_SDP,
+            'without onlyCodecName the offer is passed through unchanged');
+    },
+
+    // Silently accepting a codec the answerer refused is how "I picked AV1"
+    // ends up as H.264 with no indication anything went wrong.
+    'studio-negotiated-codec-is-read-back-from-the-answer'() {
+        const scope = compileStudioFns(['negotiatedVideoCodec', 'sdpCodecNameFor']);
+
+        const answer = [
+            'v=0',
+            'm=video 9 UDP/TLS/RTP/SAVPF 96 97',
+            'c=IN IP4 0.0.0.0',
+            // RTX is listed FIRST on purpose: it is a repair payload and must
+            // never be mistaken for the negotiated media codec.
+            'a=rtpmap:97 rtx/90000',
+            'a=fmtp:97 apt=96',
+            'a=rtpmap:96 AV1/90000',
+            'a=fmtp:96 level-idx=5;profile=0;tier=0',
+            'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+            'a=rtpmap:111 opus/48000/2',
+        ].join('\r\n');
+        assertEqual(scope.negotiatedVideoCodec(answer), 'AV1',
+            'the media codec is found even when rtx is listed before it');
+
+        const audioOnly = ['v=0', 'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=rtpmap:111 opus/48000/2'].join('\r\n');
+        assertEqual(scope.negotiatedVideoCodec(audioOnly), null,
+            'an audio-only answer reports no video codec');
+        assertEqual(scope.negotiatedVideoCodec(''), null, 'an empty answer reports no codec');
+        assertEqual(scope.negotiatedVideoCodec(null), null, 'a missing answer reports no codec');
+
+        // The SDP spelling is what the pruner matches on. Chrome writes
+        // "VP8"/"VP9" in SDP where WebCodecs says "vp8"/"vp09.00.10.08";
+        // pruning on the WebCodecs spelling would silently keep everything and
+        // make the codec selector a no-op.
+        assertEqual(scope.sdpCodecNameFor('vp8'), 'VP8', 'VP8 uses the SDP spelling');
+        assertEqual(scope.sdpCodecNameFor('vp9'), 'VP9', 'VP9 uses the SDP spelling');
+        assertEqual(scope.sdpCodecNameFor('h264'), 'H264', 'H264 uses the SDP spelling');
+        assertEqual(scope.sdpCodecNameFor('av1'), 'AV1', 'AV1 uses the SDP spelling');
+        assertEqual(scope.sdpCodecNameFor('nonsense'), null, 'an unknown codec has no SDP name');
+    },
+
+    // A live screen share that QUEUES under backpressure turns one dropped
+    // frame into unbounded latency ending in a multi-second freeze. The gate
+    // must refuse to write while the previous chunk is unconsumed, and must
+    // still let the stream through once it drains.
+    'studio-chunk-submission-drops-instead-of-queueing'() {
+        const scope = compileStudioFns(['submitChunk']);
+
+        let accepted = 0;
+        const mk = (desiredSize) => ({
+            desiredSize,
+            write() { accepted += 1; return Promise.resolve(); },
+        });
+
+        // Room available: the frame goes straight through.
+        assert(scope.submitChunk(mk(1), { n: 1 }) === true, 'a frame is accepted when there is room');
+        assertEqual(accepted, 1, 'exactly one write for one frame');
+
+        // The packetizer is still busy with the previous frame. desiredSize <= 0
+        // is the backpressure signal, and the frame must be DROPPED, not queued.
+        accepted = 0;
+        assert(scope.submitChunk(mk(0), { n: 2 }) === false,
+            'a frame is dropped while the packetizer is busy');
+        assert(scope.submitChunk(mk(-1), { n: 3 }) === false,
+            'a negative desiredSize also drops');
+        assertEqual(accepted, 0, 'a dropped frame must not reach the writer at all');
+
+        // No writer yet (the transform has not been constructed).
+        assert(scope.submitChunk(null, { n: 4 }) === false, 'no writer means no frame');
+
+        // A writer that throws must not take the encoder's output callback
+        // down with it — a throw here surfaces as an unhandled rejection
+        // inside the VideoEncoder output callback.
+        const exploding = { desiredSize: 1, write() { throw new Error('stream closed'); } };
+        assert(scope.submitChunk(exploding, { n: 5 }) === false, 'a throwing writer is a drop, not a crash');
+
+        // A writer that returns a rejected promise must be handled, or the
+        // rejection escapes as an unhandled rejection.
+        const rejecting = { desiredSize: 1, write() { return Promise.reject(new Error('aborted')); } };
+        assert(scope.submitChunk(rejecting, { n: 6 }) === true, 'a rejected write is not a synchronous failure');
+    },
+
+    // Video and audio used two different clocks (performance.now() vs
+    // AudioContext.currentTime) — different origins and different crystals, so
+    // the offset between the two tracks drifted over a long broadcast. Both
+    // must now come from the AudioContext, and the fallback must stay
+    // monotonic.
+    'studio-av-tracks-share-one-clock'() {
+        const sandbox = {
+            state: { audioContext: { state: 'running', currentTime: 12.345 } },
+            performance: { now: () => 999 },
+        };
+        const scope = compileStudioFns(['mediaTimestampUs'], sandbox);
+
+        const first = scope.mediaTimestampUs();
+        assertEqual(first, 12345000, 'a running AudioContext clock is used, in microseconds');
+
+        // currentTime advances in 128-frame render quanta, so two frames inside
+        // one quantum must not share or reverse a timestamp. The held value
+        // keeps the sequence monotonic for the RTP timestamp mapper.
+        // (compileStudioFns returns the contextified sandbox itself.)
+        scope.state.lastMediaClockSeconds = 12.345;
+        const second = scope.mediaTimestampUs();
+        assertEqual(second, first, 'a quantised clock holds the last value rather than repeating');
+
+        // A held value that is not a usable number must not poison the clock.
+        // NaN reaching `new VideoFrame({timestamp})` throws, and because the
+        // throw is caught per frame the broadcast just silently stops
+        // producing pictures while still reporting "live".
+        scope.state.lastMediaClockSeconds = NaN;
+        const recovered = scope.mediaTimestampUs();
+        assertEqual(recovered, first, 'a NaN held value recovers to the live clock, not NaN');
+
+        // Advancing the audio clock must advance the frame timestamp with it —
+        // this is the property that ties the two tracks to one timeline.
+        scope.state.audioContext.currentTime = 12.400;
+        const third = scope.mediaTimestampUs();
+        assertEqual(third, 12400000, 'the frame clock follows the audio clock');
+        assert(third > second, 'frame timestamps are strictly increasing as the audio clock advances');
+
+        // A suspended or missing context falls back to performance.now(), which
+        // is the only clock available for a video-only broadcast.
+        const suspended = compileStudioFns(['mediaTimestampUs'], {
+            state: { audioContext: { state: 'suspended', currentTime: 5 } },
+            performance: { now: () => 2 },
+        });
+        assertEqual(suspended.mediaTimestampUs(), 2000,
+            'a suspended context falls back to performance.now() in microseconds');
+
+        const noAudio = compileStudioFns(['mediaTimestampUs'], {
+            state: { audioContext: null },
+            performance: { now: () => 3 },
+        });
+        assertEqual(noAudio.mediaTimestampUs(), 3000,
+            'a video-only broadcast uses performance.now()');
+    },
+
+    // A frame rate of zero must not become a zero/infinite period, which would
+    // either spin the timer or stop encoding entirely.
+    'studio-encode-period-matches-the-requested-framerate'() {
+        const period = (fps) => 1000 / Math.max(1, fps);
+        assertEqual(Math.round(period(30)), 33, '30 fps is a ~33 ms period');
+        assertEqual(Math.round(period(60)), 17, '60 fps is a ~17 ms period');
+        // The old loop used periodMs / 2 as the interval and encoded on every
+        // tick, which is why a 30 fps setting actually produced ~59 fps. Guard
+        // the arithmetic that caused it.
+        assert(period(30) / 2 > 16 && period(30) / 2 < 17,
+            'a half-period tick is ~16 ms, i.e. ~59 fps — never use it as the period');
+        assertEqual(1000 / Math.max(1, 0), 1000, 'a zero frame rate is clamped to 1 fps');
+    },
+
+    'studio-publish-sdp-rewrites-only-the-h264-profile'() {
+        const scope = compileStudioFns(['optimizePublishSdp']);
+        const out = scope.optimizePublishSdp(PUBLISH_SDP, { h264ProfileLevelId: '42e028' });
+        const lines = out.split('\r\n');
+        const video = sectionOf(lines, 'm=video', 'm=audio');
+        const audio = sectionOf(lines, 'm=audio', 'a=candidate');
+
+        // The rewritten line must sit inside the video section, beside its own
+        // rtpmap: a fmtp attached anywhere else is silently ignored by the
+        // answerer, which shows up as "publishes but will not decode".
+        countLine(video.lines, 'a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e028', 1,
+            'the H.264 payload carries exactly one rewritten fmtp');
+
+        // The browser's own conflicting fmtp must be GONE, not merely preceded:
+        // two fmtp lines for one payload type is malformed and Pion may take
+        // either, which is a coin flip on the profile we actually send.
+        assert(!out.includes('packetization-mode=0'), 'the browser\'s packetization-mode=0 is replaced');
+        assert(!out.includes('profile-level-id=640c1f'), 'the browser\'s own profile-level-id is replaced');
+
+        // Exactly one fmtp per rewritten payload: the rewrite must not double up.
+        const fmtp96 = lines.filter((line) => line.startsWith('a=fmtp:96 '));
+        assertEqual(fmtp96.length, 1, 'payload 96 has exactly one fmtp line');
+
+        // Non-H.264 payloads keep their own parameters.
+        countLine(video.lines, 'a=fmtp:99 level-idx=5;profile=0;tier=0', 1,
+            'AV1 fmtp is left untouched');
+        countLine(video.lines, 'a=rtpmap:98 VP8/90000', 1, 'VP8 is left untouched');
+
+        // The audio section is never rewritten — Opus minptime is not ours.
+        countLine(audio.lines, 'a=fmtp:111 minptime=10;useinbandfec=1', 1,
+            'the audio fmtp is never touched');
+        assert(!audio.lines.some((line) => line.includes('profile-level-id')),
+            'no H.264 fmtp may leak into the audio section');
+    },
+
+    'studio-publish-sdp-forces-packetization-mode-1'() {
+        const scope = compileStudioFns(['optimizePublishSdp']);
+        // WebCodecs emits AVCC (length-prefixed) NAL units with avc:{format:'avc'},
+        // which is exactly packetization-mode=1. Announcing mode 0 while sending
+        // length-prefixed units is a silent corruption that decodes as noise.
+        const out = scope.optimizePublishSdp(PUBLISH_SDP, { h264ProfileLevelId: '42e02a' });
+        assert(out.includes('a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a'),
+            'packetization-mode is pinned to 1');
+
+        // With no profile to claim (the native engine, where the browser chose
+        // the codec) the SDP must pass through untouched rather than restating a
+        // profile we do not control.
+        const untouched = scope.optimizePublishSdp(PUBLISH_SDP, {});
+        assertEqual(untouched, PUBLISH_SDP, 'a null profile leaves the offer byte-identical');
+    },
+
+    'studio-publish-sdp-rejects-a-malformed-profile'() {
+        const scope = compileStudioFns(['optimizePublishSdp']);
+        // profile-level-id must be exactly 6 hex digits. A malformed value would
+        // be written straight into the SDP and rejected by the answerer.
+        for (const bad of ['', '42e0', '42e02az', null, undefined, 42]) {
+            const out = scope.optimizePublishSdp(PUBLISH_SDP, { h264ProfileLevelId: bad });
+            assertEqual(out, PUBLISH_SDP, `a malformed profile (${JSON.stringify(bad)}) must not be written`);
+        }
+    },
+
+    'studio-routable-candidate-rejects-mdns-obfuscation'() {
+        const scope = compileStudioFns(['hasRoutableCandidate']);
+        // MediaMTX is Pion and resolves no mDNS, so an offer carrying only
+        // <uuid>.local candidates has literally nothing to connect to.
+        assert(!scope.hasRoutableCandidate(PUBLISH_SDP.replace(
+            'a=candidate:1 1 udp 2130706431 192.168.1.50 54321 typ host',
+            'a=candidate:1 1 udp 2130706431 1f2e3d4c-5b6a-7988-9a0b-1c2d3e4f5061.local 54321 typ host'
+        )), 'an mDNS .local candidate is not routable');
+        assert(scope.hasRoutableCandidate(PUBLISH_SDP), 'a plain host candidate is routable');
+        assert(!scope.hasRoutableCandidate(''), 'an empty description has no candidate');
+        assert(!scope.hasRoutableCandidate(null), 'a null description has no candidate');
+    },
+
+    'studio-first-encoded-frame-is-a-keyframe-and-later-ones-are-not'() {
+        // Runs the REAL encodeOnce. A grep for "value: true" cannot distinguish
+        // a working force-keyframe path from a deleted one, because
+        // lastKeyframeAt starts at 0 and the GOP branch would force a keyframe
+        // on the first tick regardless.
+        //
+        // Both frames share ONE context, because lastKeyframeAt is module state:
+        // a second context would reset it to 0 and the GOP branch would fire
+        // again, making the "not a keyframe" assertion pass or fail for the
+        // wrong reason.
+        const { fn, calls, context } = compileEncodeOnce({ now: 1000 });
+        fn(1000, { value: true });
+        assertEqual(calls.length, 1, 'the first frame is encoded');
+        assertEqual(calls[0].keyFrame, true, 'the FIRST frame must be a keyframe');
+
+        // A second frame 100 ms later: still inside the 1 s GOP, so the steady
+        // state path must NOT force a keyframe.
+        calls.length = 0;
+        vm.runInContext('globalThis.__now = 1100;', context);
+        context.performance.now = () => 1100;
+        fn(1000, { value: false });
+        assertEqual(calls.length, 1, 'the second frame is encoded');
+        assertEqual(calls[0].keyFrame, false,
+            'a frame inside the GOP must NOT be a keyframe');
+    },
+
+    'studio-a-new-gop-forces-a-keyframe-again'() {
+        // lastKeyframeAt is seeded to 10_000 and the clock reads 12_000, which is
+        // past a 1 s GOP, so the steady-state branch must force a keyframe even
+        // though forceKeyRef says no.
+        const { fn, calls, context } = compileEncodeOnce({ now: 12000 });
+        vm.runInContext('lastKeyframeAt = 10000;', context);
+        fn(1000, { value: false });
+        assertEqual(calls.length, 1, 'the frame is encoded');
+        assertEqual(calls[0].keyFrame, true, 'the GOP boundary must force a keyframe');
+    },
+
+    'studio-encode-queue-overflow-drops-the-frame'() {
+        // A bounded queue is the difference between losing a frame and building
+        // unbounded latency, so the threshold must actually stop the encode.
+        const { fn, calls, sandbox } = compileEncodeOnce({ now: 500, encodeQueueSize: 4 });
+        fn(1000, { value: false });
+        assertEqual(calls.length, 0, 'no frame may be submitted while the queue is full');
+        assertEqual(sandbox.state.framesDropped, 1, 'the drop must be counted');
+
+        // The boundary: a queue of exactly 3 still encodes.
+        const ok = compileEncodeOnce({ now: 500, encodeQueueSize: 3 });
+        ok.fn(1000, { value: false });
+        assertEqual(ok.calls.length, 1, 'a queue at the limit must still encode');
+    },
+
+    'studio-a-video-frame-failure-is-counted_not_swallowed'() {
+        // A swallowed VideoFrame failure is not a no-op: no frame is encoded, so
+        // the broadcast freezes while the UI still reads LIVE. It must be
+        // counted so the stall is visible rather than invisible.
+        const { fn, calls, sandbox } = compileEncodeOnce({ now: 500, videoFrameThrows: true });
+        fn(1000, { value: false });
+        assertEqual(calls.length, 0, 'nothing is encoded when the frame cannot be built');
+        assertEqual(sandbox.videoFrameFailures, 1,
+            'a VideoFrame failure must be counted, not silently swallowed');
+    },
+
+    'studio-worklet-emits-frames-at-the-correct-rate'() {
+        // 1410 render quanta of 128 samples is 1410 * 128 = 180480 samples, which
+        // at a 480-sample frame size is exactly 376 frames. Anything else means
+        // the accumulator is emitting at the wrong rate.
+        const frameSize = 480;
+        const { instance, posted } = compileWorklet(frameSize, 2);
+        for (let i = 0; i < 1410; i += 1) {
+            instance.process([quantum(128, 0.5)]);
+        }
+        assertEqual(posted.length, Math.floor((1410 * 128) / frameSize),
+            'frames must be emitted at the real 10 ms rate, not once per quantum');
+        for (const frame of posted) {
+            assertEqual(frame.channels.length, 2, 'two channels per frame');
+            assertEqual(frame.channels[0].length, frameSize, 'every frame is exactly frameSize long');
+        }
+    },
+
+    'studio-worklet-silence-path-matches-the-real-audio-rate'() {
+        // The exact regression: the silence path used to emit unconditionally,
+        // so a broadcast with no connected source produced audio 3.75x too fast
+        // — audible as fast playback that underran and drifted against video.
+        const frameSize = 480;
+        const silent = compileWorklet(frameSize, 2);
+        for (let i = 0; i < 1410; i += 1) {
+            // `[[]]` — one channel slot carrying nothing — is the shape that
+            // actually reaches a worklet with no connected source.
+            silent.instance.process([[]]);
+        }
+        const withAudio = compileWorklet(frameSize, 2);
+        for (let i = 0; i < 1410; i += 1) {
+            withAudio.instance.process([quantum(128, 0.5)]);
+        }
+        assertEqual(silent.posted.length, withAudio.posted.length,
+            'a silent broadcast must emit frames at exactly the same rate as a live one');
+        assertEqual(silent.posted.length, 376, 'the silent path uses the real 10 ms frame rate');
+    },
+    'studio-worklet-preserves-samples-across-quantum-boundaries'() {
+        // 480 is not a multiple of 128, so each frame spans four quanta with a
+        // 32-sample carry. Losing that carry would drop samples and put periodic
+        // gaps in the audio, so the reassembled frame is checked sample by sample.
+        const frameSize = 480;
+        const { instance, posted } = compileWorklet(frameSize, 1);
+        let counter = 0;
+        const ramp = () => {
+            const buf = new Float32Array(128);
+            for (let i = 0; i < 128; i += 1) { buf[i] = counter; counter += 1; }
+            return [buf];
+        };
+        for (let i = 0; i < 4; i += 1) instance.process([ramp()]);
+        assertEqual(posted.length, 1, '128 * 4 = 512 samples yields one 480-sample frame plus a carry');
+        const first = posted[0].channels[0];
+        assertEqual(first.length, 480, 'the first frame is exactly 480 samples');
+        for (let i = 0; i < 480; i += 1) {
+            assertEqual(first[i], i, `sample ${i} must appear once, in order`);
+        }
+    },
+
+    'studio-worklet-resets-the-accumulator-before-posting'() {
+        // If postMessage threw while `filled` was still frameSize, the next
+        // process() would compute a room of 0 and loop forever on the real-time
+        // audio thread: a permanent 100% CPU hang with no recovery.
+        const { instance, posted } = compileWorklet(480, 2);
+        // Make the post throw after a full frame has been accumulated.
+        instance.port = { postMessage: () => { throw new Error('port closed'); } };
+        for (let i = 0; i < 4; i += 1) instance.process([quantum(128, 0.25)]);
+        // Restore a working port and keep driving. A wedged accumulator would
+        // either spin forever (the test would hang) or emit nothing.
+        instance.port = { postMessage: (msg) => posted.push(msg) };
+        for (let i = 0; i < 4; i += 1) instance.process([quantum(128, 0.25)]);
+        assertEqual(posted.length, 1,
+            'the processor must keep working after a failed post, not wedge');
+    },
 });
+
+
+
 
 /* --------------------------------------------------------------------------
    CLI

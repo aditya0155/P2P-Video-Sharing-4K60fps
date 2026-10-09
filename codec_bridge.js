@@ -48,6 +48,7 @@
  */
 
 const { spawn, spawnSync, execSync } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -62,88 +63,119 @@ const AUDIO_BITRATE = process.env.BRIDGE_AUDIO_BITRATE || '160k';
 const BUNDLED_FFMPEG = path.join(__dirname,
     'ffmpeg_win', 'ffmpeg-n8.1-latest-win64-gpl-shared-8.1', 'bin', 'ffmpeg.exe');
 
-// Why ffmpeg 8.1 specifically: its AV1 RTP depacketizer fixes fragmented-keyframe
-// reassembly (ffmpeg commit d12791ef, absent from 8.0), which is what lets an
-// OBS WHIP AV1 source sync on the RTSP leg — ffmpeg 8.0 loops forever on
-// "Unexpected fragment continuation". An explicit BRIDGE_FFMPEG override wins;
-// the system PATH is the last fallback.
+// The bundled ffmpeg 8.1 build is preferred over the system PATH: its AV1 RTP
+// depacketizer fixes fragmented-keyframe reassembly (ffmpeg commit d12791ef,
+// absent from 8.0), which is what lets OBS WHIP AV1 sources sync on the RTSP
+// leg — ffmpeg 8.0 loops forever on "Unexpected fragment continuation". An
+// explicit BRIDGE_FFMPEG override wins; the system PATH is the last fallback.
 //
-// THE FALLBACK IS NOT SAFE, and it fails silently. `ffmpeg_win/` is gitignored
-// (a heavy re-downloadable binary), so it exists ONLY in a checkout that ran the
-// one-time setup — NOT in a fresh clone, and NOT in a linked git worktree. In
-// those checkouts this function quietly returns the system `ffmpeg`, which on
-// this host is 8.0: the exact build documented above as broken. The bridge then
-// spins on the RTSP leg or publishes no rendition, and the only symptom is that
-// the companion path never comes up. Reporting the substitution is what turns
-// that into a diagnosable condition instead of a mystery.
-let ffmpegResolvedFrom = null;
+// WHY the source is returned alongside the binary.
+//
+// `ffmpeg_win/` is gitignored. That means it is present in the main checkout and
+// ABSENT from every git worktree and every fresh clone — the two places code
+// actually gets edited. The old resolver fell back to a bare `'ffmpeg'` with no
+// diagnostic of any kind, so an operator starting the host from a worktree got a
+// transcoder running on whatever ffmpeg happened to be first on PATH: a different
+// build, without the AV1 depacketizer fix, silently. Nothing in the hook log
+// distinguished that from a deliberate `BRIDGE_FFMPEG` override, and the only
+// line that mentioned ffmpeg printed the bare word inside a long argument list.
+//
+// The failure it produces is the confusing kind rather than the loud kind. The
+// host starts, the local page plays, and the symptom is that changes to the
+// receiver or the bridge appear to do nothing, or that an AV1/WHIP source stalls
+// on the RTSP leg — both consistent with "I fixed the wrong copy of the project"
+// and neither pointing at the encoder. That is worth a startup line.
+//
+// `FFMPEG` stays a plain string because the ffprobe-sibling derivation below
+// branches on it (`!== 'ffmpeg'`).
 function resolveFfmpegBinary() {
     if (process.env.BRIDGE_FFMPEG) {
-        ffmpegResolvedFrom = 'BRIDGE_FFMPEG override';
-        return process.env.BRIDGE_FFMPEG;
+        return { binary: process.env.BRIDGE_FFMPEG, source: 'BRIDGE_FFMPEG override' };
     }
     try {
         if (fs.existsSync(BUNDLED_FFMPEG)) {
-            ffmpegResolvedFrom = 'bundled ffmpeg 8.1';
-            return BUNDLED_FFMPEG;
+            return { binary: BUNDLED_FFMPEG, source: 'bundled build' };
         }
     } catch (err) {
         /* stat failure falls through to PATH */
     }
-    ffmpegResolvedFrom = 'system PATH (bundled build missing)';
-    return 'ffmpeg';
+    return { binary: 'ffmpeg', source: 'PATH fallback (bundled build not found)' };
 }
+const FFMPEG_RESOLVED = resolveFfmpegBinary();
+const FFMPEG = FFMPEG_RESOLVED.binary;
 
-// WHY THE FALLBACK MUST BE LOUD. `ffmpeg_win/` is in .gitignore ("heavy local
-// binaries, re-downloadable"), so it exists in the MAIN checkout and in NONE of
-// the ~40 git worktrees this repo has. A bridge started from a worktree
-// therefore took the PATH fallback SILENTLY, and the PATH ffmpeg on this host is
-// 8.0 — the exact version the comment above says cannot bridge a WHIP AV1
-// source. The failure then presented as a mysterious circuit-breaker trip
-// minutes later, with nothing in the log connecting it to a missing directory.
-//
-// So the fallback reports itself, and names the version it actually found,
-// because "which ffmpeg am I really running" is the single fact needed to
-// diagnose every AV1 sync failure on this host.
-(function reportFfmpegResolution() {
-    const resolved = resolveFfmpegBinary();
-    if (process.env.BRIDGE_FFMPEG) return;                 // deliberate override
-    if (resolved !== 'ffmpeg') return;                      // bundled build present
-    logError(`Bundled ffmpeg NOT found at: ${BUNDLED_FFMPEG}`);
-    logError('Falling back to the ffmpeg on PATH. This is only safe for H.264 '
-        + 'sources: an AV1 WHIP source needs ffmpeg 8.1+ (commit d12791ef) or it '
-        + 'loops forever on "Unexpected fragment continuation".');
-    logError('ffmpeg_win/ is gitignored, so it is absent from every git worktree. '
-        + 'Run the host from the MAIN checkout, or set BRIDGE_FFMPEG to an 8.1+ build.');
+// Announced once per bridge start, and loudly when the fallback was taken. The
+// bridge runs as a MediaMTX runOnAvailable hook, so this lands in the launcher
+// window alongside the rest of the hook output.
+function reportFfmpegResolution() {
+    // Skip the report when an explicit override is in use: the operator picked
+    // that binary on purpose, so there is nothing to warn about.
+    if (process.env.BRIDGE_FFMPEG) return;
+    const resolved = FFMPEG;
+    // Skip when the bundled build resolved. `resolveFfmpegBinary()` leaves the
+    // bare `'ffmpeg'` string ONLY when neither the override nor the bundled
+    // build was found — i.e. exactly the PATH fallback this report exists to
+    // surface — so a resolved path that is not the bare name means the bundled
+    // build won and is silent-correct.
+    if (resolved !== 'ffmpeg') return;
+    logError(`ffmpeg: FALLING BACK TO PATH ("${resolved}") — the bundled build was not found.`);
+    logError('        Bundled ffmpeg NOT found at:');
+    logError(`        ${BUNDLED_FFMPEG}`);
+    // Name the version we actually resolved, so the operator can see it is a
+    // different build from the one this project depends on.
+    let pathVersion = 'unavailable';
     try {
-        const banner = execSync('ffmpeg -hide_banner -version',
-            { encoding: 'utf8', timeout: 5000, windowsHide: true });
-        const line = String(banner).split(/\r?\n/).find((l) => l.startsWith('ffmpeg version'));
-        logError(`PATH ffmpeg reports: ${line ? line.trim() : 'unknown version'}`);
+        const probe = spawnSync(resolved, ['-version'], { encoding: 'utf8', timeout: 5000 });
+        pathVersion = ((probe && probe.stdout) || '').split('\n')[0].trim() || 'unavailable';
     } catch (err) {
-        logError('No ffmpeg on PATH either — the bridge cannot start.');
+        pathVersion = `unavailable (${String(err.message).split('\n')[0]})`;
     }
-})();
-const FFMPEG = resolveFfmpegBinary();
-
-// Printed once per start so an operator can see WHICH binary is transcoding.
-// H.264-only sources are fine on 8.0, so the wording is scoped to the case that
-// actually breaks (AV1) rather than crying wolf on every start.
-function reportFfmpegProvenance() {
-    if (FFMPEG === BUNDLED_FFMPEG) return;
-    if (ffmpegResolvedFrom === 'BRIDGE_FFMPEG override') return;
-    logError(`Bundled ffmpeg 8.1 not found at ${BUNDLED_FFMPEG}; using the system ffmpeg on PATH instead. `
-        + 'That build is known-bad for AV1 sources (ffmpeg 8.0 loops forever on "Unexpected fragment '
-        + 'continuation"), so an AV1 broadcast may publish no companion renditions. ffmpeg_win/ is '
-        + 'gitignored, so it is missing from every fresh clone and every git worktree — copy it from '
-        + 'your main checkout, or set BRIDGE_FFMPEG to a full path. H.264 sources are unaffected.');
+    logError(`        PATH ffmpeg reports: ${pathVersion}`);
+    logError('        That directory is gitignored, so it exists in the main checkout but NOT in a');
+    logError('        git worktree or a fresh clone. A different ffmpeg build changes encoder output,');
+    logError('        and 8.0 lacks the AV1 RTP depacketizer fix this project depends on. Copy');
+    logError('        ffmpeg_win/ across, or set BRIDGE_FFMPEG to an absolute path, if renditions');
+    logError('        or an AV1/WHIP source misbehave.');
 }
 
-// Overridable so a test (or a second bridge) can use an isolated record instead
-// of the shared per-user temp path, where two bridges would overwrite each other.
+// Per-CHECKOUT identity for this machine's shared temp directory.
+//
+// Two clones or git worktrees of this project on ONE machine must not share
+// the PID record or the GPU-decode memory, and the reason is not tidiness —
+// it is destructive. This repo currently has ~40 worktrees, so this is the
+// normal case here, not an edge case.
+//
+// The cleanup path decides whether to KILL a recorded PID by matching the
+// target process's command line against the recorded rendition target
+// (`$p.CommandLine -like '*live-av1*'`). That match key is the RTMP publish
+// URL from mediamtx.yml — `rtmp://127.0.0.1:1935/live-av1` — and BOTH the port
+// and the target name are FIXED CONSTANTS, byte-identical in every checkout.
+// So with one shared PID file, a `--cleanup` (which MediaMTX fires
+// automatically via runOnUnavailable whenever a path goes away, in ANY
+// checkout) reads the other checkout's record, its guard MATCHES, and kills a
+// live transcoder belonging to a different working tree. That publisher drop
+// closes every WHEP reader session on the path — a room-wide reconnect caused
+// by someone working in an unrelated directory.
+//
+// The GPU-decode memory has the same shape: a 24-hour "this NVDEC decoder is
+// poisoned" block recorded while debugging in one checkout silently pushed
+// every OTHER checkout onto software decode for a day.
+//
+// Hashing the resolved checkout root gives each working tree its own pair of
+// files, so neither can read, poison, or act on the other's. Lower-cased so a
+// Windows path differing only in case still resolves to one identity.
+const CHECKOUT_ROOT = path.resolve(__dirname);
+const CHECKOUT_KEY = crypto
+    .createHash('sha256')
+    .update(CHECKOUT_ROOT.toLowerCase())
+    .digest('hex')
+    .slice(0, 12);
+
+// Overridable so a test can use an isolated record instead of this checkout's
+// own, which would collide with a real broadcast from the same tree.
 const PID_FILE = process.env.BRIDGE_PID_FILE
     ? path.resolve(process.env.BRIDGE_PID_FILE)
-    : path.join(os.tmpdir(), 'rydius_codec_bridge.pid');
+    : path.join(os.tmpdir(), `rydius_${CHECKOUT_KEY}_codec_bridge.pid`);
 const VIDEO_CODECS = ['AV1', 'H264', 'H265', 'HEVC', 'VP8', 'VP9'];
 const MAX_CONSECUTIVE_FFMPEG_FAILURES = 10;
 // How long to wait before the give-up exit, so MediaMTX's runOnAvailableRestart
@@ -239,6 +271,11 @@ const RENDITION_START_TIMEOUT_MS = 20000;
 // while it processes; 15s of silence is a definitive stall, not a pause.
 const RENDITION_STALL_TIMEOUT_MS = 15000;
 const RENDITION_WATCHDOG_POLL_MS = 3000;
+// How many consecutive unverifiable startup polls the watchdog tolerates before
+// it gives up waiting for a verdict and assumes the transcoder is dead. See
+// `startupUnknownTicks`: an unbounded "unknown is not a negative" rule turns the
+// watchdog into a no-op precisely when the host is unhealthy.
+const RENDITION_START_UNKNOWN_TOLERANCE = 15;
 const TARGET_VIDEO_CODEC = { 'live-h264': 'H264', 'live-av1': 'AV1' };
 
 function log(message) {
@@ -276,10 +313,22 @@ function resolveFfprobeBinary() {
     if (process.env.BRIDGE_FFPROBE) return process.env.BRIDGE_FFPROBE;
     if (FFMPEG !== 'ffmpeg') {
         const sibling = FFMPEG.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1');
-        try {
-            if (fs.existsSync(sibling)) return sibling;
-        } catch (err) {
-            /* fall through to PATH */
+        // The regex is anchored at the end and only rewrites a name that ENDS in
+        // ffmpeg/ffmpeg.exe. For any other filename (a perfectly ordinary
+        // `ffmpeg8.exe` from a BtbN build, or a renamed wrapper) the replace is
+        // a NO-OP, so `sibling` still points at ffmpeg itself - and existsSync
+        // happily says yes, so this returned FFMPEG. probeGopFrames() then ran
+        // ffmpeg with ffprobe demuxer flags (-select_streams, -show_entries),
+        // which it rejects, so the GOP silently degraded to the 60fps
+        // ASSUMPTION - the exact failure the probe exists to prevent - while
+        // the log blamed "ffprobe". Refuse a sibling that did not actually
+        // change, so the PATH fallback ('ffprobe') is used instead.
+        if (sibling !== FFMPEG) {
+            try {
+                if (fs.existsSync(sibling)) return sibling;
+            } catch (err) {
+                /* fall through to PATH */
+            }
         }
     }
     return 'ffprobe';
@@ -520,7 +569,16 @@ function decideBridge(tracks, env = {}) {
             extraOutputs: hasAudio && !hasOpusAudio
                 ? [{
                     target: 'live-av1',
-                    videoArgs: buildAv1VideoArgs(env),
+                    // The rate is passed EXPLICITLY, exactly as it is on the
+                    // H264-source primary below. buildAv1VideoArgs() defaults
+                    // its second argument to the module constant, so calling it
+                    // with one argument silently dropped `env.av1Bitrate` in
+                    // this direction while honouring it in the other - an
+                    // override that worked one way and not the other.
+                    // (Verified before the fix: decideBridge(['MPEG-4 Audio',
+                    // 'AV1'], {av1Bitrate:'9999k'}) produced -b:v 3000k while the
+                    // H264 plan produced 9999k.)
+                    videoArgs: buildAv1VideoArgs(env, env.av1Bitrate),
                     audioArgs,
                 }]
                 : undefined,
@@ -672,7 +730,13 @@ function buildFfmpegArgs(plan, ports = {}, decodeArgs = []) {
 // instead of repeating two crash cycles at every cold start. A successful
 // long GPU run clears the entry, so a fixed ffmpeg/driver re-enables the GPU
 // path automatically.
-const GPU_DECODE_STATE_FILE = path.join(os.tmpdir(), 'rydius_bridge_gpu_decode_state.json');
+// Per-checkout, for the same reason as PID_FILE above: the 24-hour NVDEC block
+// recorded here is a verdict about THIS machine's decoder reached from THIS
+// tree's source, and sharing it lets one checkout disable hardware decode in
+// another. `BRIDGE_GPU_STATE_FILE` overrides it for tests.
+const GPU_DECODE_STATE_FILE = process.env.BRIDGE_GPU_STATE_FILE
+    ? path.resolve(process.env.BRIDGE_GPU_STATE_FILE)
+    : path.join(os.tmpdir(), `rydius_${CHECKOUT_KEY}_bridge_gpu_decode_state.json`);
 const GPU_DECODE_BLOCK_MS = 24 * 60 * 60 * 1000;
 
 function readGpuDecodeState() {
@@ -729,6 +793,30 @@ function clearGpuDecodeFailure(decoder) {
     }
 }
 
+// The codec names a path descriptor is carrying, in ONE place.
+//
+// MediaMTX reports tracks in two shapes: `tracks` (a plain array of codec
+// strings) and `tracks2` (an array of objects with a `codec` field). This
+// project already depends on both - fetchSourceTracks() below reads `tracks2`
+// precisely because the `tracks` array is not guaranteed to be populated - so
+// every other reader of a path descriptor has to understand the same pair.
+// renditionHasVideo() did not: it read only `tracks`, so a MediaMTX reporting
+// just `tracks2` made an empty array answer "no video", the startup watchdog
+// killed a perfectly healthy transcoder at the 20s mark, respawned it, and
+// failed the same check 20s later - forever. One helper, both shapes.
+function codecNames(pathDesc) {
+    if (!pathDesc) return [];
+    if (Array.isArray(pathDesc.tracks) && pathDesc.tracks.length) {
+        return pathDesc.tracks.filter((t) => typeof t === 'string');
+    }
+    if (Array.isArray(pathDesc.tracks2)) {
+        return pathDesc.tracks2
+            .filter((t) => t && typeof t.codec === 'string')
+            .map((t) => t.codec);
+    }
+    return [];
+}
+
 async function fetchSourceTracks() {
     const response = await fetch(`${API_BASE}/v3/paths/list`, {
         signal: AbortSignal.timeout(3000),
@@ -740,13 +828,8 @@ async function fetchSourceTracks() {
     if (!source) return null;
     const ready = source.ready === true || source.online === true;
     if (!ready) return null;
-    if (Array.isArray(source.tracks) && source.tracks.length) return source.tracks;
-    if (Array.isArray(source.tracks2)) {
-        return source.tracks2
-            .filter((t) => t && typeof t.codec === 'string')
-            .map((t) => t.codec);
-    }
-    return null;
+    const names = codecNames(source);
+    return names.length ? names : null;
 }
 
 function writePidFile(pid, targets) {
@@ -763,23 +846,35 @@ function writePidFile(pid, targets) {
         fs.writeFileSync(PID_FILE, JSON.stringify({
             pid, targets, createdAt: Date.now(), exe: path.basename(FFMPEG),
             ownerPid: process.pid,
+            // Which checkout wrote this. The filename is already per-checkout,
+            // but BRIDGE_PID_FILE can still point two trees at one file, and
+            // cleanup() is the one place that KILLS a process. Recording the
+            // root lets it refuse a record it did not write instead of relying
+            // on the command-line match, which cannot distinguish checkouts
+            // (see CHECKOUT_KEY).
+            root: CHECKOUT_ROOT,
         }), 'utf8');
     } catch (err) {
         logError(`could not write PID file: ${err.message}`);
     }
 }
 
-// Only unlink a record this process actually wrote. A record with no ownerPid
-// is from an older build and is left alone deliberately: it may belong to a
-// bridge that is still alive, and unlinking someone else's record is the exact
-// failure this guards.
-function clearPidFile() {
+// Only unlink a record this process actually wrote, or one whose owner is dead.
+//
+// A record naming a DIFFERENT live ownerPid belongs to another bridge: every
+// bridge instance shares one path, so unlinking it from here would strand that
+// instance ffmpeg (see the ownerPid note in writePidFile). A record with no
+// ownerPid at all predates that field; it carries no claim of ownership, so there
+// is nothing to protect and it is treated as unowned - which is also what makes
+// a hard-killed bridge record cleanable, since MediaMTX does not deliver a
+// signal to the hook on Windows.
+function clearPidFile(force = false) {
     try {
         const raw = fs.readFileSync(PID_FILE, 'utf8');
         let record = null;
         try { record = JSON.parse(raw); } catch (err) { record = null; }
-        if (record && record.ownerPid && record.ownerPid !== process.pid) {
-            return;   // another live bridge owns it
+        if (!force && record && record.ownerPid && record.ownerPid !== process.pid) {
+            if (ownerIsAlive(record.ownerPid)) return;   // another live bridge owns it
         }
         fs.unlinkSync(PID_FILE);
     } catch (err) {
@@ -787,20 +882,58 @@ function clearPidFile() {
     }
 }
 
+// Is a bridge with this pid still running? Signal 0 performs the permission and
+// existence checks without delivering anything. Windows treats it as a liveness
+// probe too, and any error (ESRCH: gone; EPERM: alive but not ours) is resolved
+// conservatively - only a definitive "no such process" counts as dead.
+function ownerIsAlive(pid) {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        return err && err.code === 'EPERM';
+    }
+}
+
 // True when the target path is ready AND carries its video codec — proof that
 // real video (not just audio) is flowing through the transcoder.
+// True when the target path is ready AND carries its video codec - proof that
+// real video (not just audio) is flowing through the transcoder.
+//
+// THREE states, not two, and the distinction is load-bearing. `true`/`false`
+// is a real answer; `null` means "the control API could not tell us" (HTTP
+// error, timeout, unparseable body, or the path not being listed at all).
+// Collapsing an unknown into `false` - as this did - made a single control-API
+// hiccup indistinguishable from "this transcoder is hung": at the 20s startup
+// mark the watchdog read the hiccup as a dead ffmpeg and killed a HEALTHY
+// transcoder, which drops the RTMP publish and therefore tears down every WHEP
+// session on the path - a room-wide hard stop caused by a 500 that lasted one
+// tick. The stall half of the same watchdog already refuses to score an unknown
+// reading as a stall for exactly this reason; both halves now agree.
 async function renditionHasVideo(target) {
-    const response = await fetch(`${API_BASE}/v3/paths/list`, {
-        signal: AbortSignal.timeout(3000),
-    });
-    if (!response.ok) return false;
-    const data = await response.json();
+    let response;
+    try {
+        response = await fetch(`${API_BASE}/v3/paths/list`, {
+            signal: AbortSignal.timeout(3000),
+        });
+    } catch (err) {
+        return null;   // API unreachable / timed out: unknown, not "no video"
+    }
+    if (!response.ok) return null;
+    let data;
+    try {
+        data = await response.json();
+    } catch (err) {
+        return null;
+    }
     const items = Array.isArray(data && data.items) ? data.items : [];
     const targetPath = items.find((item) => item && item.name === target);
-    if (!targetPath || !(targetPath.ready === true || targetPath.online === true)) return false;
-    const tracks = Array.isArray(targetPath.tracks) ? targetPath.tracks : [];
+    if (!targetPath) return null;   // not listed: unknown, not "no video"
+    if (!(targetPath.ready === true || targetPath.online === true)) return false;
+    const tracks = codecNames(targetPath);
     const wanted = TARGET_VIDEO_CODEC[target];
-    return !wanted || tracks.some((t) => typeof t === 'string' && t.toUpperCase() === wanted);
+    return !wanted || tracks.some((t) => t.toUpperCase() === wanted);
 }
 
 // Total bytes a path has INGESTED since it was created. This is the
@@ -853,8 +986,42 @@ function cleanup() {
     } catch (err) {
         return; /* no record: nothing to clean */
     }
-    clearPidFile();
-    if (!record || !Number.isInteger(record.pid)) return;
+    // Two independent reasons a record must not be acted on, and BOTH are
+    // decided before the file is unlinked. Unlinking first would leave the
+    // operator following an instruction to "delete the PID file by hand" for a
+    // file that no longer exists, with no record left for a later
+    // runOnUnavailable to retry against - the stale ffmpeg would then survive
+    // holding its NVDEC/NVENC sessions, RTSP reader and RTMP publisher until the
+    // next broadcast's ffmpeg kicked it via overridePublisher.
+    if (!record || !Number.isInteger(record.pid)) {
+        clearPidFile(true);
+        return;
+    }
+    // A record naming a DIFFERENT checkout is not ours to act on - and not ours
+    // to delete either. The command-line guard below cannot make this decision:
+    // its match key is the RTMP publish URL, whose port and target are fixed
+    // constants identical in every checkout, so with a shared PID file one
+    // tree's `--cleanup` would kill another tree's live transcoder - a publisher
+    // drop that closes every WHEP session on the path. With ~40 worktrees on
+    // this machine that was not hypothetical.
+    //
+    // A record with NO root predates this field and is still reclaimed: leaving
+    // it would strand the ffmpeg it describes. It can only be an orphan by the
+    // time its bridge is gone, because a live bridge now writes its own
+    // per-checkout file.
+    if (record.root && path.resolve(record.root).toLowerCase() !== CHECKOUT_ROOT.toLowerCase()) {
+        log(`cleanup: ignoring a PID record written by another checkout (${record.root}); `
+            + 'not killing its ffmpeg');
+        return;
+    }
+    // No usable `createdAt` cannot be acted on safely (the age guard below), so
+    // refuse rather than risk killing a recycled PID.
+    if (!Number.isFinite(record.createdAt)) {
+        logError(`cleanup: record for pid ${record.pid} has no createdAt - refusing to kill on a `
+            + 'recycled-PID risk. The record is left in place so a later run can retry once it is repaired.');
+        return;
+    }
+    clearPidFile(true);
     // No age gate here. The record is stamped once, when ffmpeg starts, and never
     // refreshed, so a "stale record" cut-off silently disabled this cleanup for
     // every broadcast longer than the cut-off — and clearPidFile() above has
@@ -883,10 +1050,35 @@ function cleanup() {
             const createdIso = Number.isFinite(record.createdAt)
                 ? new Date(record.createdAt).toISOString()
                 : null;
-            const notReused = createdIso
-                ? `-and $p.CreationDate -and $p.CreationDate.ToUniversalTime() -le ([DateTime]::Parse('${createdIso}').ToUniversalTime().AddSeconds(2))`
+            // `createdAt` is validated once, up front, before the record is
+            // unlinked - see the fail-closed check at the top of cleanup(). A
+            // missing timestamp would otherwise degrade this clause to an empty
+            // string and make BOTH guards vanish at once, leaving nothing but
+            // the deliberately loose `-like '*live-av1*'` CommandLine substring,
+            // so a recycled PID running any unrelated program that merely
+            // mentions the path was force-stopped. A missing guard must disable
+            // the kill, not silently widen it.
+            const notReused = `-and $p.CreationDate -and $p.CreationDate.ToUniversalTime() -le ([DateTime]::Parse('${createdIso}').ToUniversalTime().AddSeconds(2))`;
+            // Normalise BOTH sides to the extension-less stem and compare with
+            // -eq. Win32_Process.Name is always the full image name ('ffmpeg.exe'),
+            // while the record stores path.basename(FFMPEG) - which is the bare
+            // string 'ffmpeg' whenever resolveFfmpegBinary() takes its PATH
+            // fallback (no BRIDGE_FFMPEG and no bundled build). PowerShell `-like`
+            // needs a wildcard to match 'ffmpeg.exe' against 'ffmpeg' and there
+            // is none, so the guard was False on every PATH-fallback record:
+            // cleanup() logged success and killed nothing, leaving a 300 MB ffmpeg
+            // holding an NVDEC session, an NVENC session, an RTSP reader and an
+            // RTMP publisher.
+            //
+            // Note there is deliberately NO `$p.BaseName` here: Win32_Process
+            // does not expose that property (verified against a live process -
+            // it reads empty), so the guard would have been silently always
+            // false, i.e. the same defect wearing a different hat. Stripping the
+            // extension off Name is the comparison that actually holds.
+            const exeStem = record.exe
+                ? path.basename(String(record.exe)).replace(/\.exe$/i, '')
                 : '';
-            const rightExe = record.exe ? ` -and $p.Name -like '${record.exe}'` : '';
+            const rightExe = exeStem ? ` -and (($p.Name -replace '\\.exe$','') -eq '${exeStem}')` : '';
             const script = `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${record.pid}'; `
                 + `if ($p -and $p.CommandLine -like '*${target}*'${rightExe}${notReused}) `
                 + `{ Stop-Process -Id ${record.pid} -Force }`;
@@ -952,10 +1144,11 @@ async function main() {
         return;
     }
 
-    // Which ffmpeg is actually transcoding is the first thing an operator needs
-    // to know, and the wrong one produces a bridge that looks alive while
-    // publishing nothing. See resolveFfmpegBinary for why the fallback is risky.
-    reportFfmpegProvenance();
+    // Before anything else: say which encoder this process will actually use.
+    // The PATH fallback is silent by nature — the binary is simply the first
+    // `ffmpeg` on PATH — so without this line a worktree operator gets a
+    // different transcoder than the main checkout and has no way to tell.
+    reportFfmpegResolution();
 
     let child = null;
     const stop = () => {
@@ -1036,6 +1229,13 @@ async function main() {
         let watchdogKilled = false;
         let lastBytesSeen = null;
         let stalledSamples = 0;
+        // Consecutive startup polls the control API could not answer at all.
+        // Bounded so "unknown" is not a permanent exemption: past this many the
+        // watchdog stops waiting for a verdict it is never going to get and
+        // assumes the transcoder is dead. At the 3s poll cadence this is ~45s of
+        // total unavailability, comfortably longer than a restart or a config
+        // reload, and far shorter than the indefinite freeze it prevents.
+        let startupUnknownTicks = 0;
         const watchdog = setInterval(async () => {
             // Pin the child this tick is judging. `child` is a main()-scope binding
             // that the retry loop reassigns, and the startup check below awaits the
@@ -1050,7 +1250,35 @@ async function main() {
                 if (Date.now() - startedAt < RENDITION_START_TIMEOUT_MS) return;
                 try {
                     const checks = await Promise.all(planTargetList.map((t) => renditionHasVideo(t)));
-                    renditionEverReady = checks.every(Boolean);
+                    // An UNKNOWN reading is not a negative one. renditionHasVideo
+                    // answers null when the control API could not tell us (HTTP
+                    // error, timeout, unparseable body, path not listed), and
+                    // that is not evidence the transcoder produced nothing.
+                    // Scoring it as false made a single 500 inside the startup
+                    // window kill a HEALTHY ffmpeg - which drops the RTMP publish,
+                    // closing EVERY WHEP session on the path - and then respawn
+                    // into the same answer 20s later, forever.
+                    //
+                    // ...but not FOREVER. Skipping without a bound turns the
+                    // watchdog into a no-op exactly when the host is unhealthy:
+                    // a control API that 500s for the whole broadcast, or a
+                    // rendition path MediaMTX never lists, would return on every
+                    // tick from the 20s mark on and a genuinely dead transcoder
+                    // would never be restarted. Tolerance is counted, and past
+                    // the bound the watchdog acts on the accumulated ignorance -
+                    // the safe direction to be wrong in, since a needless restart
+                    // costs a reconnect while a missed one freezes every
+                    // rendition viewer indefinitely.
+                    if (checks.some((c) => c === null)) {
+                        startupUnknownTicks += 1;
+                        if (startupUnknownTicks <= RENDITION_START_UNKNOWN_TOLERANCE) return;
+                        logError(`rendition '${planTargetList.join('+')}' unverifiable for `
+                            + `${startupUnknownTicks} consecutive polls (control API unreachable, or the path is not listed) `
+                            + '- assuming the transcoder is dead');
+                    } else {
+                        startupUnknownTicks = 0;
+                    }
+                    renditionEverReady = checks.every((c) => c === true);
                     if (renditionEverReady) {
                         // Start the stall baseline from real counters, so the
                         // first mid-broadcast comparison is not against null.
@@ -1126,6 +1354,17 @@ async function main() {
         child = null;
         if (exit.error) {
             logError(`ffmpeg failed to start: ${exit.error.message}`);
+            // Back off BEFORE exiting. This hook runs under
+            // runOnAvailableRestart, so an immediate exit(1) is re-run by
+            // MediaMTX essentially at once, and each cycle re-runs the whole
+            // 10-attempt source-track fetch first. A misconfigured
+            // BRIDGE_FFMPEG (a typo, a deleted bundled build with no PATH ffmpeg)
+            // therefore became a tight restart loop hammering a MediaMTX that is
+            // simultaneously serving the live source. Reusing the give-up backoff
+            // bounds the retry rate and gives a fixed configuration time to be
+            // corrected.
+            logError(`backing off ${Math.round(GIVE_UP_BACKOFF_MS / 1000)}s before exiting`);
+            await sleep(GIVE_UP_BACKOFF_MS);
             process.exit(1);
         }
         failures += 1;
