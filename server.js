@@ -17,6 +17,71 @@ const MEDIAMTX_PORT = Number.parseInt(process.env.MEDIAMTX_PORT || '8889', 10);
 const MEDIAMTX_API_PORT = Number.parseInt(process.env.MEDIAMTX_API_PORT || '8888', 10);
 const STATIC_DIR = __dirname;
 
+// Which copy of this project is actually running.
+//
+// This project is worked on in MANY git worktrees at once (a main checkout plus
+// dozens of cline/* worktrees, all often on the same commit), and every one of
+// them runs a server.js that wants the same port. When a second copy starts it
+// correctly refuses with EADDRINUSE - but "port 3000 is in use" does not say
+// WHICH copy holds it, so the natural reading is "my own server is still
+// running" when the truth is usually "a stale server from another worktree,
+// serving code that is not the code you just edited".
+//
+// That is not merely inconvenient: a stale server answers /stream-api/**
+// perfectly happily, so any check performed against localhost:3000 silently
+// validates the OTHER checkout. Edits appear to have no effect, or worse, appear
+// to be verified when they were never exercised at all. So the running copy
+// identifies itself, and the EADDRINUSE handler asks the incumbent who it is.
+const HOST_DIR = path.resolve(__dirname);
+const HOST_STARTED_AT = new Date().toISOString();
+
+// Loopback-only. It reports a local filesystem path and the process id, which is
+// operator-facing diagnostics and nothing more - publishing it would tell anyone
+// who can reach the public tunnel the operator Windows username and directory
+// layout. isDirectLocal() is the same test that gates the HOST chat badge, so the
+// two agree on who counts as local.
+function handleHostInfo(req, res) {
+    if (!isDirectLocal(req)) {
+        res.writeHead(403, setCorsHeaders({
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': CACHE_CONTROL
+        }));
+        res.end(JSON.stringify({ error: 'Host diagnostics are local-only.' }));
+        return;
+    }
+    const body = JSON.stringify({ dir: HOST_DIR, pid: process.pid, startedAt: HOST_STARTED_AT });
+    res.writeHead(200, setCorsHeaders({
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': CACHE_CONTROL,
+        'Content-Length': Buffer.byteLength(body)
+    }));
+    res.end(body);
+}
+
+// The ONLY MediaMTX control-API surface this server will forward, and only
+// read-only.
+//
+// This process is published to the open internet through the Cloudflare Tunnel,
+// it sets Access-Control-Allow-Origin: * on everything it answers, and
+// MediaMTX's control API is unauthenticated by default. Without an allow-list,
+// /stream-api/** was a verbatim pass-through, so every route under
+// /stream-api/v3/ was reachable from the public tunnel - verified against the
+// real binary before this guard existed:
+//
+//   GET    /stream-api/v3/config/global/get          -> 200, dumped the config
+//   PATCH  /stream-api/v3/config/global/set          -> a config WRITE
+//   DELETE /stream-api/v3/paths/list/<p>/readystate  -> kills the live stream
+//
+// i.e. a one-request remote config rewrite or a one-request kill of the
+// broadcast in progress, from anyone on the internet - and because CORS is *, from
+// any web page the streamer happens to visit, with no preflight.
+//
+// The player needs exactly one control-API call, the read-only status probe, so
+// the control plane is narrowed to that. WHEP/WHIP signaling, chat and TURN are
+// handled elsewhere and are unaffected.
+const ALLOWED_CONTROL_API = /^\/stream-api\/v3\/paths\/list$/;
+const CONTROL_API_READ_METHODS = new Set(['GET', 'HEAD']);
+
 const CACHE_CONTROL = 'no-store, no-cache, must-revalidate, max-age=0';
 // Static page assets are version-busted via ?v= in index.html, so browsers may
 // keep them but must revalidate (ETag) before reuse. This turns every repeat
@@ -254,10 +319,13 @@ function proxyToMediaMTX(req, res, requestUrl) {
             return;
         }
         console.error(`[Proxy] MediaMTX at ${MEDIAMTX_HOST}:${targetPort} is unavailable:`, error.message);
-        res.writeHead(502, {
+        // setCorsHeaders matters here as much as on any other branch: without it
+        // this 502 is an opaque CORS failure in the browser, so the one message
+        // that actually tells the operator what to do is never seen.
+        res.writeHead(502, setCorsHeaders({
             'Content-Type': 'application/json; charset=utf-8',
             'Cache-Control': CACHE_CONTROL
-        });
+        }));
         res.end(JSON.stringify({ error: 'MediaMTX is not running. Start the host with start_host.bat.' }));
     });
 
@@ -409,13 +477,35 @@ function isDirectLocal(req) {
 // actually configured to sit behind the Cloudflare tunnel, which is the one
 // deployment that rewrites them. Otherwise the real socket address is used:
 // loopback for the tunnel, or the Tailscale/LAN address for a direct viewer.
-const TRUST_FORWARDED_HEADERS = Boolean(
-    process.env.CF_TUNNEL_HOST || process.env.TRUST_PROXY_HEADERS === '1'
-);
+// Behind the Cloudflare Tunnel, cloudflared connects over LOOPBACK, so
+// req.socket.remoteAddress is 127.0.0.1 for EVERY remote viewer: keying the
+// limit on the socket put the whole room in one bucket, and a single chatty
+// viewer locked everyone else out of chat and reactions (verified: 8 messages
+// from one client produced [200,200,200,200,200,429,429,429] for every viewer).
+//
+// cf-connecting-ip is the header Cloudflare overwrites on every proxied request,
+// so its value cannot be chosen by the caller - but that guarantee comes from
+// Cloudflare, not from this process, so it is honoured ONLY when the request
+// actually arrived over loopback. server.listen() binds 127.0.0.1, so in the
+// shipped deployment the only peers are cloudflared and local tools. The loopback
+// test is what keeps that true if the bind address is ever widened to a LAN or
+// Tailscale interface: a directly-connecting client could then forge the header,
+// and it must not be believed. Trusting it unconditionally was measured to
+// reopen the bypass under a different header name (12 spoofed values produced
+// 12x200 and zero 429s).
+//
+// x-forwarded-for stays behind the explicit opt-in for the ordinary reason: any
+// client that reaches this server directly can set it to anything, and a unique
+// value per request is a unique rate-limit key per request.
+const TRUST_FORWARDED_HEADERS = Boolean(process.env.TRUST_PROXY_HEADERS === '1');
 function clientIpForRateLimit(req) {
+    const remoteAddress = (req.socket && req.socket.remoteAddress) || '';
+    const fromLoopback = remoteAddress === '127.0.0.1'
+        || remoteAddress === '::1'
+        || remoteAddress === '::ffff:127.0.0.1';
+    const cfIp = req.headers['cf-connecting-ip'];
+    if (fromLoopback && typeof cfIp === 'string' && cfIp.trim()) return cfIp.trim();
     if (TRUST_FORWARDED_HEADERS) {
-        const cfIp = req.headers['cf-connecting-ip'];
-        if (typeof cfIp === 'string' && cfIp) return cfIp.trim();
         const xff = req.headers['x-forwarded-for'];
         if (typeof xff === 'string' && xff) {
             // First hop only: the rest of the chain is client-supplied.
@@ -423,7 +513,7 @@ function clientIpForRateLimit(req) {
             if (first) return first;
         }
     }
-    return (req.socket && req.socket.remoteAddress) || 'unknown';
+    return remoteAddress || 'unknown';
 }
 
 // Per-IP reaction limits are only half the story: aggregate rate is
@@ -973,8 +1063,37 @@ const server = http.createServer((req, res) => {
             handleTurnCredentials(req, res);
             return;
         }
+        if (requestUrl.pathname === '/stream-api/host-info') {
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+                res.writeHead(405, setCorsHeaders({
+                    'Allow': 'GET, HEAD',
+                    'Content-Type': 'text/plain; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL
+                }));
+                res.end('405 Method Not Allowed');
+                return;
+            }
+            handleHostInfo(req, res);
+            return;
+        }
         if (requestUrl.pathname === '/stream-api/chat' || requestUrl.pathname.startsWith('/stream-api/chat/')) {
             handleChat(req, res, requestUrl);
+            return;
+        }
+        // The control plane is NOT public. See ALLOWED_CONTROL_API above: this
+        // process is internet-facing, so an unlisted route must be refused rather
+        // than forwarded to an unauthenticated control plane.
+        if (requestUrl.pathname.startsWith('/stream-api/v3')
+            && (!ALLOWED_CONTROL_API.test(requestUrl.pathname)
+                || !CONTROL_API_READ_METHODS.has(req.method))) {
+            res.writeHead(403, setCorsHeaders({
+                'Allow': 'GET, HEAD',
+                'Content-Type': 'application/json; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL
+            }));
+            res.end(JSON.stringify({
+                error: 'This endpoint is not exposed. The public API serves the stream status only.'
+            }));
             return;
         }
         proxyToMediaMTX(req, res, requestUrl);
@@ -1072,12 +1191,63 @@ const server = http.createServer((req, res) => {
     });
 });
 
+// Ask whoever already owns the port which copy of this project they are, and say
+// so plainly. Returns a promise the caller MUST await before exiting:
+// process.exit() discards pending I/O, so an un-awaited lookup prints nothing
+// and leaves the ambiguity exactly where it started. Bounded and best-effort -
+// this runs on the failure path of a process about to exit, so it must never
+// hang or throw. An incumbent that predates /stream-api/host-info, or is not a
+// copy of this project at all, simply does not answer and the generic message
+// stands.
+function describePortHolder(port = PORT) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; resolve(); } };
+        const request = http.request({
+            host: '127.0.0.1',
+            port,
+            path: '/stream-api/host-info',
+            method: 'GET',
+            agent: false
+        }, (response) => {
+            let raw = '';
+            response.setEncoding('utf8');
+            response.on('data', (chunk) => { raw += chunk; });
+            response.on('end', () => {
+                let info = null;
+                try { info = JSON.parse(raw); } catch (err) { info = null; }
+                if (info && typeof info.dir === 'string') {
+                    const same = path.resolve(info.dir) === HOST_DIR;
+                    console.error('  -> Port ' + port + ' is held by ' + (same
+                        ? 'ANOTHER server.js from THIS directory'
+                        : 'a server from a DIFFERENT copy of this project') + ':');
+                    console.error('     holder: ' + info.dir + ' (pid ' + info.pid
+                        + ', started ' + info.startedAt + ')');
+                    console.error('     this:   ' + HOST_DIR);
+                    if (!same) {
+                        console.error('     It is serving the OTHER copy code, so a check against');
+                        console.error('     http://127.0.0.1:' + port + '/ is NOT testing your edits.');
+                    }
+                }
+                finish();
+            });
+        });
+        request.on('error', () => finish());
+        request.setTimeout(1500, () => { request.destroy(); finish(); });
+        request.on('close', finish);
+        request.end();
+    });
+}
+
 // A second launcher (or any other process grabbing the port) must fail with
 // a readable reason, not a raw EADDRINUSE stack trace in the launcher window.
 server.on('error', (error) => {
     if (error && error.code === 'EADDRINUSE') {
         console.error(`Port ${PORT} is already in use. Stop the other site server or set PORT to a free port before starting.`);
-        process.exit(1);
+        // NAME the incumbent: with dozens of worktrees on one machine, "port 3000
+        // is in use" is ambiguous in exactly the way that causes silent wrong
+        // answers. Awaited, because process.exit() discards pending I/O.
+        describePortHolder().then(() => process.exit(1), () => process.exit(1));
         return;
     }
     // Every OTHER error used to be fatal too, which contradicts the
@@ -1132,6 +1302,7 @@ server.headersTimeout = 66000;
 
 server.listen(PORT, '127.0.0.1', () => {
     console.log('Rydius Stream host is running on this laptop.');
+    console.log(`Serving from:    ${HOST_DIR}`);
     console.log(`Local page:    http://127.0.0.1:${PORT}/streaming/`);
     console.log(`WebRTC signal: http://127.0.0.1:${MEDIAMTX_PORT} (proxied at /stream-api/**)`);
     console.log(`MediaMTX API:  http://127.0.0.1:${MEDIAMTX_API_PORT} (proxied at /stream-api/v3/**)`);
