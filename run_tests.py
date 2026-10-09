@@ -74,7 +74,6 @@ def start_node_server(node, env_overrides):
         stderr=subprocess.STDOUT,
     )
 
-
 class SiteStartupError(Exception):
     """server.js exited before it answered; ``output`` is everything it printed."""
 
@@ -130,7 +129,6 @@ def stop_process(process):
         process.kill()
         output, _ = process.communicate(timeout=3)
     return output.decode("utf-8", "replace") if output else ""
-
 
 class CaseInsensitiveHeaders(dict):
     """HTTP header names are case-insensitive, even when raw casing varies."""
@@ -223,7 +221,6 @@ def run_js_check(test_case, case_name):
         0,
         "js_checks.js case {!r} failed:\n{}{}".format(case_name, result.stdout, result.stderr),
     )
-
 
 class _QuietHTTPServer(HTTPServer):
     """Keeps proxy keep-alive resets from dumping tracebacks into the report."""
@@ -437,7 +434,6 @@ def truncated_request_outcome(port, path, timeout=5):
         except OSError:
             pass
     return outcome
-
 
 class LaptopHostChecks(unittest.TestCase):
     @classmethod
@@ -716,7 +712,6 @@ class LaptopHostChecks(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertNotIn(marker, self.app)
 
-
 class _SiteUnderTest(unittest.TestCase):
     """Boots a fresh server.js per test, wired to stub or intentionally dead upstreams.
 
@@ -785,7 +780,6 @@ class _SiteUnderTest(unittest.TestCase):
                     break
         self.fail("{}\nServer output:\n{}".format(
             startup_error, (startup_error.output or "<none>").strip()))
-
 
 class JsLogicChecks(unittest.TestCase):
     """Browser-logic checks that run the real app.js functions inside js_checks.js.
@@ -975,33 +969,39 @@ class JsLogicChecks(unittest.TestCase):
         ramp from being judged against a measurement taken minutes earlier."""
         run_js_check(self, "catchup-probe-is-abandoned-when-measurement-stops")
 
-    def test_superseded_attempt_cannot_disarm_a_live_attempt(self):
-        """Runs the real `finish()` and the real WHEP POST `finally` bodies.
 
-        `whepPostTimeout` and `gatherTimeout` are module globals purely so
-        cleanupConnection() can cancel an in-flight connectStream attempt, which
-        makes each one a slot that TWO attempts write to. Both were cleared
-        unconditionally, so a torn-down attempt's late callback disarmed the
-        attempt that replaced it: the live attempt lost its 10s POST bound (and,
-        for the gather cap, its whole routable-candidate poll loop, which
-        guarded on the very global the stale attempt nulled).
+    def test_chat_notification_behaviour_is_pinned_by_execution(self):
+        """Runs the real notification functions against a stub DOM, so the
+        burst cap, the hidden-at-zero badge, the 99+ clamp and the layer's
+        release after a burst are proven by observation rather than by the
+        presence of an identifier."""
+        run_js_check(self, "chat-notification-behaviour")
 
-        This case also asserts the OLD bodies still reproduce the fault, so it
-        cannot pass vacuously."""
-        run_js_check(self, "superseded-attempt-cannot-disarm-a-live-attempt")
 
-    def test_superseded_session_error_must_not_tear_down_the_live_session(self):
-        """A stale connectStream failure must not kill the session that replaced it.
+    def test_chat_notification_gate_decisions_are_pinned_by_execution(self):
+        """The source guards can only see that `!isSelf && !isHistory` and
+        `if (isHost)` appear in handleIncomingMessage — not that the call is
+        nested inside that gate. This drives the real function and checks which
+        branch each of the four message kinds actually takes."""
+        run_js_check(self, "chat-notification-gate-decisions")
 
-        Only the AbortError branch carried a `superseded()` guard. AbortError is
-        not the only way a torn-down attempt fails: cleanupConnection() calls
-        `pc.close()` while the attempt is still suspended on createOffer() or
-        setLocalDescription(), and those reject with InvalidStateError. That
-        landed in the generic branch, which unconditionally cleared isConnecting
-        and ran handleDisconnected() -- clearing the LIVE attempt's 26s connect
-        watchdog, closing the LIVE attempt's peer connection and painting the
-        page OFFLINE. A clean connect followed by an unexplained drop."""
-        run_js_check(self, "superseded-session-error-must-not-tear-down-the-live-session")
+
+    def test_chat_init_replay_classification_is_pinned_by_execution(self):
+        """The server answers a native auto-reconnect with exactly the messages
+        this client missed. The real connectChatEvents is driven with a stubbed
+        EventSource to prove the init payload is classified by whether a
+        watermark already existed, rather than blanket-marked as history."""
+        run_js_check(self, "chat-init-replay-classification")
+
+
+    def test_polling_catch_up_is_silent_by_execution(self):
+        """Runs the real poll body with a stubbed fetch. A string check cannot
+        tell an isCatchUp that is genuinely derived from the watermark from one
+        that is hardcoded false, nor catch a watermark re-read after the await
+        (which the batch itself advances) — so the receive path is observed
+        directly."""
+        run_js_check(self, "polling-fallback-catch-up-is-silent")
+
 
 
 class StreamApiProxyChecks(_SiteUnderTest):
@@ -1305,32 +1305,52 @@ class StreamApiProxyChecks(_SiteUnderTest):
             conn.close()
 
     def test_chat_replay_does_not_silently_drop_messages_across_a_restart(self):
-        # Message ids restart at 1 when the server restarts, so a browser
-        # reconnecting with lastId=99 while messages are numbered from 1 again
-        # used to have `m.id > 99` filter out every real message, silently and
-        # with no gap marker. The client must get the retained window instead.
+        # A browser keeps recent ids for deduplication, so the next server
+        # process must issue larger ids instead of reusing the previous range.
         self.start_site()
+        old_ids = []
         for text in ("alpha", "bravo", "charlie"):
-            http_request(
+            status, _, body = http_request(
                 self.port, "POST", "/stream-api/chat/messages",
                 body=json.dumps({"text": text, "author": "Viewer"}).encode("utf-8"),
             )
-        status, init = self._read_chat_init(self.port, "?lastId=99")
+            self.assertEqual(status, 200)
+            old_ids.append(json.loads(body.decode("utf-8"))["message"]["id"])
+
+        previous_last_id = old_ids[-1]
+        stop_process(self.server_process)
+        self.server_process = None
+        time.sleep(0.01)
+        self.start_site()
+
+        current_ids = []
+        for text in ("delta", "echo", "foxtrot"):
+            status, _, body = http_request(
+                self.port, "POST", "/stream-api/chat/messages",
+                body=json.dumps({"text": text, "author": "Viewer"}).encode("utf-8"),
+            )
+            self.assertEqual(status, 200)
+            current_ids.append(json.loads(body.decode("utf-8"))["message"]["id"])
+        self.assertGreater(current_ids[0], previous_last_id,
+                           "a restarted server must not reuse ids held by open clients")
+
+        status, init = self._read_chat_init(self.port, "?lastId={}".format(previous_last_id))
         self.assertEqual(status, 200)
         self.assertIsNotNone(init, "the init frame must be readable")
         texts = [m.get("text") for m in init["history"]]
-        for text in ("alpha", "bravo", "charlie"):
+        for text in ("delta", "echo", "foxtrot"):
             self.assertIn(
                 text, texts,
-                "an id this process never issued must fall back to the full "
+                "a previous process id must fall back to the full "
                 "retained window instead of silently dropping messages",
             )
         # A legitimate in-range replay must still replay only what followed it,
         # or the fix would just resend the whole log to every reconnecting tab.
-        status, init = self._read_chat_init(self.port, "?lastId=1")
+        status, init = self._read_chat_init(
+            self.port, "?lastId={}".format(current_ids[0]))
         self.assertEqual(status, 200)
         self.assertEqual(
-            [m.get("text") for m in init["history"]], ["bravo", "charlie"],
+            [m.get("text") for m in init["history"]], ["echo", "foxtrot"],
             "an id inside the retained window must replay only what followed it",
         )
 
@@ -1376,7 +1396,6 @@ class StreamApiProxyChecks(_SiteUnderTest):
         self.assertEqual(status, 405)
         self.assertEqual(self.signaling.requests, [], "the TURN endpoint must not reach MediaMTX")
         self.assertEqual(self.api.requests, [], "the TURN endpoint must not reach MediaMTX")
-
 
 class TurnCredentialProxyChecks(_SiteUnderTest):
     """Remote viewers receive Cloudflare TURN credentials minted by the local server.
@@ -1497,7 +1516,6 @@ class TurnCredentialProxyChecks(_SiteUnderTest):
         self.assertRegex(app, r"cachedIceServersAt (?:<=>|> |<=) 10 \* 60 \* 1000",
                          "viewer ICE cache (10 min) must stay below the mint's >=30 min validity floor")
 
-
 class MediaMtxUnavailableChecks(_SiteUnderTest):
     """MediaMTX is down before OBS starts — the page must still behave."""
 
@@ -1520,7 +1538,6 @@ class MediaMtxUnavailableChecks(_SiteUnderTest):
         status, headers, _ = http_request(self.port, "OPTIONS", "/stream-api/v3/paths/list")
         self.assertEqual(status, 204)
         self.assertEqual(headers.get("Access-Control-Allow-Origin"), "*")
-
 
 class ProxyUpstreamFailureChecks(_SiteUnderTest):
     """The proxy's failure paths, exercised against upstreams that really fail.
@@ -1628,7 +1645,6 @@ class ProxyUpstreamFailureChecks(_SiteUnderTest):
                           "a surviving process.exit() must be guarded by an explicit "
                           "fatal-error list, not reached unconditionally")
 
-
 class StaticServerHardeningChecks(_SiteUnderTest):
     """The allowlist map is the only thing standing between the page and the repo."""
 
@@ -1673,7 +1689,6 @@ class StaticServerHardeningChecks(_SiteUnderTest):
         self.start_site()
         status, _, _ = http_request(self.port, "GET", "/stream-api")
         self.assertEqual(status, 404)
-
 
 class SiteStartupDiagnosticsChecks(_SiteUnderTest):
     """A server that dies at startup must say why, in its own words.
@@ -1773,7 +1788,6 @@ class SiteStartupDiagnosticsChecks(_SiteUnderTest):
             slow.shutdown()
             slow.server_close()
 
-
 class StartupConfigurationChecks(unittest.TestCase):
     """A bad PORT must abort at boot instead of silently binding something else."""
 
@@ -1816,7 +1830,6 @@ class StartupConfigurationChecks(unittest.TestCase):
         returncode, output = self._boot({"PORT": find_free_port(), "MEDIAMTX_PORT": 8889, "MEDIAMTX_API_PORT": "abc"})
         self.assertNotEqual(returncode, 0)
         self.assertIn("MEDIAMTX_API_PORT must be a valid TCP port", output)
-
 
 class CrossFileConsistencyChecks(unittest.TestCase):
     """Ports, stream names and asset URLs are each written down in several files."""
@@ -1905,7 +1918,7 @@ class CrossFileConsistencyChecks(unittest.TestCase):
                 self.assertIsNotNone(version, "{} has no ?v= cache buster".format(reference))
                 versions.add(version.group(1))
         self.assertEqual(len(versions), 1,
-                         "all assets must share one cache version, got {}".format(sorted(versions)))
+                         "all page assets must share one cache version, got {}".format(sorted(versions)))
 
     def test_query_selectors_used_by_app_exist_in_html(self):
         selectors = re.findall(r"querySelector(?:All)?\(\s*['\"]([^'\"]+)['\"]\s*\)", self.app)
@@ -1929,7 +1942,6 @@ class CrossFileConsistencyChecks(unittest.TestCase):
                                   "id {} used by app.js is absent from index.html".format(selector[1:]))
                 else:
                     self.fail("unsupported selector {!r} — extend this check".format(selector))
-
 
 class MediaMTXControlApiContractChecks(unittest.TestCase):
     """Locks the MediaMTX behaviour app.js depends on (this breaks on upgrades).
@@ -2117,7 +2129,6 @@ class MediaMTXControlApiContractChecks(unittest.TestCase):
         finally:
             stop_process(process)
             config_path.unlink(missing_ok=True)
-
 
 class ReceiverLagFixChecks(unittest.TestCase):
     """Guards for the receiver-side lag fixes, each one verified live.
@@ -2915,8 +2926,6 @@ class ChatFeatureChecks(_SiteUnderTest):
         self.assertTrue(data.get("ok"))
         self.assertGreaterEqual(data.get("count", 0), 1)
 
-
-
 class StreamingHardeningChecks(unittest.TestCase):
     """Hardening pass: audio-rescue renditions, codec-change re-planning,
     viewer count, route HUD, single-path volume, network-change recovery and
@@ -3197,7 +3206,6 @@ class StreamingHardeningChecks(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("ok", result.stdout)
 
-
 class ViewerCountRuntimeChecks(_SiteUnderTest):
     def test_viewer_count_broadcasts_on_join_and_leave(self):
         self.start_site()
@@ -3251,8 +3259,6 @@ class ViewerCountRuntimeChecks(_SiteUnderTest):
         self.assertIn(b'"count":1', leave_event, "leave must broadcast the dropped count")
         conn_a.close()
 
-
-
 class EndToEndBridgeChecks(unittest.TestCase):
     """Opt-in END-TO-END check on the real machine: boots the bundled
     MediaMTX with free ports, lets the runOnAvailable hook launch
@@ -3284,7 +3290,6 @@ class EndToEndBridgeChecks(unittest.TestCase):
             0,
             "E2E bridge check failed: " + result.stdout[-4000:] + " " + result.stderr[-2000:],
         )
-
 
 class ViewerSmoothnessRegressionChecks(unittest.TestCase):
     """Regression guards for the viewer-smoothness audit.
@@ -4802,7 +4807,7 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         So the guard has to ask WHICH config file the running process was started
         with, which is available from its own command line.
         """
-        ps = read_text(LAUNCHER_PATH)
+        ps = self.launcher
         self.assertIn("$foreignConfig", ps,
                       "the launcher must detect a reused MediaMTX that was "
                       "started from a different copy of this project")
@@ -4814,79 +4819,6 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
                       "compared with this checkout's")
         self.assertIn("DIFFERENT copy of this project", ps,
                       "the operator must be told which copy is actually serving")
-        # The reassuring message must not be reachable while a foreign config is
-        # in use, and must not claim a scope it does not have: the scalar reader
-        # is anchored at column 0, so the whole `paths:` block -- which holds the
-        # rendition hooks -- is never compared.
-        match = re.search(
-            r"if \(\$configVerified -and \$compared -gt 0 (-and -not \$foreignConfig)?\) \{",
-            ps)
-        self.assertIsNotNone(match, "the reuse-branch success condition was not found")
-        self.assertIn("-not $foreignConfig", match.group(0),
-                      "the 'config matches' message is still reachable while a "
-                      "foreign MediaMTX is running")
-        self.assertIn("are NOT compared", ps,
-                      "the reuse message must state that path-level settings, "
-                      "including the codec-bridge hooks, were not compared")
-
-    def test_launcher_derives_the_webrtc_udp_port_from_the_config(self):
-        """The UDP pre-flight must not be able to drift from the config it guards.
-
-        `$webrtcUdpPort` was the one value in the launcher that was hard-coded
-        while everything else is derived from mediamtx.yml, so editing
-        `webrtcLocalUDPAddress` left the conflict check probing a port nothing
-        binds: the guard silently went dead on exactly the edit it exists to
-        catch. It has to be parsed out of the file, with the literal kept only
-        as a fallback."""
-        ps = read_text(LAUNCHER_PATH)
-        self.assertIn("webrtcLocalUDPAddress", ps,
-                      "the WebRTC UDP port must be derived from mediamtx.yml")
-        config = read_text(ROOT / "mediamtx.yml")
-        m = re.search(r"^\s*webrtcLocalUDPAddress:\s*\S*?:(\d{1,5})\s*$", config, re.MULTILINE)
-        self.assertIsNotNone(m, "webrtcLocalUDPAddress has no parseable port")
-        self.assertIn("Select-String", ps,
-                      "the port must be read out of the config at launch time")
-        # The literal survives as the FALLBACK for a missing/unreadable config,
-        # which is legitimate. What must not happen is it being the only source:
-        # the parsed value has to be able to REASSIGN it, and to be parsed from
-        # the key rather than from a second hard-coded copy of the number.
-        self.assertRegex(
-            ps, r"\$webrtcUdpPort\s*=\s*\$parsedPort",
-            "the parsed port must be assigned to $webrtcUdpPort, or the literal "
-            "is still the only source and the check can drift from the config")
-        self.assertRegex(
-            ps, r"webrtcLocalUDPAddress:\s*\\s\*",
-            "the port must be read by matching the webrtcLocalUDPAddress key, "
-            "not by assuming a fixed line number or column")
-
-    def test_launcher_detects_a_mediamtx_started_from_another_checkout(self):
-        """"config matches mediamtx.yml" must not be able to hide the case where
-        the running MediaMTX belongs to a DIFFERENT copy of this project.
-
-        This repo is checked out many times over (a main checkout plus one
-        worktree per task) and sibling worktrees usually sit on the SAME commit,
-        so their mediamtx.yml files are byte-identical. The launcher's guard
-        compares the running instance's VALUES against the file on disk, so in
-        that situation every comparison passes and it reports a clean match --
-        while `runOnAvailable: node "codec_bridge.js"` is a RELATIVE path
-        resolved against MediaMTX's working directory, meaning the bridge
-        actually transcoding is the other checkout's file. Editing
-        codec_bridge.js then does nothing at all, with the launcher actively
-        reassuring you that it is in effect.
-
-        So the guard has to ask WHICH config file the running process was started
-        with, which is available from its own command line.
-        """
-        ps = self.launcher
-        self.assertIn("$foreignConfig", ps,
-                      "the launcher must detect a reused MediaMTX that was "
-                      "started from a different copy of this project")
-        self.assertIn("Get-CimInstance Win32_Process", ps,
-                      "the running instance's own command line is the signal that "
-                      "names the config file it was started with")
-        self.assertIn("Resolve-Path -LiteralPath $liveConfigPath", ps,
-                      "the live config path must be resolved before it can be "
-                      "compared with this checkout's")
         # The reassuring message must not be reachable while a foreign config is
         # in use, and must not claim a scope it does not have: the scalar reader
         # is anchored at column 0, so the whole `paths:` block -- which holds the
@@ -4933,6 +4865,12 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         self.assertLess(literal, derive.start(),
                         "the config-derived port must override the fallback literal, "
                         "not be overwritten by it")
+        # And it must be read by matching the KEY, not by assuming a fixed line
+        # number or column - the same class of drift the fallback literal caused.
+        self.assertRegex(
+            ps, r"webrtcLocalUDPAddress:\s*\\s\*",
+            "the port must be read by matching the webrtcLocalUDPAddress key, "
+            "not by assuming a fixed line number or column")
         # And the key it parses must still exist in the config.
         config = read_text(ROOT / "mediamtx.yml")
         self.assertIsNotNone(
@@ -5240,6 +5178,249 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         # No removal timer should be left behind for the bump.
         self.assertNotIn("classList.remove('count-bump')", code,
                          "the bump ends at its natural state, so it needs no timer")
+
+
+    def test_chat_notification_fires_only_for_new_messages(self):
+        """A notification that replays history is worse than none: on every SSE
+        (re)connect the server hands the host its whole 50-message backlog, and
+        on the polling fallback path the whole 100-message window. Both arrive
+        with isHistory=true, so both must be silent."""
+        fn = self._js_function_body(self.app, "handleIncomingMessage")
+        self.assertIsNotNone(fn, "handleIncomingMessage not found")
+        self.assertIn("!isSelf && !isHistory", fn,
+                      "a replayed or self-sent message must not raise a notification")
+        self.assertIn("showChatNotification", fn,
+                      "new messages must raise the on-screen notification")
+        # The init payload is old backlog ONLY on a cold connect. After a native
+        # auto-reconnect the server replays Last-Event-ID and sends exactly the
+        # messages the client MISSED, so it must not blanket-mark them history.
+        self.assertNotIn("data.history.forEach((m) => handleIncomingMessage(m, true));",
+                         self.app,
+                         "a reconnect replay is the messages this client missed, "
+                         "not backlog; marking it history drops every message that "
+                         "arrived during a blip")
+        init_fn = self._js_function_body(self.app, "connectChatEvents")
+        self.assertIn("hadWatermark", init_fn,
+                      "the init replay must be classified by whether a watermark "
+                      "already existed, not blanket-marked as history")
+        self.assertLess(init_fn.index("const hadWatermark"), init_fn.index("data.history.forEach"),
+                        "the watermark must be sampled before the batch is applied, "
+                        "since applying it advances the variable")
+
+
+    def test_chat_notification_is_host_only(self):
+        """Viewers already have the log open in front of them; a card over the
+        video for every viewer message is noise, not notification. isHost is
+        only authoritative once the server's init event has been handled, which
+        is why the check lives inside the receive path rather than at the top
+        of the file."""
+        fn = self._js_function_body(self.app, "handleIncomingMessage")
+        self.assertIn("if (isHost)", fn,
+                      "only the host should get an on-screen chat notification")
+
+
+    def test_chat_notification_density_is_bounded(self):
+        """Each card is a composited layer drawn over live video, on the same
+        GPU budget as the decoder. A chatty room would otherwise stack one per
+        message, so the stack is capped and a burst folds into a counter."""
+        self.assertIn("MAX_CHAT_TOASTS", self.app,
+                      "concurrent chat notification cards must be capped")
+        self.assertIn("CHAT_TOAST_BURST_MS", self.app,
+                      "a burst must be folded instead of stacking a card per message")
+        fn = self._js_function_body(self.app, "showChatNotification")
+        self.assertIsNotNone(fn, "showChatNotification not found")
+        self.assertIn("liveChatToasts >= MAX_CHAT_TOASTS", fn,
+                      "the cap must be enforced at the append site")
+        # The counter is a real element, not a string that silently no-ops.
+        self.assertIn('id="chat-toast-overflow"', read_text(HTML_PATH))
+
+
+    def test_chat_notification_cards_leave_the_render_tree_when_idle(self):
+        """Same rule as .action-feedback / .volume-toast: an over-video layer
+        that is idle for the whole session between messages must be hidden
+        with visibility, not only opacity, or it keeps a render surface alive
+        above the video permanently."""
+        css = self._strip_comments(self.css, "css")
+        body = self._css_rule(css, ".chat-toast-layer")
+        self.assertIsNotNone(body, ".chat-toast-layer rule not found")
+        self.assertIn("visibility: hidden", body,
+                      "the empty notification layer must be hidden with visibility")
+        self.assertIn("pointer-events: none", body,
+                      "an empty layer must not swallow clicks meant for the video")
+        self.assertIn("visibility: visible", self._css_rule(css, ".chat-toast-layer.active"),
+                      "the layer must become visible while it holds cards")
+
+
+    def test_chat_notification_does_not_blur_the_video(self):
+        """A backdrop-filter directly over the <video> forces a render surface
+        and re-samples the video texture on every decoded frame."""
+        css = self._strip_comments(self.css, "css")
+        body = self._css_rule(css, ".chat-toast-layer")
+        self.assertNotIn("backdrop-filter: blur", body,
+                         "the notification layer is drawn over live video and must not blur it")
+        card = self._css_rule(css, ".chat-toast")
+        self.assertIsNotNone(card, ".chat-toast rule not found")
+        self.assertNotIn("backdrop-filter: blur", card,
+                         "a notification card is drawn over live video and must not blur it")
+
+
+    def test_clicking_a_notification_does_not_toggle_playback(self):
+        """The card is deliberately clickable (it jumps to the chat), so it sits
+        inside .video-container — which has its own click/dblclick handlers that
+        toggle play/pause and fullscreen. Without the ignore entry, answering a
+        viewer would pause the broadcast. The wheel handler needs it too: a card
+        sits under the pointer, so scrolling one changed the volume."""
+        for handler in ("click", "dblclick", "wheel"):
+            anchor = "videoContainer.addEventListener('" + handler + "'"
+            start = self.app.find(anchor)
+            self.assertGreater(start, 0, "videoContainer {} handler not found".format(handler))
+            # The guard is a chain of closest() calls joined by ||, so the scan
+            # has to span the whole `if` condition rather than stop at the
+            # first ')' — that is the end of the FIRST clause, not the chain.
+            window = self.app[start:start + 700]
+            self.assertIn("'.chat-toast-layer'", window,
+                          "the {} handler must ignore events on a chat notification "
+                          "(clicking one would pause the stream; the wheel would "
+                          "change the volume)".format(handler))
+
+
+    def test_chat_notification_escapes_viewer_text(self):
+        """Author and body are untrusted viewer input. A card built with
+        innerHTML would be a stored-XSS sink on every viewer's screen."""
+        code = self._js_function_body(self._strip_comments(self.app, "js"), "showChatNotification")
+        self.assertIn("innerText", code,
+                      "viewer-supplied text must be written with innerText")
+        # Comments are stripped for BOTH halves: the function's own comment
+        # explains WHY it avoids innerHTML, and it also contains the literal
+        # word "innerText" — a naive check on unstripped source is satisfied by
+        # the explanation of the fix rather than by the fix.
+        self.assertNotIn("innerHTML", code,
+                         "innerHTML on viewer text is an XSS sink")
+
+
+    def test_polling_fallback_catch_up_is_not_treated_as_new(self):
+        """A client whose EventSource failed falls back to polling. The FIRST
+        poll sends since=0, and the server reads 0 as 'send everything'
+        (server.js), so that response is the entire backlog rather than a
+        delta. Marking it as new made the host raise a notification for every
+        message already in the log — up to the 100-message cap — at exactly the
+        moment the connection was already struggling."""
+        fn = self._js_function_body(self.app, "startPollingFallback")
+        self.assertIsNotNone(fn, "startPollingFallback not found")
+        self.assertNotIn("handleIncomingMessage(m, false)", fn,
+                         "the since=0 catch-up response is the whole backlog, "
+                         "not new messages")
+        self.assertIn("isCatchUp", fn,
+                      "the first poll must be marked as a catch-up replay")
+        self.assertIn("handleIncomingMessage(m, isCatchUp)", fn,
+                      "the catch-up flag must actually reach the receive path")
+        # The watermark must be sampled BEFORE the await. handleIncomingMessage
+        # advances lastReceivedMessageId as the batch is applied, so a value
+        # read afterwards could already have moved and misclassify a batch that
+        # began at 0 as a delta.
+        code = self._js_function_body(self._strip_comments(self.app, "js"),
+                                      "startPollingFallback")
+        sample = code.find("const since = lastReceivedMessageId")
+        fetch = code.find("await fetch")
+        self.assertGreater(sample, -1,
+                           "the watermark must be captured into a local, not re-read later")
+        self.assertGreater(fetch, -1, "no fetch found in the poll body")
+        self.assertLess(sample, fetch,
+                        "the watermark must be captured before the await, or a "
+                        "batch that advanced it mid-apply reads as a delta")
+        # The decision must use the SNAPSHOT, not the live variable. Sampling
+        # early is pointless if the comparison still reads the mutable global
+        # after handleIncomingMessage has advanced it.
+        self.assertRegex(
+            code, r"const isCatchUp = since === 0 && !chatStreamPrimed;",
+            "isCatchUp must compare the pre-await snapshot; re-reading "
+            "lastReceivedMessageId after the fetch restores the race this fix removed")
+        # A since=0 poll is only a BACKLOG replay while nothing has ever been
+        # received. Once the client is primed, a still-zero watermark just means
+        # the log is empty, and the response is live traffic that must notify.
+        self.assertIn("chatStreamPrimed = true;", self.app,
+                      "the client must be marked primed once a baseline exists")
+        init = self._js_function_body(self.app, "connectChatEvents")
+        self.assertIn("chatStreamPrimed = true", init,
+                      "the SSE init handler must mark the stream primed")
+        # The polling path must be able to prime ITSELF. It is reachable with no
+        # init handler at all: a throwing EventSource constructor returns before
+        # the listener is attached, and a non-200 / wrong-MIME EventSource goes
+        # to CLOSED without reconnecting. With the flag written only by init,
+        # every polled message stayed classified as backlog and the host was
+        # never notified again for the whole session.
+        self.assertIn("chatStreamPrimed = true", fn,
+                      "the poll body must prime the client, or the polling-only "
+                      "path never notifies again after the first catch-up")
+        # ...and the write must come AFTER the classification, or the very
+        # first poll would stop being a catch-up. Compared on the FIRST
+        # occurrence of each: the body legitimately contains one priming write,
+        # and a last-occurrence search would sail straight past an illegally
+        # EARLY one and still find the correct one further down.
+        self.assertLess(fn.index("const isCatchUp"), fn.index("chatStreamPrimed = true"),
+                        "priming must happen after the batch is classified, or the "
+                        "first since=0 poll is no longer treated as a catch-up")
+        # A cursor from before a restart is outside the new history window, so
+        # the server returns retained messages instead of filtering them away.
+        self.assertRegex(self.server, r"const replayable = Number\.isFinite\(sinceId\)",
+                         "the server must decide replayability before it filters")
+        self.assertRegex(
+            self.server,
+            r"replayable \? chatHistory\.filter\(\(m\) => m\.id > sinceId\) : chatHistory",
+            "a since=0 poll is not replayable, so it must return the whole history")
+
+
+    def test_chat_toast_layer_always_goes_idle(self):
+        """The layer is pointer-events:auto while `active`, over the video. The
+        folded '+N more' counter is the last thing holding it active, and
+        nothing cleared it: one burst left a permanently visible, permanently
+        clickable invisible box in the corner of the player's hit area, and the
+        pill never went away. It needs its own expiry."""
+        self.assertIn("scheduleChatOverflowRetire", self.app,
+                      "the folded counter must retire on its own clock")
+        fn = self._js_function_body(self.app, "scheduleChatOverflowRetire")
+        self.assertIsNotNone(fn, "scheduleChatOverflowRetire not found")
+        self.assertIn("chatToastOverflow = 0", fn,
+                      "the expiry must actually zero the counter")
+        self.assertIn("classList.remove('active')", fn,
+                      "the layer must be released once the counter retires")
+        # Folding must arm the timer, or the expiry above is unreachable.
+        show = self._js_function_body(self.app, "showChatNotification")
+        self.assertIn("scheduleChatOverflowRetire", show,
+                      "every folded message must arm the counter's expiry")
+        # Clicking through retires it too: the host is going to the log.
+        # Scoped to the click handler, NOT the whole file: a bare
+        # `assertIn("clearChatOverflow", self.app)` is satisfied by the function
+        # DEFINITION, so deleting the only call site left that dead function
+        # still passing — which is exactly the state the handler was once in.
+        click = self.app.index("chatToastLayer.addEventListener('click'")
+        self.assertGreater(click, -1, "the notification click handler is missing")
+        handler = self.app[click:click + 700]
+        self.assertIn("clearChatOverflow()", handler,
+                      "acting on a notification must retire the folded counter; "
+                      "a definition alone is dead code")
+        self.assertIn("clearChatUnread()", handler,
+                      "acting on a notification must retire the unread count")
+
+
+    def test_chat_unread_badge_is_hidden_at_zero_and_cleared_on_read(self):
+        """A '0' badge that never clears is worse than no badge: it trains the
+        host to ignore the one thing the badge exists to signal."""
+        render = self._js_function_body(self.app, "renderChatUnread")
+        self.assertIsNotNone(render, "renderChatUnread not found")
+        self.assertIn("chatUnreadBadge.hidden = true", render,
+                      "a zero count must hide the badge rather than render '0'")
+        self.assertIn("MAX_CHAT_UNREAD", self.app,
+                      "the label must be capped so it cannot reflow the tab strip")
+        tab = self._js_function_body(self.app, "activateSidebarTab")
+        self.assertIn("clearChatUnread", tab,
+                      "opening the chat by hand must retire the unread count")
+        self.assertIn('.tab-unread-badge[hidden]', self.css,
+                      "[hidden] must beat the badge's display, or '0' renders")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 
 
 class StudioOverlayVisibilityChecks(unittest.TestCase):

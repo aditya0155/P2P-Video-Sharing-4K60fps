@@ -500,7 +500,9 @@ const reactionRateLimits = new Map();
 // write()===false cannot detect this early enough on its own (the kernel
 // socket buffer absorbs megabytes first), so the bytes are counted here.
 const SSE_MAX_QUEUED_BYTES = 256 * 1024;
-let lastChatMessageId = 0;
+// Seed from wall time so a normal restart cannot reuse ids held by an open
+// browser. This range remains exactly representable in JavaScript numbers.
+let lastChatMessageId = Date.now() * 1000;
 
 function isDirectLocal(req) {
     const ip = req.socket && req.socket.remoteAddress;
@@ -750,14 +752,10 @@ function handleChat(req, res, requestUrl) {
         const isHost = isDirectLocal(req);
         const lastEventId = Number.parseInt(req.headers['last-event-id'] || requestUrl.searchParams.get('lastId') || '0', 10);
         let initialHistory;
-        // Replay is only meaningful for ids this process actually issued. The
-        // counter restarts at 0 on boot, so a browser that reconnects after a
-        // server restart presents lastEventId=4 while messages are being
-        // numbered from 1 again: `m.id > 4` filtered out everything until the
-        // count climbed past 4, silently dropping real messages. The same
-        // happens for any id older than the ring buffer. In both cases the
-        // honest answer is the full retained window, which is also what a fresh
-        // subscriber gets — the client can render it without a gap marker.
+        // Replay is only meaningful for ids inside this process's retained
+        // window. A reconnecting page can carry an id from a previous process;
+        // when that id falls outside the window, send the retained messages
+        // instead of filtering away everything until the counter catches up.
         const replayable = Number.isFinite(lastEventId)
             && lastEventId > 0
             && lastEventId <= lastChatMessageId
@@ -841,11 +839,9 @@ function handleChat(req, res, requestUrl) {
     if (subpath === '/messages' || subpath === '/messages/') {
         if (req.method === 'GET' || req.method === 'HEAD') {
             const sinceId = Number.parseInt(requestUrl.searchParams.get('since') || '0', 10);
-            // Same rule as the SSE replay above, for the same reason: this is the
-            // client's FALLBACK poll (used when EventSource is unavailable), and
-            // after a server restart the ids restart from 1, so `sinceId` can be
-            // ahead of the counter and the naive filter would silently drop every
-            // real message until the count climbed past it.
+            // Same rule as SSE replay: a fallback poll can carry an id from a
+            // previous process or outside the retained window. Return the
+            // retained history rather than silently filtering out new messages.
             const replayable = Number.isFinite(sinceId)
                 && sinceId > 0
                 && sinceId <= lastChatMessageId
