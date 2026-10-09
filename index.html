@@ -58,11 +58,12 @@
                     <span id="perf-toggle-label">Reduce effects</span>
                 </button>
 
-                <!-- Broadcast Studio: the no-install screen-share broadcaster.
-                     Kept as a real link (not a script-built click) so it opens
-                     in a new tab, works with middle-click, and is visible to
-                     a keyboard user as part of the page's normal tab order. -->
-                <a class="studio-link-btn" id="open-studio-btn" href="/streaming/studio?v=2.26.0" target="_blank" rel="noopener" title="Broadcast a screen, window or tab from this browser (opens in a new tab)" aria-label="Open the broadcast studio in a new tab">
+                <!-- Real link keeps the broadcaster reachable by keyboard and
+                     supports opening it in a separate tab. -->
+                <a class="perf-toggle-btn studio-launch-btn" id="studio-launch-btn"
+                   href="/streaming/studio?v=2.26.0" target="_blank" rel="noopener"
+                   title="Broadcast a screen, window or tab from this browser (opens in a new tab)"
+                   aria-label="Open the broadcast studio in a new tab">
                     <i class="fa-solid fa-tower-broadcast"></i>
                     <span>Broadcast</span>
                 </a>
@@ -361,6 +362,9 @@
                                 <h3>OBS Studio Settings</h3>
                             </div>
                             <p class="info-description">Select ingest protocol for OBS Studio setup:</p>
+                            <ul class="obs-instructions active">
+                                <li><span class="obs-key">No OBS?</span><span class="obs-val">Use the built-in <a class="studio-inline-link" id="studio-inline-link" href="/broadcast?v=2.26.0">browser broadcaster</a>. It publishes to the same <code>live</code> path over WHIP, with codec, bitrate, resolution, frame rate and keyframe controls, screen/window/tab capture, webcam picture-in-picture and system audio + mic mixing. OBS keeps working exactly as before — pick whichever you prefer.</span></li>
+                            </ul>
                             <div class="ingest-selector">
                                 <button class="ingest-tab active" id="ingest-tab-whip">RTMP (this laptop)</button>
                                 <button class="ingest-tab" id="ingest-tab-srt">SRT / WHIP options</button>

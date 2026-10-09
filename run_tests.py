@@ -33,6 +33,12 @@ JS_CHECKS_PATH = ROOT / "js_checks.js"
 BRIDGE_PATH = ROOT / "codec_bridge.js"
 LAUNCHER_PATH = ROOT / "start_host.ps1"
 MEDIAMTX_PATH = ROOT / "mediamtx_win" / "mediamtx.exe"
+# The browser broadcaster ("Rydius Studio"). Separate files from the player so
+# the player's own load path and its tests are untouched by this feature.
+BROADCAST_HTML_PATH = ROOT / "broadcast.html"
+BROADCAST_JS_PATH = ROOT / "broadcast.js"
+BROADCAST_WORKER_PATH = ROOT / "broadcast_worker.js"
+BROADCAST_WORKLET_PATH = ROOT / "broadcast_audio_worklet.js"
 
 
 class IdCollector(HTMLParser):
@@ -776,6 +782,14 @@ class _SiteUnderTest(unittest.TestCase):
     BOOT_ATTEMPTS = 5
 
     def start_site(self, signaling_routes=None, api_routes=None, extra_env=None):
+        # Tests sometimes reconfigure the host mid-test. Retire the previous
+        # server before replacing its Popen handle so its random-port listener
+        # cannot survive into the next test.
+        previous_process = getattr(self, "server_process", None)
+        if previous_process is not None:
+            stop_process(previous_process)
+            self.server_process = None
+
         overrides = {}
         if signaling_routes is None:
             overrides["MEDIAMTX_PORT"] = find_free_port()
@@ -1001,6 +1015,12 @@ class JsLogicChecks(unittest.TestCase):
         ramp from being judged against a measurement taken minutes earlier."""
         run_js_check(self, "catchup-probe-is-abandoned-when-measurement-stops")
 
+    def test_catchup_gate_stops_per_second_rewrites(self):
+        run_js_check(self, "catch-up-gate-stops-the-per-second-rewrite")
+
+    def test_presentation_evenness_detects_uneven_cadence(self):
+        run_js_check(self, "presentation-evenness-detects-uneven-cadence")
+
 
     def test_chat_notification_behaviour_is_pinned_by_execution(self):
         """Runs the real notification functions against a stub DOM, so the
@@ -1034,6 +1054,117 @@ class JsLogicChecks(unittest.TestCase):
         directly."""
         run_js_check(self, "polling-fallback-catch-up-is-silent")
 
+
+
+class StudioJsLogicChecks(unittest.TestCase):
+    """Browser-logic checks for the broadcaster (broadcast.js).
+
+    These are the decisions that silently break a broadcast rather than throwing:
+    an H.264 level that under-declares the stream, an SDP fmtp attached to the
+    wrong section, a codec string the encoder cannot produce. They are extracted
+    from the shipped broadcast.js by name, so the tests cannot drift from the
+    code the browser actually runs.
+    """
+
+    def test_h264_level_matches_resolution_and_framerate(self):
+        run_js_check(self, "studio-h264-level-matches-resolution-and-framerate")
+
+    def test_h264_codec_string_is_constrained_baseline(self):
+        run_js_check(self, "studio-h264-codec-string-is-constrained-baseline")
+
+    def test_av1_level_rises_with_pixel_rate(self):
+        run_js_check(self, "studio-av1-level-rises-with-pixel-rate")
+
+    def test_odd_dimensions_are_forced_even(self):
+        run_js_check(self, "studio-odd-dimensions-are-forced-even")
+
+    def test_suggested_bitrate_is_monotonic_and_clamped(self):
+        run_js_check(self, "studio-suggested-bitrate-is-monotonic-and-clamped")
+
+    def test_publish_sdp_rewrites_only_the_h264_profile(self):
+        run_js_check(self, "studio-publish-sdp-rewrites-only-the-h264-profile")
+
+    def test_publish_sdp_forces_packetization_mode_1(self):
+        run_js_check(self, "studio-publish-sdp-forces-packetization-mode-1")
+
+    def test_publish_sdp_rejects_a_malformed_profile(self):
+        run_js_check(self, "studio-publish-sdp-rejects-a-malformed-profile")
+
+    def test_routable_candidate_rejects_mdns_obfuscation(self):
+        run_js_check(self, "studio-routable-candidate-rejects-mdns-obfuscation")
+
+    def test_worklet_emits_frames_at_the_correct_rate(self):
+        run_js_check(self, "studio-worklet-emits-frames-at-the-correct-rate")
+
+    def test_worklet_silence_path_matches_the_real_audio_rate(self):
+        run_js_check(self, "studio-worklet-silence-path-matches-the-real-audio-rate")
+
+    def test_worklet_preserves_samples_across_quantum_boundaries(self):
+        run_js_check(self, "studio-worklet-preserves-samples-across-quantum-boundaries")
+
+    def test_worklet_resets_the_accumulator_before_posting(self):
+        run_js_check(self, "studio-worklet-resets-the-accumulator-before-posting")
+
+    def test_every_js_check_case_is_reachable_from_a_unittest(self):
+        """A js_checks case that no unittest invokes never runs.
+
+        The suite is driven by hand-written `run_js_check` calls, so a case
+        added to js_checks.js is silently dead until somebody wires it up. This
+        makes that gap a failure instead of an omission. (Two pre-existing
+        cases are exempted by name; they are exercised via the exports, not
+        through runCase.)
+        """
+        script = (
+            "const m = require('./js_checks.js');"
+            "console.log(JSON.stringify(Object.keys(m.cases).sort()));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script], cwd=str(ROOT),
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        cases = set(json.loads(result.stdout.strip()))
+        self.assertTrue(cases, "js_checks.js exposed no cases")
+
+        referenced = set(re.findall(r"run_js_check\(\s*self,\s*\"([^\"]+)\"", read_text(Path(__file__))))
+        unreachable = cases - referenced
+        self.assertEqual(
+            unreachable, set(),
+            "these js_checks cases are defined but never run by run_tests.py: {}".format(
+                sorted(unreachable)))
+        # And the reverse: a unittest naming a case that does not exist is a
+        # typo that would only surface when that test runs.
+        missing = referenced - cases
+        self.assertEqual(
+            missing, set(),
+            "run_tests.py references js_checks cases that do not exist: {}".format(
+                sorted(missing)))
+
+    def test_publish_sdp_prunes_to_the_selected_codec(self):
+        # Without pruning, "AV1" can still be answered with H.264: the offer
+        # keeps every family and Pion picks the first it supports. The picture
+        # looks live and is quietly the wrong codec.
+        run_js_check(self, "studio-publish-sdp-prunes-to-the-selected-codec")
+
+    def test_negotiated_codec_is_read_back_from_the_answer(self):
+        # Silently accepting a codec the answerer refused is how a host picks
+        # AV1 and gets H.264 with no indication anything went wrong.
+        run_js_check(self, "studio-negotiated-codec-is-read-back-from-the-answer")
+
+    def test_chunk_submission_drops_instead_of_queueing(self):
+        # Queueing under backpressure converts one dropped frame into unbounded
+        # latency ending in a multi-second freeze.
+        run_js_check(self, "studio-chunk-submission-drops-instead-of-queueing")
+
+    def test_av_tracks_share_one_clock(self):
+        # Video stamped with performance.now() and audio with
+        # AudioContext.currentTime drift apart over a long broadcast.
+        run_js_check(self, "studio-av-tracks-share-one-clock")
+
+    def test_encode_period_matches_the_requested_framerate(self):
+        # The old loop used periodMs/2 as its interval and encoded on every
+        # tick, so 30 fps actually produced ~59 fps.
+        run_js_check(self, "studio-encode-period-matches-the-requested-framerate")
 
 
 class StreamApiProxyChecks(_SiteUnderTest):
@@ -1819,6 +1950,368 @@ class SiteStartupDiagnosticsChecks(_SiteUnderTest):
         finally:
             slow.shutdown()
             slow.server_close()
+
+class BrowserBroadcasterChecks(_SiteUnderTest):
+    """Rydius Studio: the browser screen-share publisher.
+
+    The studio is a second way to publish to the SAME MediaMTX path OBS uses, so
+    these check the two things that matter: the studio is reachable and its
+    runtime assets actually load, and it publishes over WHIP through the same
+    proxy the player already uses. They also pin the "do not break OBS" rule:
+    nothing here may change the `live` path's configuration.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.studio_html = read_text(BROADCAST_HTML_PATH)
+        cls.studio_js = read_text(BROADCAST_JS_PATH)
+        cls.studio_worker = read_text(BROADCAST_WORKER_PATH)
+        cls.studio_worklet = read_text(BROADCAST_WORKLET_PATH)
+        cls.server = read_text(SERVER_PATH)
+        cls.html = read_text(HTML_PATH)
+
+    def test_studio_files_exist_and_parse(self):
+        for path in (BROADCAST_HTML_PATH, BROADCAST_JS_PATH,
+                     BROADCAST_WORKER_PATH, BROADCAST_WORKLET_PATH):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file(), "missing studio file {}".format(path.name))
+        node = shutil.which("node")
+        for path in (BROADCAST_JS_PATH, BROADCAST_WORKER_PATH, BROADCAST_WORKLET_PATH):
+            with self.subTest(path=path.name):
+                result = subprocess.run(
+                    [node, "--check", str(path)], cwd=str(ROOT),
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_studio_is_reachable_through_every_alias(self):
+        self.start_site()
+        for route in ("/studio", "/studio/", "/streaming/studio", "/streaming/studio/"):
+            with self.subTest(route=route):
+                status, headers, body = http_request(self.port, "GET", route)
+                self.assertEqual(status, 200, "{} must serve the studio".format(route))
+                self.assertIn("Rydius Studio", body.decode("utf-8"))
+                self.assertIn("html", headers.get("Content-Type", ""))
+
+    def test_studio_runtime_assets_are_served(self):
+        """The worker and the AudioWorklet are fetched by URL at runtime.
+
+        They are NOT referenced from the page's <script>/<link> tags, so a
+        missing allowlist entry would not fail an HTML asset test — it would
+        just 404 at the moment the user presses Go live. Served here explicitly.
+        """
+        self.start_site()
+        for route in ("/streaming/broadcast.js", "/streaming/broadcast_worker.js",
+                      "/streaming/broadcast_audio_worklet.js"):
+            with self.subTest(route=route):
+                status, headers, body = http_request(self.port, "GET", route)
+                self.assertEqual(status, 200, "{} must be served".format(route))
+                self.assertGreater(len(body), 0, "{} must not be empty".format(route))
+                self.assertIn("javascript", headers.get("Content-Type", ""))
+
+    def test_studio_whip_post_budget_exceeds_the_players_whep_budget(self):
+        """The two timeouts answer different questions and must not be copied.
+
+        MediaMTX does not write the WHIP 201 until ICE AND DTLS have completed,
+        so a legitimate publish answers in ~12s on this host (webrtcSTUNGather
+        Timeout 2s nested inside webrtcHandshakeTimeout 10s). The viewer's 10s
+        WHEP abort is right — it is attaching to an already-live source — but
+        reusing it in the publisher aborted handshakes that were about to
+        succeed, failing to start on exactly the slow uplink the feature exists
+        to serve.
+
+        The outer watchdog must in turn exceed the POST budget, or it aborts a
+        handshake it is supposed to be watching.
+        """
+        def constant(name):
+            match = re.search(
+                r"const\s+{}\s*=\s*(\d+)".format(re.escape(name)), self.studio_js)
+            self.assertIsNotNone(match, "{} must be declared".format(name))
+            return int(match.group(1))
+
+        post_budget = constant("WHIP_POST_TIMEOUT_MS")
+        watchdog = constant("PUBLISH_WATCHDOG_MS")
+        self.assertGreaterEqual(post_budget, 25000,
+            "the WHIP POST budget must cover the real ~12s ICE+DTLS handshake")
+        # The watchdog watches the POST, so it must outlast it with headroom.
+        self.assertGreater(watchdog, post_budget * 2,
+            "the outer watchdog must comfortably exceed the POST budget, "
+            "or it aborts a handshake that is still legitimately in flight")
+
+    def test_studio_publishes_over_whip_to_the_live_path(self):
+        """The offer must go to the same WHIP endpoint the player proxies.
+
+        If this drifted to another path, viewers polling "live" would never see
+        a browser broadcast and the codec bridge would never build renditions.
+        """
+        self.assertIn("const WHIP_PATH = '/stream-api/live/whip';", self.studio_js)
+        self.assertIn("'Content-Type': 'application/sdp'", self.studio_js)
+        # RFC 9725: the answer arrives on 201 with a Location resource.
+        self.assertIn("response.headers.get('Location')", self.studio_js)
+        self.assertIn("method: 'DELETE'", self.studio_js,
+                      "the session resource must be released on teardown")
+
+    def test_studio_teardown_always_releases_the_publisher(self):
+        """Every exit path must DELETE the WHIP resource.
+
+        `live` has overridePublisher, so a leaked publisher session is not just
+        wasted upload — it actively fights the next broadcaster, OBS included,
+        until MediaMTX's readTimeout expires.
+        """
+        for hook in ("window.addEventListener('pagehide', handlePageExit)",
+                     "window.addEventListener('beforeunload', handlePageExit)"):
+            with self.subTest(hook=hook):
+                self.assertIn(hook, self.studio_js)
+        # The browser's own "Stop sharing" bar ends the track with no JS call.
+        self.assertIn("addEventListener('ended'", self.studio_js,
+                      "an ended capture track must stop the broadcast")
+        # Every route into teardown must bump the session token so an in-flight
+        # handshake cannot resurrect the session it belongs to.
+        self.assertIn("state.sessionToken += 1;", self.studio_js)
+
+    def test_studio_drops_frames_rather_than_queueing_them(self):
+        """A live stream must lose frames under load, not accumulate delay.
+
+        Bounding the encode queue and refusing a chunk while the transport's
+        writer still has no room is what keeps latency flat; an unbounded queue
+        converts a momentary uplink shortfall into unbounded delay that ends in a
+        multi-second freeze long after the link recovered.
+        """
+        # Backpressure comes from the TransformStream's own writer: desiredSize
+        # <= 0 means the packetizer has not consumed the previous chunk.
+        self.assertIn("writer.desiredSize <= 0", self.studio_js)
+        self.assertIn("state.framesDropped += 1", self.studio_js)
+        # pipeTo is what carries that backpressure from the packetizer up to the
+        # main-thread writer.
+        self.assertIn("readable.pipeTo(writable)", self.studio_worker)
+
+    def test_studio_audio_drop_counter_is_reported_not_write_only(self):
+        """A counter nobody can read is not telemetry, it is dead state.
+
+        audioFramesDropped was incremented and reset but never rendered, so a
+        test that only asserted the increment "passed" while audio could be
+        audibly breaking up with nothing on screen to show it.
+        """
+        self.assertIn("state.audioFramesDropped += 1", self.studio_js)
+        self.assertIn("state.audioFramesDropped", self.studio_html + self.studio_js)
+        # The counter must be READ into the DOM, not merely mentioned.
+        self.assertIn("el['tele-audio-dropped'].textContent = String(state.audioFramesDropped)",
+                      self.studio_js)
+        self.assertIn('id="tele-audio-dropped"', self.studio_html)
+
+    def test_first_encoded_frame_is_a_keyframe_and_later_ones_are_not(self):
+        run_js_check(self, "studio-first-encoded-frame-is-a-keyframe-and-later-ones-are-not")
+
+    def test_a_new_gop_forces_a_keyframe_again(self):
+        run_js_check(self, "studio-a-new-gop-forces-a-keyframe-again")
+
+    def test_encode_queue_overflow_drops_the_frame(self):
+        run_js_check(self, "studio-encode-queue-overflow-drops-the-frame")
+
+    def test_a_video_frame_failure_is_counted_not_swallowed(self):
+        run_js_check(self, "studio-a-video-frame-failure-is-counted_not_swallowed")
+
+    def test_studio_audio_tap_is_wired_in_the_right_direction(self):
+        """The PCM tap READS the mix; it has no audio output of its own.
+
+        The tap was built with numberOfOutputs: 0 and then connected with
+        `node.connect(state.audioDest)` — the wrong direction. A zero-output
+        node has nothing to connect FROM, so the call was a no-op, and nothing
+        was ever connected TO the node either. The worklet's `inputs[0]` was
+        therefore permanently empty, it took its silence branch on every render
+        quantum, and the WebCodecs engine published a stream that was LIVE BUT
+        MUTED while the UI meters (which read the same mix) showed healthy
+        levels. Silent broadcast with visible meters is the most confusing
+        possible failure, so the direction is pinned here.
+        """
+        self.assertIn("numberOfOutputs: 0", self.studio_js)
+        self.assertIn("state.audioDest.connect(node)", self.studio_js,
+                      "the mix destination must feed the tap")
+        # Scoped to executable lines, exactly as the postMessage test does: the
+        # one remaining mention of the wrong direction is inside the comment
+        # that explains why it was wrong, and asserting on the raw text would
+        # forbid documenting the bug.
+        self.assertEqual(
+            [line for line in self.studio_js.splitlines()
+             if "node.connect(state.audioDest)" in line
+             and not line.lstrip().startswith(("//", "*"))],
+            [],
+            "a zero-output tap cannot be the source of a connection")
+
+        # Teardown must sever the SOURCE side. `node.disconnect()` only
+        # disconnects outputs, of which the tap has none, so on its own it
+        # leaves the tap attached to a mix that keeps running.
+        idx = self.studio_js.find("state.audioWorkletNode) {")
+        self.assertGreater(idx, 0, "the worklet teardown block was not found")
+        window = self.studio_js[idx:idx + 700]
+        self.assertIn("state.audioDest.disconnect(state.audioWorkletNode)", window,
+                      "teardown must disconnect the tap from the mix destination")
+
+    def test_studio_pcm_tap_never_stalls_or_discards_a_partial_frame(self):
+        """The tap must always complete a frame, and must never throw away
+        samples it already has.
+
+        Two separate ways it used to go wrong, both silent:
+        - `inputs[0]` present but holding an empty channel (`[[]]`) gave
+          length 0, so the copy loop never ran, `filled` never advanced and the
+          encoder's clock stalled for the rest of the session.
+        - The silence path completed a frame and emitted unconditionally,
+          ignoring the accumulator, so it emitted 10 ms of audio per 2.67 ms
+          render quantum — 3.75x the correct rate. Playback ran fast, underran,
+          and drifted ~730 ms against video every second of broadcast.
+        """
+        self.assertIn("padAndEmit", self.studio_worklet)
+        # The pad writes only the REMAINDER, starting at the accumulated offset.
+        # Zeroing the whole buffer would discard real samples already gathered.
+        self.assertIn("this.buffers[c].fill(0, this.filled, this.filled + take)",
+                      self.studio_worklet,
+                      "only the remainder of a partial frame may be zeroed")
+        # And it advances the same accumulator the real-audio path uses, which
+        # is what keeps the two paths at the same frame rate. The behavioural
+        # proof is in js_checks (studio-worklet-silence-path-matches-the-real-audio-rate).
+        self.assertIn("this.filled += take;", self.studio_worklet,
+                      "the silence path must advance the shared accumulator")
+        # A present-but-empty channel counts as no input.
+        self.assertRegex(
+            self.studio_worklet,
+            r"length === 0\)\s*\{",
+            "an empty channel array must be treated as silence, not as a stall")
+        # Every emitted frame is the configured size, which is what AudioData
+        # requires and what the encoder is configured for.
+        self.assertIn("frameSize: OPUS_FRAME_SAMPLES", self.studio_js)
+        self.assertIn("const OPUS_FRAME_SAMPLES = 480;", self.studio_js,
+                      "480 samples at 48 kHz is the 10 ms Opus frame")
+
+    def test_studio_teardown_never_stops_the_shared_audio_mix(self):
+        """Only PLACEHOLDER tracks may be stopped at teardown.
+
+        releaseBlankTracks() runs over both engines, but in the NATIVE engine
+        `state.audioSender.track` is the real mix output — the only audio track
+        of state.audioDest.stream, which is shared and deliberately kept alive
+        across sessions. Stopping it sets readyState='ended' while leaving it in
+        the stream, and because buildAudioGraph() early-returns for the life of
+        the page and audioDest is never rebuilt, the SECOND Go live would
+        addTransceiver an ended track. Result: a permanently silent broadcast
+        with the UI still showing the mic as On and a moving fader, and nothing
+        anywhere logged. A silent stream is worse than a failed one, so the
+        stop() is gated on the track actually being a placeholder.
+        """
+        idx = self.studio_js.find("function releaseBlankTracks()")
+        self.assertGreater(idx, 0, "releaseBlankTracks() was not found")
+        body = self.studio_js[idx:idx + 1400]
+        # The placeholder marker must be captured BEFORE it is cleared, and
+        # must gate the stop().
+        self.assertIn("const isBlank = !!(track.blankNodes || track.blankCanvas);", body,
+                      "the placeholder check must run before the markers are cleared")
+        stop_at = body.find("track.stop()")
+        guard_at = body.find("if (isBlank) {")
+        self.assertGreater(stop_at, 0, "the placeholder track must still be stopped")
+        self.assertGreater(guard_at, 0, "track.stop() must be gated on the placeholder check")
+        self.assertLess(guard_at, stop_at, "the guard must precede the stop()")
+
+        # And the mix output must be rebuilt if it is ever found dead.
+        self.assertIn("readyState === 'live'", self.studio_js,
+                      "a dead mix output must be detected and rebuilt, not reused")
+
+    def test_studio_encoded_chunks_reach_the_sender_by_transfer_not_postmessage(self):
+        """Encoded chunks are NOT structured-cloneable.
+
+        Pushing an EncodedVideoChunk over a MessagePort throws DataCloneError
+        before a single byte moves, which would kill the WebCodecs engine on its
+        very first frame. The only supported route is the `transfer` argument of
+        the RTCRtpScriptTransform constructor, so this is pinned as a contract.
+        """
+        self.assertIn("new TransformStream()", self.studio_js)
+        self.assertIn("new RTCRtpScriptTransform(worker, { name }, [transport.readable])",
+                      self.studio_js,
+                      "the readable must be transferred into the transform constructor")
+        # No postMessage CALL may survive. The one surviving mention is the
+        # comment explaining why it cannot be used, so executable calls are
+        # what is ruled out, not the word itself.
+        self.assertEqual(
+            [line for line in self.studio_js.splitlines()
+             if "postMessage" in line and not line.lstrip().startswith(("//", "*"))],
+            [],
+            "encoded chunks must never travel by postMessage")
+
+    def test_studio_captures_system_audio_and_microphone(self):
+        for needle in ("getDisplayMedia", "systemAudio: 'include'",
+                       "getUserMedia", "audioWorklet.addModule"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.studio_js)
+        # The mic needs echo cancellation: it sits in the same room as the
+        # speakers whose audio it is mixing, which without AEC is a feedback
+        # loop in every viewer's speakers.
+        self.assertIn("echoCancellation: true", self.studio_js)
+        # Opus in WebRTC is 48 kHz; a 44.1 kHz context would need resampling.
+        self.assertIn("OPUS_SAMPLE_RATE = 48000", self.studio_js)
+
+    def test_studio_falls_back_to_the_native_engine_and_says_so(self):
+        """A silent downgrade is the most confusing failure there is.
+
+        The user picks WebCodecs, gets something else, and has no idea why the
+        keyframe setting does nothing. So the resolved engine is always reported
+        in the UI and the reason is always logged.
+        """
+        self.assertIn("supports.fullWebCodecs", self.studio_js)
+        self.assertIn("el['engine-hint'].textContent = resolved.reason", self.studio_js)
+        self.assertIn("log('Engine: ' + resolved.engine", self.studio_js)
+
+    def test_studio_does_not_change_the_obs_pipeline(self):
+        """OBS support must be exactly as it was.
+
+        The studio is a publisher, never a reconfiguration of the stack: it must
+        not add or alter a MediaMTX path, touch the bridge's hooks, or change the
+        WHIP instructions the player page shows OBS users.
+        """
+        config = read_text(CONFIG_PATH)
+        # No new paths: publishing to an undeclared path would be accepted only
+        # by the default config, not this one.
+        for path in ("live-test", "browser", "studio"):
+            with self.subTest(path=path):
+                self.assertNotRegex(
+                    config, r"^\s*{}:".format(re.escape(path)),
+                    "the studio must not require a new MediaMTX path")
+        # The existing OBS-facing instructions and hooks are untouched.
+        self.assertIn("rtmp://127.0.0.1:1935/live", self.html)
+        self.assertIn("http://127.0.0.1:8889/live/whip", self.html)
+        self.assertIn('runOnAvailable: node "codec_bridge.js"', config)
+        self.assertIn("overridePublisher: yes", config)
+
+    def test_studio_is_reachable_from_the_player(self):
+        """A broadcaster should not have to know a URL to find the studio."""
+        self.assertIn('id="studio-launch-btn"', self.html)
+        self.assertIn('href="/streaming/studio', self.html)
+
+    def test_studio_html_ids_are_unique_and_all_referenced(self):
+        parser = IdCollector()
+        parser.feed(self.studio_html)
+        self.assertEqual(len(parser.ids), len(set(parser.ids)),
+                         "broadcast.html contains duplicate IDs")
+        html_ids = set(parser.ids)
+        referenced = set(re.findall(r"getElementById\(['\"]([^'\"]+)['\"]\)", self.studio_js))
+        # The studio resolves elements through an ID table, so this has to read
+        # the table rather than bare getElementById calls.
+        table = re.search(r"const IDS = \[(.*?)\];", self.studio_js, re.DOTALL)
+        self.assertIsNotNone(table, "broadcast.js must declare its element ID table")
+        for element_id in re.findall(r"'([^']+)'", table.group(1)):
+            with self.subTest(element_id=element_id):
+                self.assertIn(element_id, html_ids,
+                              "broadcast.js references an id absent from broadcast.html")
+        self.assertEqual(referenced - html_ids, set())
+
+    def test_studio_assets_share_the_player_cache_version(self):
+        versions = set(re.findall(r"/streaming/(?:style\.css|broadcast\.js)\?v=([^\"']+)",
+                                  self.studio_html))
+        self.assertEqual(len(versions), 1,
+                         "both studio assets must share one cache version, got {}".format(versions))
+        self.assertRegex(versions.pop(), r"^\d+\.\d+\.\d+$", "cache version must be semver-like")
+        # And it must be the same version the player uses, so one bump covers all.
+        player_version = re.search(r"/streaming/app\.js\?v=([^\"']+)", self.html)
+        studio_version = re.search(r"/streaming/broadcast\.js\?v=([^\"']+)", self.studio_html)
+        self.assertEqual(player_version.group(1), studio_version.group(1),
+                         "the player and the studio must be bumped together")
+
+
 
 class StartupConfigurationChecks(unittest.TestCase):
     """A bad PORT must abort at boot instead of silently binding something else."""

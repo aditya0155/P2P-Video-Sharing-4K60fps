@@ -2010,8 +2010,316 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
     .volume-slider { width: 40px; }
 }
 
+/* ==========================================================================
+   Rydius Studio — the browser broadcaster (broadcast.html)
+
+   Scoped under .studio-body so none of it can leak into the player. The
+   player page never loads this markup, but a shared stylesheet means an
+   unscoped rule here WOULD restyle the viewer, so every rule below is
+   either prefixed or names a .studio-* class that does not exist there.
+   ========================================================================== */
+
+/* The player pins html,body to overflow:hidden because the video fills the
+   viewport. The studio is a scrolling two-column form, so it opts back out.
+   Scoped to the studio body rather than editing the shared rule. */
+.studio-body { overflow: auto; height: auto; min-height: 100%; }
+.studio-body .app-container { position: static; min-height: 100vh; padding-bottom: 32px; }
+.studio-body .app-header { position: sticky; top: 0; z-index: 20; }
+
+/* The launch button in the player header is an <a>, not a <button>, so it
+   needs the text-decoration reset a button gets for free. It is also a
+   navigation target, so it gets an explicit focus ring: without one, a
+   keyboard user cannot see where they are in the header. */
+.studio-launch-btn { text-decoration: none; white-space: nowrap; }
+
+.studio-launch-btn:hover,
+.studio-launch-btn:focus-visible {
+    color: var(--text-primary);
+    border-color: var(--primary);
+    text-decoration: none;
+}
+
+.studio-launch-btn:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+/* The inline "No OBS?" cross-link inside the OBS instructions panel. */
+.studio-inline-link {
+    color: var(--primary);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    font-weight: 600;
+}
+
+.studio-inline-link:hover { color: var(--text-primary); }
+
+/* The studio header's "Open player" link. Same reason as .studio-launch-btn:
+   it is an <a> wearing a button's classes, so it needs the underline reset
+   the button gets for free, plus a focus ring because it is a real
+   navigation target. */
+.studio-link { text-decoration: none; white-space: nowrap; }
+
+.studio-link:hover,
+.studio-link:focus-visible {
+    color: var(--text-primary);
+    border-color: var(--primary);
+    text-decoration: none;
+}
+
+.studio-link:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.studio-main {
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(340px, 0.65fr);
+    gap: 20px;
+    padding: 20px;
+    align-items: start;
+}
+
+.studio-panel {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg);
+    padding: 18px;
+    backdrop-filter: blur(12px);
+}
+
+.studio-panel-header {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-subtle);
+}
+.studio-panel-header i { color: var(--cyan); }
+.studio-panel-header h2 {
+    font-family: var(--font-display);
+    font-size: 13px; font-weight: 600;
+    letter-spacing: 1.2px; text-transform: uppercase;
+    color: var(--text-primary);
+}
+
+.studio-preview-wrap {
+    position: relative;
+    width: 100%;
+    background: #000;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    aspect-ratio: 16 / 9;
+    display: flex; align-items: center; justify-content: center;
+}
+.studio-preview-wrap canvas {
+    width: 100%; height: 100%;
+    object-fit: contain;
+    display: block;
+}
+.studio-preview-placeholder {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 10px; color: var(--text-muted); text-align: center; padding: 20px;
+    background: repeating-linear-gradient(45deg, #0a0812, #0a0812 12px, #0c0a16 12px, #0c0a16 24px);
+}
+.studio-preview-placeholder i { font-size: 32px; opacity: 0.5; }
+.studio-preview-placeholder p { font-size: 12px; }
+.studio-preview-badge {
+    position: absolute; top: 10px; left: 10px;
+    padding: 4px 9px; border-radius: var(--radius-full);
+    background: rgba(8, 6, 16, 0.8);
+    border: 1px solid var(--border-subtle);
+    font-family: var(--font-mono); font-size: 11px; color: var(--cyan);
+}
+/*STUDIO_CSS_2*/
+
+/* ==========================================================================
+   Studio controls
+   ========================================================================== */
+
+.studio-scene-row {
+    display: flex; align-items: center; gap: 12px;
+    margin: 14px 0;
+}
+.studio-field-label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--text-muted); font-weight: 600;
+}
+.studio-segmented { display: flex; gap: 6px; flex-wrap: wrap; }
+.studio-seg {
+    padding: 6px 12px; border-radius: var(--radius-full);
+    background: var(--bg-glass);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    font-size: 11px; font-weight: 600; cursor: pointer;
+    font-family: var(--font-body);
+    transition: all var(--speed-fast) var(--ease);
+}
+.studio-seg:hover { border-color: rgba(34, 211, 238, 0.3); color: var(--cyan); }
+.studio-seg.active {
+    background: var(--cyan-dim); color: var(--cyan);
+    border-color: var(--cyan); box-shadow: 0 0 10px var(--cyan-glow);
+}
+
+.studio-source-list { display: flex; flex-direction: column; gap: 10px; }
+.studio-source {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 12px;
+    background: var(--bg-glass);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+}
+.studio-source-icon {
+    width: 32px; height: 32px; flex: 0 0 32px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: var(--radius-sm);
+    background: var(--primary-dim); color: var(--primary);
+}
+.studio-source-body { flex: 1; min-width: 0; }
+.studio-source-name { font-size: 12px; font-weight: 600; }
+.studio-source-meta {
+    font-size: 10px; color: var(--text-muted); margin-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.studio-btn {
+    padding: 7px 14px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-glass); color: var(--text-secondary);
+    font-size: 11px; font-weight: 600; cursor: pointer;
+    font-family: var(--font-body);
+    display: inline-flex; align-items: center; gap: 7px;
+    transition: all var(--speed-fast) var(--ease);
+}
+.studio-btn:hover:not(:disabled) { border-color: var(--cyan); color: var(--cyan); }
+.studio-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.studio-btn-primary {
+    background: var(--primary); border-color: var(--primary);
+    color: #fff; flex: 1; justify-content: center;
+    padding: 11px 18px; font-size: 13px;
+}
+.studio-btn-primary:hover:not(:disabled) {
+    background: #7c3aed; border-color: #7c3aed; color: #fff;
+    box-shadow: 0 0 16px var(--primary-glow);
+}
+.studio-btn-stop {
+    background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.4);
+    color: var(--red); padding: 11px 18px; font-size: 13px;
+}
+.studio-btn-stop:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.28); border-color: var(--red); color: #fff;
+}
+.studio-actions { display: flex; gap: 10px; margin: 18px 0; }
+
+.studio-mixer { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border-subtle); }
+.studio-mixer-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.studio-mixer-header h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--text-muted); display: flex; align-items: center; gap: 7px;
+}
+.studio-master-meter {
+    width: 80px; height: 5px; border-radius: var(--radius-full);
+    background: var(--bg-glass); overflow: hidden;
+}
+.studio-master-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--green), var(--amber), var(--red));
+    transition: width 80ms linear;
+}
+
+.studio-fader {
+    display: grid; grid-template-columns: 90px 1fr 44px;
+    align-items: center; gap: 10px; margin-bottom: 9px;
+}
+.studio-fader label { font-size: 11px; color: var(--text-secondary); }
+.studio-fader input[type=range] { width: 100%; accent-color: var(--cyan); }
+.studio-fader-value {
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--text-muted); text-align: right;
+}
+
+.studio-field { margin-bottom: 14px; }
+.studio-field > label {
+    display: block; font-size: 11px; font-weight: 600;
+    color: var(--text-secondary); margin-bottom: 6px;
+    text-transform: uppercase; letter-spacing: 0.6px;
+}
+.studio-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.studio-field-inline { display: flex; align-items: center; justify-content: space-between; }
+.studio-field-inline > label { margin-bottom: 0; text-transform: none; letter-spacing: 0; }
+.studio-field select, .studio-field input[type=range] { width: 100%; }
+.studio-field select {
+    padding: 8px 10px; border-radius: var(--radius-sm);
+    background: var(--bg-void); color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    font-size: 12px; font-family: var(--font-body);
+}
+.studio-field input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--cyan); }
+.studio-inline-value { color: var(--cyan); font-family: var(--font-mono); }
+
+.studio-bitrate-presets { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.studio-chip {
+    padding: 4px 10px; border-radius: var(--radius-full);
+    background: var(--bg-glass); border: 1px solid var(--border-subtle);
+    color: var(--text-muted); font-size: 10px; font-weight: 600;
+    cursor: pointer; font-family: var(--font-mono);
+}
+.studio-chip:hover { border-color: var(--cyan); color: var(--cyan); }
+
+.studio-hint { font-size: 10px; color: var(--text-muted); margin-top: 6px; line-height: 1.5; }
+
+.studio-telemetry {
+    margin-top: 18px; padding: 14px;
+    background: var(--bg-void); border-radius: var(--radius-md);
+    border: 1px solid var(--border-subtle);
+}
+.studio-tele-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+}
+.studio-tele { display: flex; flex-direction: column; gap: 3px; }
+.studio-tele-label {
+    font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px;
+    color: var(--text-muted);
+}
+.studio-tele-value {
+    font-family: var(--font-mono); font-size: 12px; color: var(--cyan);
+}
+.studio-tele-note {
+    margin-top: 12px; padding-top: 10px;
+    border-top: 1px solid var(--border-subtle);
+    font-size: 10px; color: var(--text-muted); line-height: 1.5;
+}
+
+.studio-log {
+    margin-top: 14px; height: 168px; overflow-y: auto;
+    background: var(--bg-void); border-radius: var(--radius-md);
+    border: 1px solid var(--border-subtle);
+    padding: 10px;
+    font-family: var(--font-mono); font-size: 10px; line-height: 1.65;
+}
+.studio-log-line { color: var(--text-secondary); word-break: break-word; }
+.studio-log-warn { color: var(--amber); }
+.studio-log-error { color: var(--red); }
+
+/* The studio paints a red ERROR badge that the player never uses. Scoped to
+   the studio so the player's own badge states are untouched. */
+.studio-body .status-badge.error {
+    background: rgba(239, 68, 68, 0.14);
+    color: var(--red);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+@media (max-width: 900px) {
+    .studio-main { grid-template-columns: minmax(0, 1fr); }
+    .studio-field-row { grid-template-columns: 1fr; }
+    .studio-tele-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
 /* Legacy 320px-wide devices: the mute button (plus device volume keys)
    replaces the slider to guarantee the row fits. */
 @media (max-width: 340px) {
     .volume-slider { display: none; }
 }
+
+

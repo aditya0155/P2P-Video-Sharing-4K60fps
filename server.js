@@ -208,6 +208,14 @@ const STATIC_FILES = new Map([
     ['/streaming/studio', 'studio.html'],
     ['/streaming/studio/', 'studio.html'],
     ['/streaming/studio/index.html', 'studio.html'],
+    // The earlier broadcaster remains available under its own routes; the
+    // player-facing /studio URL above stays on the current studio page.
+    ['/broadcast', 'broadcast.html'],
+    ['/broadcast/', 'broadcast.html'],
+    ['/broadcast/index.html', 'broadcast.html'],
+    ['/streaming/broadcast', 'broadcast.html'],
+    ['/streaming/broadcast/', 'broadcast.html'],
+    ['/streaming/broadcast/index.html', 'broadcast.html'],
     ['/style.css', 'style.css'],
     ['/streaming/style.css', 'style.css'],
     ['/studio.css', 'studio.css'],
@@ -215,7 +223,17 @@ const STATIC_FILES = new Map([
     ['/app.js', 'app.js'],
     ['/streaming/app.js', 'app.js'],
     ['/studio.js', 'studio.js'],
-    ['/streaming/studio.js', 'studio.js']
+    ['/streaming/studio.js', 'studio.js'],
+    ['/broadcast.js', 'broadcast.js'],
+    ['/streaming/broadcast.js', 'broadcast.js'],
+    // Loaded by the studio itself: the RTP encoded-transform worker and the
+    // AudioWorklet PCM tap. Both are fetched by URL at runtime (new Worker()
+    // and audioWorklet.addModule()), so they must be in the allowlist exactly
+    // like any other page asset or they 404 and the studio cannot go live.
+    ['/broadcast_worker.js', 'broadcast_worker.js'],
+    ['/streaming/broadcast_worker.js', 'broadcast_worker.js'],
+    ['/broadcast_audio_worklet.js', 'broadcast_audio_worklet.js'],
+    ['/streaming/broadcast_audio_worklet.js', 'broadcast_audio_worklet.js'],
 ]);
 
 // Writes the CORS headers onto a response, replacing any that are already there.
