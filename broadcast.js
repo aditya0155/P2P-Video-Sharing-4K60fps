@@ -328,7 +328,22 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             if (only) {
                 // Drop every attribute that names a payload type we removed.
-                const scoped = line.match(/^a=(rtpmap|fmtp|rtcp-fb|ssrc|ssrc-group):(\d+)\b/i);
+                //
+                // `a=ssrc:` and `a=ssrc-group:` are DELIBERATELY absent from this
+                // pattern. Their leading number is an SSRC (or an SSRC pair), not
+                // a payload type — an SSRC is a random 32-bit value that will
+                // essentially never appear in keptVideoPts, so including them
+                // deleted every `a=ssrc:` line from the video section on every
+                // WebCodecs publish. MediaMTX's answerer (Pion) binds an incoming
+                // RTP stream to a receiver via those declarations; without them
+                // the SSRC arrives "undeclared" and falls into Pion's simulcast
+                // probing heuristic (mid/rid header extensions this publisher
+                // never sends), where the failure mode is exactly the logged
+                // "Incoming unhandled RTP ssrc(...), OnTrack will not be fired" —
+                // a connected session that publishes no video. The `ssrc-group`
+                // FID line also references the media SSRC, so dropping the ssrc
+                // lines while keeping the group would be a dangling reference.
+                const scoped = line.match(/^a=(rtpmap|fmtp|rtcp-fb):(\d+)\b/i);
                 if (scoped && !keptVideoPts.has(scoped[2])) {
                     continue;
                 }

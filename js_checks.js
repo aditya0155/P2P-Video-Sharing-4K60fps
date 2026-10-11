@@ -4314,6 +4314,70 @@ Object.assign(cases, {
             'without onlyCodecName the offer is passed through unchanged');
     },
 
+    // The scoped drop is for PAYLOAD-TYPE-scoped attributes only. `a=ssrc:` and
+    // `a=ssrc-group:` lead with an SSRC, which is a random 32-bit value that is
+    // never a member of keptVideoPts — so a pattern that includes them deletes
+    // every ssrc declaration from the video section of EVERY pruned WebCodecs
+    // offer. The answerer (Pion, inside MediaMTX) then receives RTP from an
+    // SSRC it was never told about, falls into its simulcast-probing heuristic
+    // (mid/rid extensions this publisher does not send), and fails with the
+    // logged "Incoming unhandled RTP ssrc(...), OnTrack will not be fired": a
+    // WHIP session that connects and publishes no video. The fixture
+    // PUBLISH_SDP above carries no ssrc lines at all, which is exactly why the
+    // pruning test never caught this.
+    'studio-publish-sdp-keeps-ssrc-lines-through-pruning'() {
+        const scope = compileStudioFns(['optimizePublishSdp']);
+        const withSsrc = [
+            'v=0',
+            'm=video 9 UDP/TLS/RTP/SAVPF 96 97 98',
+            'c=IN IP4 0.0.0.0',
+            'a=mid:0',
+            'a=sendonly',
+            'a=rtpmap:96 H264/90000',
+            'a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f',
+            'a=rtpmap:97 rtx/90000',
+            'a=fmtp:97 apt=96',
+            'a=rtpmap:98 VP8/90000',
+            'a=ssrc-group:FID 2733346320 144570216',
+            'a=ssrc:2733346320 cname:3b679344fc85c0d5',
+            'a=ssrc:2733346320 msid:8f1d63d0-5767-4b7f-a137-ff4b70a56d1a v0',
+            'a=ssrc:144570216 cname:3b679344fc85c0d5',
+            'a=ssrc:144570216 msid:8f1d63d0-5767-4b7f-a137-ff4b70a56d1a v0',
+            'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+            'c=IN IP4 0.0.0.0',
+            'a=mid:1',
+            'a=sendonly',
+            'a=rtpmap:111 opus/48000/2',
+            'a=ssrc:987654321 cname:3b679344fc85c0d5',
+            '',
+        ].join('\r\n');
+
+        // Prune to H.264, exactly as the WebCodecs engine does on every publish.
+        const pruned = scope.optimizePublishSdp(withSsrc, { onlyCodecName: 'H264' });
+        const lines = pruned.split('\r\n');
+        const video = sectionOf(lines, 'm=video', 'm=audio');
+
+        // VP8 is still pruned — the drop itself must keep working.
+        assert(!video.lines.some((line) => /^a=rtpmap:\d+ VP8\//.test(line)),
+            'VP8 is still pruned when H.264 is selected');
+
+        // But every ssrc declaration in the video section survives it. Losing
+        // any of these makes the publisher's SSRC undeclared to the answerer.
+        const ssrcLines = video.lines.filter((line) => line.startsWith('a=ssrc:'));
+        assertEqual(ssrcLines.length, 4,
+            'all four video a=ssrc lines survive pruning (media + rtx)');
+        assert(video.lines.indexOf('a=ssrc-group:FID 2733346320 144570216') !== -1,
+            'the FID group survives and still references declared SSRCs');
+        assert(video.lines.some((line) => line === 'a=ssrc:2733346320 cname:3b679344fc85c0d5'),
+            'the media SSRC declaration survives');
+        assert(video.lines.some((line) => line === 'a=ssrc:144570216 cname:3b679344fc85c0d5'),
+            'the rtx SSRC declaration survives');
+
+        // The audio section is untouched by video pruning, ssrc lines included.
+        assert(pruned.includes('a=ssrc:987654321 cname:3b679344fc85c0d5'),
+            'the audio section ssrc line survives');
+    },
+
     // Silently accepting a codec the answerer refused is how "I picked AV1"
     // ends up as H.264 with no indication anything went wrong.
     'studio-negotiated-codec-is-read-back-from-the-answer'() {

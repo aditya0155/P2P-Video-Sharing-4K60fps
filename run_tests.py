@@ -1146,6 +1146,16 @@ class StudioJsLogicChecks(unittest.TestCase):
         # looks live and is quietly the wrong codec.
         run_js_check(self, "studio-publish-sdp-prunes-to-the-selected-codec")
 
+    def test_publish_sdp_keeps_ssrc_lines_through_pruning(self):
+        # a=ssrc: leads with an SSRC, not a payload type, so a scoped-drop
+        # pattern that includes it deleted every ssrc declaration from the
+        # video section of every WebCodecs publish. The answerer then binds
+        # the incoming stream by simulcast probing (mid/rid extensions this
+        # publisher never sends) and fails with "Incoming unhandled RTP
+        # ssrc(...), OnTrack will not be fired" — a connected WHIP session
+        # publishing no video.
+        run_js_check(self, "studio-publish-sdp-keeps-ssrc-lines-through-pruning")
+
     def test_negotiated_codec_is_read_back_from_the_answer(self):
         # Silently accepting a codec the answerer refused is how a host picks
         # AV1 and gets H.264 with no indication anything went wrong.
