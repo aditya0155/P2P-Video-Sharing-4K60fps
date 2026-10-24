@@ -1678,8 +1678,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (isPublishing) {
                     // The codec is baked into the offer, and MediaMTX accepts
                     // one video m-section, so switching means a new session.
+                    // Keep the new selection: it is what the NEXT broadcast
+                    // reads. Reverting the control (it used to hard-code
+                    // 'h264') contradicted the toast and silently changed the
+                    // next session's codec even though the user picked another.
                     showToast('Codec is fixed for a WHIP session. It applies on the next broadcast.', 'info');
-                    codecSelect.value = 'h264';
                 }
             });
         }

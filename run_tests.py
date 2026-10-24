@@ -6411,5 +6411,34 @@ class StudioOverlayVisibilityChecks(unittest.TestCase):
                       "while it is idle, or one CSS regression bricks the page")
 
 
+class StudioCodecSelectionChecks(unittest.TestCase):
+    """The older `/streaming/studio` codec picker.
+
+    `studio.js` bakes the codec into the WHIP offer, so changing it mid-session
+    cannot affect the live broadcast. It must still keep the user's choice for
+    the next one: the old handler popped the select back to `h264`, which made
+    the toast ("applies on the next broadcast") false and silently started the
+    next session with a codec the operator had not chosen.
+    """
+
+    def setUp(self):
+        self.js = read_text(ROOT / "studio.js")
+
+    def test_changing_codec_during_a_broadcast_keeps_the_next_session_choice(self):
+        start = self.js.find("if (codecSelect) {")
+        end = self.js.find("if (audioBitrateSelect)", start)
+        self.assertGreater(start, 0, "the codec change handler was not found")
+        self.assertGreater(end, start, "the codec change handler is not bounded")
+        handler = self.js[start:end]
+        self.assertIn("Codec is fixed for a WHIP session", handler,
+                      "the user must be told the change applies to the next broadcast")
+        self.assertNotIn("codecSelect.value", handler,
+                         "the handler must not overwrite the selection it just accepted")
+        # The selection is not decorative: the next publish reads it when it
+        # builds the offer.
+        self.assertIn("applyCodecPreference(pc, codecSelect.value)", self.js,
+                      "the next broadcast must actually use the kept selection")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
