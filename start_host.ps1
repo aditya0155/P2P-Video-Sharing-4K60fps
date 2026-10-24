@@ -48,10 +48,14 @@ $webrtcUdpPort = 8189
 # file, which the required-file check further down then reports by name.
 try {
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        $udpLine = Select-String -LiteralPath $configPath -Pattern '^\s*webrtcLocalUDPAddress:\s*\S+\s*$' |
+        # The capture group is on THIS pattern, not a second match against the
+        # extracted value. The previous version matched `\S+` (no group) and
+        # then read Groups[1], so the port was always the fallback literal and
+        # editing webrtcLocalUDPAddress left the pre-flight probing the old one.
+        $udpLine = Select-String -LiteralPath $configPath -Pattern '^\s*webrtcLocalUDPAddress:\s*\S*:(\d{1,5})\s*$' |
             Select-Object -First 1
-        if ($udpLine -and $udpLine.Matches[0].Groups[1].Value -match ':(\d{1,5})\s*$') {
-            $parsedPort = [int]$Matches[1]
+        if ($udpLine) {
+            $parsedPort = [int]$udpLine.Matches[0].Groups[1].Value
             if ($parsedPort -ge 1 -and $parsedPort -le 65535) { $webrtcUdpPort = $parsedPort }
         }
     }

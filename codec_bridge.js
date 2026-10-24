@@ -267,8 +267,9 @@ const RENDITION_START_TIMEOUT_MS = 20000;
 // A transcoder that STOPPED producing output after video already flowed
 // (hung NVENC session, dead RTSP leg that never errors) freezes every viewer
 // of the rendition indefinitely — MediaMTX keeps the path online because the
-// publisher connection is alive. ffmpeg prints ~2 progress lines per second
-// while it processes; 15s of silence is a definitive stall, not a pause.
+// publisher connection is alive. The control API's per-path byte counters are
+// the liveness signal; 15s without progress on any published target is a
+// definitive stall, not a pause.
 const RENDITION_STALL_TIMEOUT_MS = 15000;
 const RENDITION_WATCHDOG_POLL_MS = 3000;
 // How many consecutive unverifiable startup polls the watchdog tolerates before
@@ -277,6 +278,19 @@ const RENDITION_WATCHDOG_POLL_MS = 3000;
 // watchdog into a no-op precisely when the host is unhealthy.
 const RENDITION_START_UNKNOWN_TOLERANCE = 15;
 const TARGET_VIDEO_CODEC = { 'live-h264': 'H264', 'live-av1': 'AV1' };
+// Stderr evidence that a fast ffmpeg exit belongs to the NVDEC decoder, not to
+// the source, the RTSP leg or the muxer. Without this gate, any two fast exits
+// (two OBS auto-reconnects, a publisher that has not produced a frame yet, an
+// RTSP 404) were recorded as "NVDEC failed twice" and the next 24 hours of
+// broadcasts silently decoded 1080p60 on the CPU alongside OBS.
+// Decoder-specific evidence only. A broad `cuda|hwaccel|no capable devices`
+// match also hit NVENC failures (10-bit input on h264_nvenc logs "No capable
+// devices found"), so two OBS encoder errors could disable GPU DECODE for 24h.
+const NVDEC_FAILURE_RE = /(cuvid|nvdec|nvcuda|libcuda|no device available for decoder|failed setup for format (?:cuda|nvdec)|cuda_error_|failed to (?:create|initialize|initialise) (?:a )?cuda (?:context|device))/i;
+
+function isNvdecFailure(stderr) {
+    return NVDEC_FAILURE_RE.test(String(stderr || ''));
+}
 
 function log(message) {
     console.log(`[codec_bridge] ${message}`);
@@ -407,18 +421,44 @@ function probeGopFrames() {
     try {
         const probe = spawnSync(resolveFfprobeBinary(), [
             '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0',
-            '-show_entries', 'stream=avg_frame_rate',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
+            // BOTH rates. MediaMTX's AV1 RTSP stream reports
+            // avg_frame_rate=0/0 (the demuxer has no duration to average over)
+            // while r_frame_rate=30/1 is perfectly usable. Asking only for the
+            // average made the probe fall back to an assumed 60fps, producing a
+            // 30-frame GOP — a 1.0s keyframe interval at 30fps, twice the
+            // designed 0.5s and a doubled worst-case freeze after a lost
+            // keyframe. Prefer the average when it is usable (it is the right
+            // number for a genuinely variable-rate source), else the real base
+            // rate.
+            '-show_entries', 'stream=avg_frame_rate,r_frame_rate',
+            '-of', 'default=noprint_wrappers=1',
             `rtsp://127.0.0.1:${RTSP_PORT}/${SOURCE_PATH}`,
         ], { encoding: 'utf8', timeout: 4000 });
-        const raw = String((probe.stdout || '').split(/\r?\n/)[0] || '').trim();
-        const parsed = raw.match(/^(\d+)\/(\d+)$/);
-        const fps = parsed ? Number(parsed[1]) / Number(parsed[2]) : Number(raw);
+        const fields = {};
+        for (const line of String(probe.stdout || '').split(/\r?\n/)) {
+            const match = line.trim().match(/^(avg_frame_rate|r_frame_rate)=(.+)$/);
+            if (match) fields[match[1]] = match[2].trim();
+        }
+        const parseRate = (text) => {
+            const match = String(text || '').trim().match(/^(\d+)\/(\d+)$/);
+            if (match && Number(match[2]) > 0) return Number(match[1]) / Number(match[2]);
+            const numeric = Number(text);
+            return Number.isFinite(numeric) ? numeric : NaN;
+        };
+        let usedField = 'avg_frame_rate';
+        let raw = fields.avg_frame_rate || '';
+        let fps = parseRate(raw);
+        if (!(Number.isFinite(fps) && fps >= 12 && fps <= 240)) {
+            usedField = 'r_frame_rate';
+            raw = fields.r_frame_rate || '';
+            fps = parseRate(raw);
+        }
         if (Number.isFinite(fps) && fps >= 12 && fps <= 240) {
             // Clamp the product too: 240fps x the 10s ceiling is a 10s GOP, i.e.
             // a ten-second freeze on every keyframe loss.
             const gop = String(Math.min(300, Math.max(1, Math.round(fps * seconds))));
-            log(`source reports ${raw} fps -> GOP ${gop} frames (~${seconds}s keyframes)`);
+            log(`source reports ${raw} fps (${usedField}) -> GOP ${gop} frames `
+                + `(~${seconds}s keyframes)`);
             return gop;
         }
         // There is exactly ONE call site for this probe and the track-fetch
@@ -428,7 +468,8 @@ function probeGopFrames() {
         // rework exists to remove — 60 frames is 1.0s at 60fps, twice the
         // 0.5s intent.
         const fallback = String(Math.min(300, Math.max(1, Math.round(60 * seconds))));
-        logError(`unexpected frame rate '${raw}' from ffprobe; using GOP ${fallback} frames `
+        logError(`unexpected frame rates (avg='${fields.avg_frame_rate || ''}', `
+            + `r='${fields.r_frame_rate || ''}') from ffprobe; using GOP ${fallback} frames `
             + `(~${seconds}s at the assumed 60fps). This is NOT retried — the next broadcast will probe again.`);
         return fallback;
     } catch (err) {
@@ -511,7 +552,14 @@ function decideBridge(tracks, env = {}) {
             sourceCodec: 'AV1',
             target: 'live-h264',
             videoArgs: [
-                '-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'ull',
+                '-c:v', 'h264_nvenc',
+                // Force 8-bit 4:2:0 output. A 10-bit AV1 source (p010/yuv420p10le)
+                // makes h264_nvenc fail at init with "10 bit encode not supported"
+                // / "No capable devices found"; verified with the bundled ffmpeg
+                // 8.1 on an RTX 4070 (10-bit AV1 input fails without this, succeeds
+                // with yuv420p). H.264 High 10 is not a WebRTC-safe target anyway.
+                '-pix_fmt', 'yuv420p',
+                '-preset', 'p4', '-tune', 'ull',
                 // Adaptive quantization is OFF by default in ffmpeg's NVENC
                 // wrapper (verified against the bundled n8.1:
                 // `-spatial_aq <boolean> ... (default false)`), so bits were
@@ -635,6 +683,44 @@ function planTargets(plan) {
     return [plan.target, ...(plan.extraOutputs || []).map((out) => out.target)];
 }
 
+/*
+ * Decide what the running plan becomes after a fresh source-track read.
+ *
+ * The target list is NOT enough to tell whether anything changed: the audio
+ * arguments switch between `-c:a copy` and `-c:a libopus` without changing a
+ * single target. H265/VP9/VP8 always publish only live-av1, so a source audio
+ * change from Opus to AAC used to be invisible to the old outer gate and the
+ * rendition kept copying AAC into WebRTC - silently muted. H264/AV1 could
+ * lose their primary audio the same way after an AAC -> Opus -> AAC flap.
+ *
+ * A same-codec re-plan keeps any prior extra the fresh plan no longer
+ * mentions. A transient track-list change otherwise permanently deletes the
+ * audio-rescue rendition; a genuine codec change still adopts the fresh plan
+ * wholesale, because the old extras were encoded for the previous codec.
+ */
+function mergeReplan(plan, freshPlan) {
+    const codecChanged = freshPlan.sourceCodec !== plan.sourceCodec;
+    let nextPlan = freshPlan;
+    let keptExtras = [];
+    if (!codecChanged) {
+        const freshTargets = new Set(planTargets(freshPlan));
+        keptExtras = (plan.extraOutputs || [])
+            .filter((out) => out && !freshTargets.has(out.target));
+        if (keptExtras.length) {
+            nextPlan = {
+                ...freshPlan,
+                extraOutputs: [...(freshPlan.extraOutputs || []), ...keptExtras],
+            };
+        }
+    }
+    return {
+        codecChanged,
+        keptExtras,
+        nextPlan,
+        changed: codecChanged || JSON.stringify(nextPlan) !== JSON.stringify(plan),
+    };
+}
+
 // NVDEC decoder per source codec. RTX 40-series covers all of these; the
 // availability probe below decides whether they are actually usable.
 const GPU_DECODERS = {
@@ -709,15 +795,15 @@ function buildFfmpegArgs(plan, ports = {}, decodeArgs = []) {
             '-map', '0:v:0', '-map', '0:a:0?',
             ...out.videoArgs,
             ...out.audioArgs,
-            // Write packets as they arrive instead of letting the FLV muxer's
-            // interleaving queue hold audio back while no video frame exists
-            // yet. Without this, a publisher whose first keyframe takes longer
-            // than MediaMTX's 10s publisher timeout (long OBS keyframe
-            // interval) gets its whole publish killed and the bridge
-            // retry-loops until the GOP happens to align — with interleaving
-            // off, the rendition simply starts the moment the first keyframe
-            // lands.
-            '-max_interleave_delta', '0',
+            // Bound the FLV muxer's interleave buffering. `0` does NOT mean
+            // "interleaving off": the ffmpeg formats documentation defines it
+            // as buffering until a packet for every stream exists regardless
+            // of timestamp difference, i.e. the muxer can wait indefinitely
+            // for a missing video keyframe or audio packet. That is the exact
+            // startup hang this option was meant to prevent. 200ms keeps
+            // audio/video interleaved without letting either stream hold the
+            // publish past MediaMTX's 10s publisher timeout.
+            '-max_interleave_delta', '200000',
             '-f', 'flv',
             `rtmp://127.0.0.1:${rtmpPort}/${out.target}`,
         );
@@ -1104,11 +1190,19 @@ function startFfmpeg(plan, decodeArgs = []) {
     // stronger evidence anyway: it proves bytes are actually reaching the
     // published path, not merely that a process is alive.
     child._lastProgressAt = Date.now();
+    // Bounded stderr ring. The retry loop below must distinguish "NVDEC failed
+    // to open the stream" from "the source/muxer failed after a fast exit"
+    // before it records a 24h GPU-decode block; logging alone threw that
+    // evidence away. 40 lines is far more than any NVENC/NVDEC init error needs
+    // and still bounded for a run that logs for hours.
+    child._stderrTail = [];
     child.stderr.on('data', (chunk) => {
         for (const rawLine of String(chunk).split(/[\r\n]+/)) {
             const line = rawLine.trim();
             if (!line) continue;
             log(`ffmpeg: ${line}`);
+            child._stderrTail.push(line);
+            if (child._stderrTail.length > 40) child._stderrTail.shift();
         }
     });
     writePidFile(child.pid, planTargets(plan));
@@ -1217,9 +1311,10 @@ async function main() {
         //   2) MID-BROADCAST STALL — once video has flowed, the published
         //      byte counters are the liveness signal: a hung NVENC session or
         //      a dead RTSP leg that never errors keeps the path `ready` while
-        //      no further bytes land, freezing every rendition viewer. Two
-        //      consecutive stalled samples are required, so one slow control-API
-        //      read can never disconnect a healthy broadcast.
+        //      no further bytes land, freezing every rendition viewer. Several
+        //      consecutive stalled samples are required (five, see below), so
+        //      one slow control-API read can never disconnect a healthy
+        //      broadcast.
         //
         // The signal deliberately is NOT ffmpeg's stderr. ffmpeg emits its
         // "frame=" stats line at AV_LOG_INFO and the bridge runs at
@@ -1326,7 +1421,14 @@ async function main() {
             // counter when a new publisher connects to it, and the bridge's own
             // restart does exactly that. Only an UNCHANGED value is evidence of
             // a stall, so compare for inequality rather than for growth.
-            const advanced = counts.some((n, i) => n !== lastBytesSeen[i]);
+            //
+            // EVERY target must advance, not just one. This is a single ffmpeg
+            // process with one output per rendition; if one output has stopped
+            // receiving bytes while another still advances, the viewers of the
+            // dead rendition are already hard-stopped. `some` treated that as a
+            // healthy publisher forever, so the watchdog could never restart
+            // the process that would repair them.
+            const advanced = counts.every((n, i) => n !== lastBytesSeen[i]);
             lastBytesSeen = counts.map((n) => (Number.isFinite(n) ? n : 0));
             if (advanced) {
                 stalledSamples = 0;
@@ -1346,11 +1448,18 @@ async function main() {
         }, RENDITION_WATCHDOG_POLL_MS);
 
         const exit = await new Promise((resolve) => {
-            child.once('exit', (code, signal) => resolve({ code, signal }));
+            // `close`, not `exit`: it fires only after the stdio streams have
+            // drained, so the NVDEC decision below sees the decoder's final
+            // stderr lines. `exit` can fire while the pipe still holds the very
+            // error that explains why the process died.
+            child.once('close', (code, signal) => resolve({ code, signal }));
             child.once('error', (err) => resolve({ error: err }));
         });
         clearInterval(watchdog);
         clearPidFile();
+        const stderrTail = Array.isArray(child._stderrTail)
+            ? child._stderrTail.join('\n')
+            : '';
         child = null;
         if (exit.error) {
             logError(`ffmpeg failed to start: ${exit.error.message}`);
@@ -1399,28 +1508,42 @@ async function main() {
             lastHealthyRunAt = Date.now();
         }
 
-        // A crash within the first 10s points at the decoder configuration,
-        // not the source: record it, drop to CPU after the second occurrence,
-        // and retry almost immediately instead of sleeping the full 2s.
+        // A crash within the first 10s CAN point at the decoder configuration,
+        // but only the decoder's own stderr proves it. Every fast exit used
+        // to count: two OBS auto-reconnects, a publisher with no frames yet, an
+        // RTSP 404 or a muxer error were all recorded as "NVDEC failed twice"
+        // and blocked GPU decode for the next 24 hours. The next broadcast then
+        // decoded 1080p60 on the CPU while OBS captured on the same cores,
+        // delaying every packet to every viewer.
         //
-        // The counter must be cleared by a healthy run. It previously was not,
-        // so `gpuFastFailures` accumulated for the whole broadcast: one 5s exit,
-        // then two perfectly good hours, then an unrelated 5s exit tripped the
-        // threshold and switched the rest of the broadcast to SOFTWARE decode —
-        // 1080p60 decoded on the CPU while OBS captured on the same 14 cores,
-        // which delays every packet to EVERY viewer rather than one. The run
-        // counter above already treats >=30s as proof the configuration works;
-        // this one has to agree.
+        // The counter must also be cleared by a non-fast run. It previously
+        // only cleared after 30s, so one 5s exit, two good hours, then an
+        // unrelated 5s exit (neither with NVDEC evidence) still tripped the
+        // threshold. A run that survived the 10s fast-failure window proves the
+        // decoder opened; that is the bar for clearing the strike count. The
+        // persistent 24h block still needs a 30s run to clear.
         if (decodeArgs.length && runSeconds < 10) {
-            gpuFastFailures += 1;
-            if (gpuFastFailures >= 2) {
-                logError('NVDEC decode failed twice in a row — falling back to CPU decode');
-                rememberGpuDecodeFailure(decodeArgs[1]);
-                decodeArgs = [];
+            if (isNvdecFailure(stderrTail)) {
+                gpuFastFailures += 1;
+                const evidence = stderrTail.split('\n')
+                    .filter((line) => isNvdecFailure(line))
+                    .slice(-2)
+                    .join(' | ');
+                logError(`NVDEC evidence in a ${runSeconds.toFixed(1)}s run `
+                    + `(${gpuFastFailures}/2): ${evidence}`);
+                if (gpuFastFailures >= 2) {
+                    logError('NVDEC decode failed twice in a row — falling back to CPU decode');
+                    rememberGpuDecodeFailure(decodeArgs[1]);
+                    decodeArgs = [];
+                }
+            } else {
+                gpuFastFailures = 0;
+                log(`ffmpeg exited in ${runSeconds.toFixed(1)}s without NVDEC evidence; `
+                    + 'not counting it toward the GPU-decode fallback');
             }
-        } else if (decodeArgs.length && runSeconds >= 30) {
+        } else if (decodeArgs.length) {
             gpuFastFailures = 0;
-            clearGpuDecodeFailure(decodeArgs[1]);
+            if (runSeconds >= 30) clearGpuDecodeFailure(decodeArgs[1]);
         }
         if (runSeconds < 10) {
             await sleep(400);
@@ -1446,11 +1569,8 @@ async function main() {
             break;
         }
         const freshPlan = decideBridge(fetchedTracks, { gopFrames });
-        if (freshPlan && (freshPlan.sourceCodec !== plan.sourceCodec
-            || freshPlan.target !== plan.target
-            || JSON.stringify(planTargets(freshPlan)) !== JSON.stringify(planTargets(plan)))) {
-            log(`source codec changed (${plan.sourceCodec} -> ${freshPlan.sourceCodec}); `
-                + `re-planning renditions: ${planTargets(freshPlan).join(' + ')}`);
+        if (freshPlan) {
+            const { codecChanged, keptExtras, nextPlan, changed } = mergeReplan(plan, freshPlan);
             // A plan change is NOT proof the configuration works, so it must not
             // clear the consecutive-failure budget. Resetting `failures` here
             // meant a source whose track list oscillated could restart the
@@ -1461,19 +1581,33 @@ async function main() {
             //
             // A genuine codec change does deserve a clean slate, because the old
             // budget was spent on a different codec. Only the source VIDEO codec
-            // is treated as authoritative for that; the set of rendition targets
-            // can legitimately differ for a transient reason — an RTMP source
-            // whose audio track briefly disappears makes decideBridge drop the
-            // audio-rescue output, and adopting that permanently would leave
-            // live-h264 unpublished for the REST OF THE BROADCAST, hard-stopping
-            // every audio-rescue viewer, which is the entire reason that
-            // rendition exists.
-            if (freshPlan.sourceCodec !== plan.sourceCodec) {
-                failures = 0;
-                gpuFastFailures = 0;
+            // is treated as authoritative for that.
+            //
+            // After the first merge of a transiently-missing extra, `nextPlan`
+            // can be byte-for-byte the plan already running. mergeReplan reports
+            // `changed=false` then, so the bridge does not re-log or re-probe
+            // every poll for a source whose track list is simply still
+            // different from the merged set; only a real change is work.
+            if (changed) {
+                const beforeTargets = planTargets(plan).join(' + ');
+                const afterTargets = planTargets(nextPlan).join(' + ');
+                if (keptExtras.length) {
+                    log(`track list transiently dropped ${keptExtras.map((o) => o.target).join(', ')}; `
+                        + 'keeping the rendition(s) published until the source really changes codec');
+                }
+                if (codecChanged || beforeTargets !== afterTargets) {
+                    log(`source plan changed (${plan.sourceCodec}: ${beforeTargets} -> `
+                        + `${nextPlan.sourceCodec}: ${afterTargets}); re-planning renditions`);
+                } else {
+                    log('source plan arguments changed; refreshing rendition encoder/audio arguments');
+                }
+                if (codecChanged) {
+                    failures = 0;
+                    gpuFastFailures = 0;
+                }
+                plan = nextPlan;
+                decodeArgs = resolveDecodeArgs(plan);
             }
-            plan = freshPlan;
-            decodeArgs = resolveDecodeArgs(plan);
         }
         // Two independent reasons to stop. Either the consecutive-failure cap
         // tripped, or the bridge has been crash-cycling without ever producing
@@ -1507,7 +1641,7 @@ async function main() {
     process.exit(0);
 }
 
-module.exports = { decideBridge, buildFfmpegArgs, pickDecoderArgs, probeGopFrames, planTargets, shouldGiveUp, MAX_CONSECUTIVE_FFMPEG_FAILURES, NO_HEALTHY_RUN_LIMIT_MS, VIDEO_CODECS };
+module.exports = { decideBridge, buildFfmpegArgs, pickDecoderArgs, probeGopFrames, planTargets, mergeReplan, isNvdecFailure, shouldGiveUp, MAX_CONSECUTIVE_FFMPEG_FAILURES, NO_HEALTHY_RUN_LIMIT_MS, VIDEO_CODECS };
 
 if (require.main === module) {
     main().catch((err) => {

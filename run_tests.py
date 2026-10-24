@@ -915,10 +915,11 @@ class JsLogicChecks(unittest.TestCase):
         ViewerSmoothnessRegressionChecks for the full rationale."""
         run_js_check(self, "spec-freeze-threshold")
 
-    def test_loss_accounting_excludes_retransmissions(self):
-        """`packetsReceived` includes retransmissions, so the old
-        dLost/(dRx+dLost) ratio reported a fully RTX-repaired link as 0% loss
-        and could not see an SFU queue overflow at all."""
+    def test_loss_accounting_uses_unrepaired_loss_without_double_counting(self):
+        """`packetsLost` is already net of RTX repair and `packetsReceived`
+        includes retransmissions, so subtracting RTX again under-reported real
+        loss; `packetsDiscarded` is a subset of received and must not dilute
+        the denominator either."""
         run_js_check(self, "network-loss-accounting")
 
     def test_loss_metric_scale_matches_controller_thresholds(self):
@@ -936,6 +937,15 @@ class JsLogicChecks(unittest.TestCase):
         """`decodedDelta === 0` was blind to a partially-wedged decoder and
         could false-fire on a sampling artefact."""
         run_js_check(self, "decoder-stall-detection")
+
+    def test_freeze_recovery_requires_a_presented_frame(self):
+        """Stage 1/2 treated a ready, unpaused element as recovered.
+
+        A decoder stall leaves the element at HAVE_FUTURE_DATA and not paused
+        while it holds the last decoded frame, so that check returned success
+        on every trip and the flush/renewal stages never ran. The picture then
+        stayed frozen until the recovery cap forced a reconnect."""
+        run_js_check(self, "freeze-recovery-requires-a-presented-frame")
 
 
     def test_abr_switching_state_machine(self):
@@ -1075,6 +1085,12 @@ class StudioJsLogicChecks(unittest.TestCase):
     def test_av1_level_rises_with_pixel_rate(self):
         run_js_check(self, "studio-av1-level-rises-with-pixel-rate")
 
+    def test_native_codec_preference_matches_both_av1_spellings(self):
+        run_js_check(self, "studio-native-codec-preference-spells-av1-both-ways")
+
+    def test_webcodecs_engine_is_disabled_with_a_reason(self):
+        run_js_check(self, "studio-webcodecs-engine-is-disabled-with-a-reason")
+
     def test_odd_dimensions_are_forced_even(self):
         run_js_check(self, "studio-odd-dimensions-are-forced-even")
 
@@ -1104,6 +1120,38 @@ class StudioJsLogicChecks(unittest.TestCase):
 
     def test_worklet_resets_the_accumulator_before_posting(self):
         run_js_check(self, "studio-worklet-resets-the-accumulator-before-posting")
+
+    def test_mic_fader_works_without_system_audio(self):
+        """The mic gain must be found by name, not by array position.
+
+        A screen share with "Share audio" unticked produces a mic-only mix:
+        [micSource, micGain] at indices 0 and 1. The old fixed index 3 read
+        undefined, so the mic slider did nothing while the UI looked correct.
+        """
+        run_js_check(self, "studio-mic-fader-works-in-a-mic-only-mix")
+
+    def test_dead_audio_destination_is_recreated(self):
+        """Detecting a dead destination is not enough; it must be replaced.
+
+        Clearing state.audioDest and then returning the existing context left
+        the next gain.connect(null) to throw after the UI had entered
+        "Starting...", which the user saw as a 75 s hang.
+        """
+        run_js_check(self, "studio-dead-audio-destination-is-recreated")
+
+    def test_source_toggle_reconnects_live_audio(self):
+        """A source change while live must rebuild the mix, or be explained.
+
+        A live session with an audio sender can pick up a newly enabled mic
+        immediately. A video-only session cannot: it has no sender to feed, so
+        the user has to be told that a restart is required instead of being
+        left with a microphone the UI calls On and viewers cannot hear.
+        """
+        run_js_check(self, "studio-source-toggle-reconnects-live-audio")
+
+    def test_source_changes_call_the_reconnect(self):
+        """The reconnect helper is useless if the capture paths never call it."""
+        run_js_check(self, "studio-source-changes-actually-call-the-reconnect")
 
     def test_every_js_check_case_is_reachable_from_a_unittest(self):
         """A js_checks case that no unittest invokes never runs.
@@ -1175,6 +1223,14 @@ class StudioJsLogicChecks(unittest.TestCase):
         # The old loop used periodMs/2 as its interval and encoded on every
         # tick, so 30 fps actually produced ~59 fps.
         run_js_check(self, "studio-encode-period-matches-the-requested-framerate")
+
+    def test_encoder_probe_cannot_outlive_a_stopped_session(self):
+        """stopBroadcast() bumps the session token before releasing what it can
+        see, but the capability probe is an await: an encoder constructed after
+        the stop was assigned to dead state and never closed. The factory must
+        refuse to build one for a superseded session, while still building one
+        for the current session."""
+        run_js_check(self, "studio-encoder-probe-cannot-outlive-a-stopped-session")
 
 
 class StreamApiProxyChecks(_SiteUnderTest):
@@ -2198,12 +2254,13 @@ class BrowserBroadcasterChecks(_SiteUnderTest):
         `state.audioSender.track` is the real mix output — the only audio track
         of state.audioDest.stream, which is shared and deliberately kept alive
         across sessions. Stopping it sets readyState='ended' while leaving it in
-        the stream, and because buildAudioGraph() early-returns for the life of
-        the page and audioDest is never rebuilt, the SECOND Go live would
-        addTransceiver an ended track. Result: a permanently silent broadcast
-        with the UI still showing the mic as On and a moving fader, and nothing
-        anywhere logged. A silent stream is worse than a failed one, so the
-        stop() is gated on the track actually being a placeholder.
+        the stream, so the SECOND Go live would addTransceiver an ended track.
+        (buildAudioGraph() now detects and replaces a dead destination, but the
+        placeholder check is still the correct, cheaper fix.) Result without the
+        guard: a permanently silent broadcast with the UI still showing the mic
+        as On and a moving fader, and nothing anywhere logged. A silent stream
+        is worse than a failed one, so the stop() is gated on the track actually
+        being a placeholder.
         """
         idx = self.studio_js.find("function releaseBlankTracks()")
         self.assertGreater(idx, 0, "releaseBlankTracks() was not found")
@@ -2222,18 +2279,23 @@ class BrowserBroadcasterChecks(_SiteUnderTest):
         self.assertIn("readyState === 'live'", self.studio_js,
                       "a dead mix output must be detected and rebuilt, not reused")
 
-    def test_studio_encoded_chunks_reach_the_sender_by_transfer_not_postmessage(self):
-        """Encoded chunks are NOT structured-cloneable.
+    def test_studio_does_not_claim_webcodecs_chunks_can_reach_the_sender(self):
+        """No shipping browser can inject WebCodecs output into an RTCRtpSender.
 
-        Pushing an EncodedVideoChunk over a MessagePort throws DataCloneError
-        before a single byte moves, which would kill the WebCodecs engine on its
-        very first frame. The only supported route is the `transfer` argument of
-        the RTCRtpScriptTransform constructor, so this is pinned as a contract.
+        RTCRtpScriptTransform's readable is the sender's own encoded output,
+        its writable rejects raw chunks ("Invalid frame"), and the constructor
+        transfer list arrives in `transformer.options`. The old test pinned the
+        transfer list as an injection route; that contract was false, so the
+        engine is now explicitly disabled and must resolve to Native with a
+        reason instead of silently publishing a blank track.
         """
-        self.assertIn("new TransformStream()", self.studio_js)
-        self.assertIn("new RTCRtpScriptTransform(worker, { name }, [transport.readable])",
+        self.assertIn("const WEBCODECS_SENDER_INJECTION_SUPPORTED = false",
                       self.studio_js,
-                      "the readable must be transferred into the transform constructor")
+                      "the unsupported injection path must stay disabled")
+        self.assertIn("&& WEBCODECS_SENDER_INJECTION_SUPPORTED", self.studio_js,
+                      "fullWebCodecs must include the injection capability")
+        self.assertIn("no shipping browser can inject", self.studio_js,
+                      "the fallback reason must name the real API gap")
         # No postMessage CALL may survive. The one surviving mention is the
         # comment explaining why it cannot be used, so executable calls are
         # what is ruled out, not the word itself.
@@ -2907,7 +2969,10 @@ class ReceiverLagFixChecks(unittest.TestCase):
         # live-tested and made RTSP joins flaky or broken — they must stay out.
         bridge = read_text(BRIDGE_PATH)
         for flag in ("'-rtsp_transport', 'tcp'", "'-tune', 'ull'", "'-forced-idr', '1'",
-                     "'-max_interleave_delta', '0'",
+                     # 0 means UNLIMITED interleave buffering in ffmpeg, not
+                     # "off": one slow first keyframe/audio packet could hold
+                     # the whole FLV publish until MediaMTX timed it out.
+                     "'-max_interleave_delta', '200000'",
                      # Burst cap: bare -b:v measured 2.4x-target 100ms peaks;
                      # -maxrate/-bufsize must stay glued to every encoder plan.
                      "'-maxrate'", "'-bufsize'"):
@@ -3509,9 +3574,70 @@ class StreamingHardeningChecks(unittest.TestCase):
         # offline (so the runOnAvailable hook is NOT re-run); a mid-broadcast
         # encoder switch must re-plan the renditions instead of crash-looping
         # on a plan built for the previous codec.
-        self.assertIn("source codec changed", self.bridge, "codec-change re-plan missing")
+        self.assertIn("source plan changed", self.bridge, "codec-change re-plan missing")
         self.assertIn("function resolveDecodeArgs(", self.bridge,
                       "decode args must be re-derived for the new codec")
+        # A transient source-track change (audio disappearing for one poll)
+        # makes decideBridge drop the audio-rescue output. Adopting that would
+        # leave live-h264/live-av1 unpublished for the rest of the broadcast,
+        # hard-stopping the viewers it exists for. Extras are merged on a
+        # same-codec re-plan and only dropped when the source codec changes.
+        self.assertIn("keptExtras = (plan.extraOutputs || [])", self.bridge,
+                      "target-shrink merge missing")
+        self.assertIn("...freshPlan,", self.bridge,
+                      "the fresh primary must be adopted before merging extras")
+        self.assertIn("extraOutputs: [...(freshPlan.extraOutputs || []), ...keptExtras]", self.bridge,
+                      "kept extras must be attached to the fresh plan")
+
+    def test_bridge_replan_compares_the_whole_plan_not_just_targets(self):
+        """An audio-only change must still be adopted.
+
+        H265/VP9/VP8 sources always publish only `live-av1`, so the target list
+        is identical when their source audio changes Opus->AAC. The old outer
+        gate looked only at the source codec and targets, left `-c:a copy` in
+        place, and copied AAC into a WebRTC rendition - silently video-only.
+        The same shape occurs on H264/AV1 after an AAC->Opus->AAC flap.
+        """
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise the re-plan merge")
+        script = (
+            "const b=require('./codec_bridge.js');"
+            "const copy={sourceCodec:'H265',target:'live-av1',"
+            "videoArgs:['-c:v','av1_nvenc'],audioArgs:['-c:a','copy'],extraOutputs:[]};"
+            "const opus={...copy,audioArgs:['-c:a','libopus']};"
+            "const audio=b.mergeReplan(copy,opus);"
+            "if(!audio.changed) throw new Error('audio-only plan change was ignored');"
+            "if(audio.nextPlan.audioArgs.join(' ')!=='-c:a libopus') "
+            "throw new Error('fresh audio args were not adopted');"
+            "const same=b.mergeReplan(copy,{...copy});"
+            "if(same.changed) throw new Error('an identical plan must not re-plan');"
+
+            "const running={sourceCodec:'H264',target:'live-h264',"
+            "videoArgs:['-c:v','copy'],audioArgs:['-c:a','libopus'],"
+            "extraOutputs:[{target:'live-av1',videoArgs:['-c:v','av1_nvenc'],"
+            "audioArgs:['-c:a','libopus']}]};"
+            "const shrunk={sourceCodec:'H264',target:'live-h264',"
+            "videoArgs:['-c:v','copy'],audioArgs:['-c:a','copy'],extraOutputs:[]};"
+            "const merge=b.mergeReplan(running,shrunk);"
+            "if(!merge.changed) throw new Error('target shrink was ignored');"
+            "if(merge.keptExtras.length!==1||merge.keptExtras[0].target!=='live-av1') "
+            "throw new Error('transiently missing extra was deleted');"
+            "if(b.planTargets(merge.nextPlan).join(',')!=='live-h264,live-av1') "
+            "throw new Error('merged target list is wrong');"
+            "if(merge.nextPlan.audioArgs.join(' ')!=='-c:a copy') "
+            "throw new Error('fresh primary audio args were not adopted');"
+            "const again=b.mergeReplan(merge.nextPlan,shrunk);"
+            "if(again.changed) throw new Error('a merged plan must not re-log every poll');"
+
+            "const codec={sourceCodec:'AV1',target:'live-av1',"
+            "videoArgs:['-c:v','copy'],audioArgs:['-c:a','copy'],extraOutputs:[]};"
+            "const switched=b.mergeReplan(running,codec);"
+            "if(!switched.codecChanged||switched.keptExtras.length) "
+            "throw new Error('a codec change must adopt the fresh plan wholesale');"
+        )
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_player_routes_viewers_to_the_audio_rescue_rendition(self):
         self.assertIn("hasOpusAudio", self.app, "audio-aware path choice missing")
@@ -4077,6 +4203,99 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
                       "unchanged value is evidence of one")
         self.assertNotIn("targetPath.bytesSent", self.bridge,
                          "bytesSent is EGRESS to readers; using it inverts the watchdog")
+
+    def test_bridge_gop_probe_falls_back_to_r_frame_rate(self):
+        """MediaMTX's AV1 RTSP stream reports avg_frame_rate=0/0.
+
+        Asking ffprobe only for the average left every AV1 source on the
+        assumed-60fps fallback, so a 30fps source got a 30-frame GOP: a 1.0s
+        keyframe interval instead of the designed 0.5s, doubling the
+        worst-case freeze after a lost IDR. The real base rate is available as
+        r_frame_rate and must be the fallback.
+        """
+        code = self._strip_comments(self.bridge, "js")
+        self.assertIn("stream=avg_frame_rate,r_frame_rate", code,
+                      "ffprobe must request both frame-rate fields")
+        self.assertIn("fields.avg_frame_rate", code)
+        self.assertIn("fields.r_frame_rate", code)
+        self.assertIn("usedField = 'r_frame_rate'", code,
+                      "an unusable average must fall back to the real base rate")
+        self.assertIn("avg_frame_rate|r_frame_rate", code,
+                      "the probe must parse whichever field it requested")
+
+    def test_bridge_h264_output_forces_8_bit_4_2_0(self):
+        """h264_nvenc rejects a 10-bit AV1 source without -pix_fmt yuv420p.
+
+        Verified with the bundled ffmpeg 8.1 on an RTX 4070: the same command
+        fails with "10 bit encode not supported / No capable devices found"
+        without it and succeeds with it. H.264 High 10 is not WebRTC-safe
+        anyway, so this is not merely a workaround.
+        """
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise the bridge plan")
+        script = (
+            "const b=require('./codec_bridge.js');"
+            "const p=b.decideBridge(['AV1']);"
+            "const line=p.videoArgs.join(' ');"
+            "if(!line.includes('-pix_fmt yuv420p')) "
+            "throw new Error('AV1->H264 transcode is missing -pix_fmt yuv420p: '+line);"
+        )
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_bridge_only_blames_nvdec_on_decoder_stderr(self):
+        """Every fast ffmpeg exit used to count as an NVDEC failure.
+
+        Two OBS auto-reconnects, an RTSP 404 or a publisher with no frames yet
+        therefore blocked GPU decode for 24 hours, and the next broadcast
+        decoded 1080p60 on the CPU alongside OBS. Only decoder evidence may
+        increment the strike count, a run past the 10s fast-failure window must
+        clear it, and the stderr tail must be captured before the child dies.
+        """
+        code = self._strip_comments(self.bridge, "js")
+        self.assertIn("const NVDEC_FAILURE_RE", code,
+                      "decoder-evidence matcher missing")
+        self.assertIn("isNvdecFailure(stderrTail)", code,
+                      "fast failures must be gated on decoder stderr")
+        self.assertIn("child.once('close'", code,
+                      "stderr must drain before the exit is classified (exit can race the pipe)")
+        self.assertIn("child._stderrTail", code,
+                      "the bounded stderr tail must be retained for classification")
+        self.assertIn("gpuFastFailures = 0;", code,
+                      "a non-fast run must clear the strike count")
+        self.assertRegex(
+            code,
+            r"\} else if \(decodeArgs\.length\) \{\s*"
+            r"gpuFastFailures = 0;\s*"
+            r"if \(runSeconds >= 30\) clearGpuDecodeFailure\(decodeArgs\[1\]\);",
+            "a non-fast run must clear the strikes; only a 30s+ run may clear the 24h record")
+        self.assertIn("runSeconds >= 30", code,
+                      "the persistent block must still require a healthy 30s+ run to clear")
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise the NVDEC classifier")
+        positives = [
+            "[av1_cuvid @ 000001] Cannot load libnvcuvid.so.1",
+            "[h264_cuvid @ 000001] Failed to create decoder",
+            "Failed setup for format cuda: hwaccel initialisation returned error.",
+            "Cannot load nvcuda.dll",
+            "CUDA_ERROR_NO_DEVICE",
+            "No device available for decoder: device type cuda needed for codec av1.",
+        ]
+        negative = ("[h264_nvenc @ 000001] No capable devices found\n"
+                    "10 bit encode not supported")
+        script = (
+            "const b=require('./codec_bridge.js');"
+            "const pos=" + json.dumps(positives) + ";"
+            "for (const s of pos) {"
+            "  if (!b.isNvdecFailure(s)) throw new Error('decoder evidence missed: '+s);"
+            "}"
+            "const nvenc=" + json.dumps(negative) + ";"
+            "if (b.isNvdecFailure(nvenc)) throw new Error('NVENC failure counted as NVDEC: '+nvenc);"
+        )
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_opus_rescue_corrects_timestamps(self):
         self.assertIn("aresample=async=1", self.bridge,
@@ -5118,9 +5337,8 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         WHEP session on the path: a room-wide hard stop for a broadcast that
         never stalled."""
         code = self._strip_comments(self.bridge, "js")
-        watchdog = self._js_function_body(code, "advance")
         body = code
-        idx = body.find("const advanced = counts.some(")
+        idx = body.find("const advanced = counts.every(")
         self.assertGreater(idx, 0, "the advance test was not found")
         window = body[max(0, idx - 900): idx]
         self.assertIn("!Number.isFinite(n)", window,
@@ -5402,10 +5620,29 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
                         "not be overwritten by it")
         # And it must be read by matching the KEY, not by assuming a fixed line
         # number or column - the same class of drift the fallback literal caused.
-        self.assertRegex(
-            ps, r"webrtcLocalUDPAddress:\s*\\s\*",
-            "the port must be read by matching the webrtcLocalUDPAddress key, "
-            "not by assuming a fixed line number or column")
+        pattern_match = re.search(
+            r"Select-String[^\n]*?-Pattern\s+'([^']+)'", ps)
+        self.assertIsNotNone(
+            pattern_match,
+            "the launcher no longer reads the WebRTC UDP address with Select-String")
+        pattern = pattern_match.group(1)
+        self.assertIn(
+            "Groups[1]", ps,
+            "the launcher must read the port from a capture group in that pattern")
+        # The extraction reads Groups[1], so the shipped pattern MUST capture the
+        # digits. Checking only that the key appears let a group-less `\S+`
+        # pattern pass while Groups[1] was always $null, which meant the config
+        # was read but the value was silently discarded in favour of 8189.
+        for line, expected in (
+                ("webrtcLocalUDPAddress: 127.0.0.1:9911", "9911"),
+                ("webrtcLocalUDPAddress: :9911", "9911"),
+                ("  webrtcLocalUDPAddress: [::]:9911  ", "9911")):
+            matched = re.search(pattern, line)
+            self.assertIsNotNone(
+                matched, "the launcher pattern does not match {!r}".format(line))
+            self.assertEqual(
+                matched.group(1), expected,
+                "the launcher must capture the port from {!r}".format(line))
         # And the key it parses must still exist in the config.
         config = read_text(ROOT / "mediamtx.yml")
         self.assertIsNotNone(
@@ -5952,10 +6189,6 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
                       "opening the chat by hand must retire the unread count")
         self.assertIn('.tab-unread-badge[hidden]', self.css,
                       "[hidden] must beat the badge's display, or '0' renders")
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class StudioOverlayVisibilityChecks(unittest.TestCase):

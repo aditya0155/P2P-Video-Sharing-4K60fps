@@ -9,7 +9,7 @@
    replacement.
 
    --------------------------------------------------------------------------
-   Why there are two engines
+   Engines: NATIVE is the only one that can publish
    --------------------------------------------------------------------------
    NATIVE  getDisplayMedia -> addTrack -> WHIP. The browser's own encoder does
           the work. Works on every browser that can do WHIP at all, and the
@@ -19,13 +19,18 @@
           browser offers, and there is no control over the keyframe interval.
 
    WEBCODECS  getDisplayMedia -> canvas -> VideoEncoder -> RTCRtpScriptTransform
-          -> WHIP. Real OBS-style control: exact codec string, bitrate, framerate,
-          resolution, keyframe interval and hardware-acceleration preference.
-          Requires RTCRtpScriptTransform (Chrome/Edge 124+) and WebCodecs.
+          -> WHIP was intended to add exact codec/bitrate/keyframe control.
+          It cannot work in any shipping browser: RTCRtpScriptTransform exposes
+          only the sender's own encoded output, and no API accepts WebCodecs
+          chunks as sender input (verified in Chrome 155; raw chunk writes throw
+          "Invalid frame"). The code is kept behind
+          WEBCODECS_SENDER_INJECTION_SUPPORTED = false so it can be re-enabled
+          if such an API ships, but resolveEngine() always returns NATIVE today
+          and reports that reason instead of silently downgrading.
 
-   "auto" picks WEBCODECS when it is fully available AND the requested codec is
-   one WebCodecs can actually produce, else NATIVE. The resolved engine is always
-   displayed, and the reason is logged, so a fallback is never silent.
+   "auto" and an explicit "WebCodecs" selection both resolve to NATIVE. The
+   resolved engine is always displayed, and the reason is logged, so a fallback
+   is never silent.
 
    --------------------------------------------------------------------------
    Composition
@@ -158,21 +163,48 @@ document.addEventListener('DOMContentLoaded', () => {
         return (parts[1] || '').toLowerCase();
     }
 
-    // AV1 level 2.0 = 0, 3.0 = 4, 4.0 = 8, 4.1 = 9, 5.0 = 16, 5.1 = 17,
-    // 5.2 = 18, 6.0 = 20. Two digits, 'M' is tier 0 (Main), '08' is 8-bit.
-    // Thresholds are luma samples/second, so the declared level is never
-    // under-stated for the resolution and frame rate actually being sent.
+    // AV1 levels are indexed by `seq_level_idx` (the third field of
+    // av01.P.LLT.DD), NOT by the level number written on the spec table. The
+    // old ladder used level digits as indices — 5.0 -> 16, 5.1 -> 17,
+    // 6.0 -> 20 — which are actually level 6.0, 6.1 and an undefined 6.4. A
+    // 1080p60 stream declared 6.1 and a 4K60 stream declared 6.4, so a decoder
+    // that trusts the codec string rejected or mis-sized the stream.
+    //
+    // This table is AOMedia AV1 Annex A (seq_level_idx and both limits that
+    // apply to a non-constant-frame-rate stream): MaxPicSize in luma samples
+    // and MaxDisplayRate in luma samples/second. Both are checked, because a
+    // level can cover the sample rate while its picture-size cap is too small
+    // (8K30 is within 5.2's sample rate but far beyond its 8.9 MP cap). The
+    // 5.3 and 6.3 rows are omitted deliberately: they change tier bitrate
+    // limits, not either limit used here. Main tier and 8-bit are still the
+    // right declaration for the studio's <=20 Mbps output.
     function av1CodecString(width, height, framerate) {
-        const pps = width * height * Math.max(1, framerate);
-        let level;
-        if (pps > 2359296 * 60) level = 20;      // 6.0
-        else if (pps > 1179648 * 60) level = 18; // 5.2
-        else if (pps > 1179648 * 30) level = 17; // 5.1
-        else if (pps > 1179648 * 15) level = 16; // 5.0
-        else if (pps > 589824 * 30) level = 9;   // 4.1
-        else if (pps > 589824 * 15) level = 8;   // 4.0
-        else if (pps > 147456 * 30) level = 4;   // 3.0
-        else level = 0;                          // 2.0
+        const w = Math.max(1, Number(width) || 0);
+        const h = Math.max(1, Number(height) || 0);
+        const fps = Math.max(1, Number(framerate) || 0);
+        const picSize = w * h;
+        const displayRate = picSize * fps;
+        const levels = [
+            [0, 147456, 4423680],       // 2.0
+            [1, 278784, 8363520],       // 2.1
+            [4, 665856, 19975680],      // 3.0
+            [5, 1065024, 31950720],     // 3.1
+            [8, 2359296, 70778880],     // 4.0
+            [9, 2359296, 141557760],    // 4.1
+            [12, 8912896, 267386880],   // 5.0
+            [13, 8912896, 534773760],   // 5.1
+            [14, 8912896, 1069547520],  // 5.2
+            [16, 35651584, 1069547520], // 6.0
+            [17, 35651584, 2139095040], // 6.1
+            [18, 35651584, 4278190080], // 6.2
+        ];
+        let level = 19; // Highest defined level; never under-declare beyond 6.3.
+        for (const [idx, maxPicSize, maxDisplayRate] of levels) {
+            if (picSize <= maxPicSize && displayRate <= maxDisplayRate) {
+                level = idx;
+                break;
+            }
+        }
         return 'av01.0.' + String(level).padStart(2, '0') + 'M.08';
     }
 
@@ -434,6 +466,15 @@ document.addEventListener('DOMContentLoaded', () => {
        Capability detection and settings
        ====================================================================== */
 
+    // The APIs the old WebCodecs engine used are present in current Chrome, but
+    // none of them can publish WebCodecs output. RTCRtpScriptTransform's
+    // readable side is the sender's OWN encoded output; its writable accepts
+    // only frames owned by that same encoder; the constructor transfer list is
+    // delivered to `transformer.options`, not to the writable. Raw
+    // EncodedVideoChunk/Uint8Array writes were verified in Chrome 155 to throw
+    // "TypeError: Invalid frame". Keep this flag false until a sender
+    // encoded-source API exists. See resolveEngine() and README.
+    const WEBCODECS_SENDER_INJECTION_SUPPORTED = false;
     const supports = {
         videoEncoder: typeof window.VideoEncoder === 'function',
         audioEncoder: typeof window.AudioEncoder === 'function',
@@ -441,13 +482,12 @@ document.addEventListener('DOMContentLoaded', () => {
         audioWorklet: !!(window.AudioContext && window.AudioContext.prototype.audioWorklet),
         displayMedia: !!(navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function'),
     };
-    // The WebCodecs engine needs all three of these, because it feeds both a
-    // video and an audio track through the same injected-writer path. Video-only
-    // would work without AudioEncoder, but a silent studio is a worse experience
-    // than a fallback that carries system audio, so the engine is all-or-nothing.
+    // All-or-nothing: the WebCodecs engine feeds both tracks through the same
+    // (nonexistent) injection path, so a video-only variant would not rescue it.
     supports.fullWebCodecs = supports.videoEncoder
         && supports.audioEncoder
-        && supports.scriptTransform;
+        && supports.scriptTransform
+        && WEBCODECS_SENDER_INJECTION_SUPPORTED;
 
     const settings = {
         engine: 'auto',
@@ -497,22 +537,18 @@ document.addEventListener('DOMContentLoaded', () => {
     function resolveEngine() {
         const wanted = el['set-engine'].value || settings.engine;
         if (wanted === 'native') return { engine: 'native', reason: 'Selected manually.' };
+        const unavailable = 'WebCodecs publishing is unavailable: no shipping browser can inject '
+            + 'encoded chunks into an RTCRtpSender (RTCRtpScriptTransform only exposes the '
+            + 'sender\'s own encoder output). Using the native encoder; resolution, frame rate '
+            + 'and bitrate still apply.';
         if (wanted === 'webcodecs') {
             if (!supports.fullWebCodecs) {
-                return {
-                    engine: 'native',
-                    reason: 'WebCodecs publishing needs Chrome/Edge 124+ (WebCodecs + AudioEncoder + '
-                        + 'RTCRtpScriptTransform). Falling back to the native encoder.',
-                };
+                return { engine: 'native', reason: unavailable };
             }
             return { engine: 'webcodecs', reason: 'WebCodecs engine (exact bitrate, keyframe and codec control).' };
         }
         if (!supports.fullWebCodecs) {
-            return {
-                engine: 'native',
-                reason: 'This browser cannot inject WebCodecs frames, so the native encoder is used. '
-                    + 'Bitrate, frame rate and resolution still apply.',
-            };
+            return { engine: 'native', reason: unavailable };
         }
         return { engine: 'webcodecs', reason: 'WebCodecs engine available.' };
     }
@@ -525,7 +561,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const mime = String(mimeType).toLowerCase();
         if (/(rtx|red|ulpfec|flexfec)/.test(mime)) return 100;
         if (mime.includes('h264')) return 100;
-        if (mime.includes('av01')) return 80;
+        // Chrome's capabilities/SDP name AV1 "video/AV1" or "AV1"; WebCodecs
+        // codec strings use "av01". Matching only av01 missed the native
+        // spelling entirely and left the browser's own codec order in charge.
+        if (mime.includes('av1') || mime.includes('av01')) return 80;
         if (mime.includes('vp9')) return 70;
         if (mime.includes('vp8')) return 60;
         return 50;
@@ -545,7 +584,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 // The requested family must outrank everything else that is not
                 // a repair payload, or the browser will quietly pick its own.
                 if (family === 'h264' && m.includes('h264')) return 900;
-                if (family === 'av1' && (m.includes('av01'))) return 900;
+                // Native capabilities/SDP spell AV1 two ways; see
+                // nativeCodecScore. Matching only av01 made a selected AV1
+                // stream fall back to whatever the browser ranked first.
+                if (family === 'av1' && (m.includes('av1') || m.includes('av01'))) return 900;
                 if (family === 'vp9' && m.includes('vp9')) return 900;
                 if (family === 'vp8' && m.includes('vp8')) return 900;
                 return 10;
@@ -571,6 +613,21 @@ document.addEventListener('DOMContentLoaded', () => {
         canvasStream: null,
         audioContext: null,
         audioDest: null,
+        audioNodes: [],
+        // Per-source gain nodes, keyed by source name. Storing them by NAME is
+        // load-bearing: the previous fixed-index lookup assumed both the
+        // system and mic tracks existed, so a mic-only broadcast (the common
+        // screen-share-without-audio case) pushed [micSource, micGain] into
+        // audioNodes and then looked for audioNodes[3] on every fader move —
+        // undefined. The mic slider did nothing with no error anywhere.
+        audioGains: { system: null, mic: null },
+        // Capture requests are async, so a double-click used to start TWO
+        // getUserMedia calls before either resolved. The last one won the
+        // state variable and the first stream was left live but unreferenced,
+        // i.e. a microphone/camera that stayed on after "Disable".
+        screenPending: false,
+        cameraPending: false,
+        micPending: false,
         // Live publish session
         state: 'idle',          // idle | preparing | live | error
         engine: 'native',
@@ -667,76 +724,94 @@ document.addEventListener('DOMContentLoaded', () => {
     // or screen in the browser's own dialog, exactly as they would in OBS's
     // "Display Capture" source.
     async function pickScreenSource() {
+        if (state.screenPending) return null;
         if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
             log('This browser cannot capture the screen. Use Chrome or Edge.', 'error');
             return null;
         }
-        let stream;
+        state.screenPending = true;
         try {
-            stream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    frameRate: { ideal: 60 },
-                    // The cursor is a capture-time setting: when off, Chrome
-                    // omits the pointer from the captured frames entirely, which
-                    // is both cheaper to encode and less distracting for slides.
-                    cursor: settings.showCursor ? 'always' : 'never',
-                },
-                audio: {
-                    echoCancellation: false,
-                    noiseSuppression: false,
-                    autoGainControl: false,
-                },
-                systemAudio: 'include',
-                selfBrowserSurface: 'exclude',
-                surfaceSwitching: 'include',
-                monitorTypeSurfaces: 'include',
-                preferCurrentTab: false,
-            });
-        } catch (err) {
-            // AbortError is the user closing the picker; that is not an error.
-            if (err && err.name === 'AbortError') {
-                log('Screen picker dismissed.');
-            } else {
-                log('Could not start screen capture: ' + (err && err.message ? err.message : err), 'error');
+            let stream;
+            try {
+                stream = await navigator.mediaDevices.getDisplayMedia({
+                    video: {
+                        frameRate: { ideal: 60 },
+                        // The cursor is a capture-time setting: when off, Chrome
+                        // omits the pointer from the captured frames entirely, which
+                        // is both cheaper to encode and less distracting for slides.
+                        cursor: settings.showCursor ? 'always' : 'never',
+                    },
+                    audio: {
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false,
+                    },
+                    systemAudio: 'include',
+                    selfBrowserSurface: 'exclude',
+                    surfaceSwitching: 'include',
+                    monitorTypeSurfaces: 'include',
+                    preferCurrentTab: false,
+                });
+            } catch (err) {
+                // AbortError is the user closing the picker; that is not an error.
+                if (err && err.name === 'AbortError') {
+                    log('Screen picker dismissed.');
+                } else {
+                    log('Could not start screen capture: ' + (err && err.message ? err.message : err), 'error');
+                }
+                return null;
             }
-            return null;
+
+            stopStream(state.screenStream);
+            state.screenStream = stream;
+
+            const videoTrack = stream.getVideoTracks()[0];
+            if (videoTrack) {
+                const info = videoTrack.getSettings ? videoTrack.getSettings() : {};
+                el['studio-screen-name'].textContent = describeSurface(info.displaySurface || 'unknown');
+                el['studio-screen-meta'].textContent =
+                    (info.width || '?') + 'x' + (info.height || '?')
+                    + ' source, captured at ' + (info.frameRate || '?') + ' fps';
+
+                // The browser's own "Stop sharing" bar ends the track without any
+                // JS call. Without this listener the studio would keep publishing a
+                // frozen last frame while claiming to be LIVE.
+                //
+                // The stale check matters when a source is REPLACED: an ended
+                // event queued by the old track must not stop the new source's
+                // broadcast.
+                videoTrack.addEventListener('ended', () => {
+                    if (state.screenStream !== stream) return;
+                    log('Screen sharing was stopped by the browser.', 'warn');
+                    stopBroadcast('Screen sharing ended.');
+                });
+            }
+
+            const audioTrack = stream.getAudioTracks()[0];
+            if (audioTrack) {
+                el['mix-system'].disabled = false;
+                el['mix-system-value'].textContent = 'on';
+                log('System audio is available for this source.');
+            } else {
+                el['mix-system'].disabled = true;
+                el['mix-system-value'].textContent = 'none';
+                log('No system audio on this source (tick "Share audio" in the picker for sound).');
+            }
+
+            state.screenVideo = attachVideoElement(videoTrack);
+            el['studio-preview-placeholder'].style.display = 'none';
+            startCompositor();
+
+            // The system-audio track belongs to the captured stream, so
+            // replacing the source must rebuild the per-source mix nodes. This
+            // used to happen only inside startBroadcast(), which meant picking
+            // a different screen while live kept the OLD (now stopped) audio
+            // track wired up and never heard the new one.
+            reconnectLiveAudio(Boolean(audioTrack));
+            return stream;
+        } finally {
+            state.screenPending = false;
         }
-
-        stopStream(state.screenStream);
-        state.screenStream = stream;
-
-        const videoTrack = stream.getVideoTracks()[0];
-        if (videoTrack) {
-            const info = videoTrack.getSettings ? videoTrack.getSettings() : {};
-            el['studio-screen-name'].textContent = describeSurface(info.displaySurface || 'unknown');
-            el['studio-screen-meta'].textContent =
-                (info.width || '?') + 'x' + (info.height || '?')
-                + ' source, captured at ' + (info.frameRate || '?') + ' fps';
-
-            // The browser's own "Stop sharing" bar ends the track without any
-            // JS call. Without this listener the studio would keep publishing a
-            // frozen last frame while claiming to be LIVE.
-            videoTrack.addEventListener('ended', () => {
-                log('Screen sharing was stopped by the browser.', 'warn');
-                stopBroadcast('Screen sharing ended.');
-            });
-        }
-
-        const audioTrack = stream.getAudioTracks()[0];
-        if (audioTrack) {
-            el['mix-system'].disabled = false;
-            el['mix-system-value'].textContent = 'on';
-            log('System audio is available for this source.');
-        } else {
-            el['mix-system'].disabled = true;
-            el['mix-system-value'].textContent = 'none';
-            log('No system audio on this source (tick "Share audio" in the picker for sound).');
-        }
-
-        state.screenVideo = attachVideoElement(videoTrack);
-        el['studio-preview-placeholder'].style.display = 'none';
-        startCompositor();
-        return stream;
     }
 
     function describeSurface(surface) {
@@ -760,7 +835,9 @@ document.addEventListener('DOMContentLoaded', () => {
         return video;
     }
     async function toggleCamera() {
+        if (state.cameraPending) return;
         if (state.cameraStream) {
+            const wasCameraScene = state.scene === 'camera';
             stopStream(state.cameraStream);
             releaseVideoElement(state.cameraVideo);
             state.cameraStream = null;
@@ -768,8 +845,22 @@ document.addEventListener('DOMContentLoaded', () => {
             el['studio-camera-meta'].textContent = 'Off';
             el['btn-toggle-camera'].textContent = 'Enable';
             log('Camera disabled.');
+            // Camera-only with the camera just removed would publish black.
+            // Move to the screen if there is one; otherwise say so instead of
+            // leaving a silently black frame behind.
+            if (wasCameraScene) {
+                if (state.screenStream) {
+                    setScene('screen');
+                    log('Switched to the Screen scene because camera-only has no source now.', 'warn');
+                } else {
+                    log('Camera-only has no camera now. Pick a screen or re-enable the camera.', 'warn');
+                }
+            }
             return;
         }
+        state.cameraPending = true;
+        const button = el['btn-toggle-camera'];
+        button.disabled = true;
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
@@ -780,14 +871,16 @@ document.addEventListener('DOMContentLoaded', () => {
             el['studio-camera-meta'].textContent = 'On (PiP)';
             el['btn-toggle-camera'].textContent = 'Disable';
             log('Camera enabled.');
-            // Camera-only needs a camera; fall back rather than publishing black.
-            if (state.scene === 'camera') setScene('pip');
         } catch (err) {
             log('Could not open the camera: ' + (err && err.message ? err.message : err), 'error');
+        } finally {
+            state.cameraPending = false;
+            button.disabled = false;
         }
     }
 
     async function toggleMic() {
+        if (state.micPending) return;
         if (state.micStream) {
             stopStream(state.micStream);
             state.micStream = null;
@@ -796,8 +889,15 @@ document.addEventListener('DOMContentLoaded', () => {
             el['mix-mic'].disabled = true;
             el['mix-mic-value'].textContent = '--';
             log('Microphone disabled.');
+            // Remove the now-dead source from the mix. Without this the old
+            // source node stayed connected for the rest of the session, and
+            // re-enabling the mic created a track nothing was listening to.
+            reconnectLiveAudio(false);
             return;
         }
+        state.micPending = true;
+        const button = el['btn-toggle-mic'];
+        button.disabled = true;
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: false,
@@ -816,10 +916,18 @@ document.addEventListener('DOMContentLoaded', () => {
             el['studio-mic-meta'].textContent = 'On';
             el['btn-toggle-mic'].textContent = 'Disable';
             el['mix-mic'].disabled = false;
-            el['mix-mic-value'].textContent = 'on';
+            el['mix-mic-value'].textContent = el['mix-mic'].value + '%';
             log('Microphone enabled.');
+            // If the session already carries an audio track, this makes the
+            // mic audible immediately. If it started video-only there is no
+            // audio sender to feed, and the helper says so instead of leaving
+            // the UI claiming the mic is on when viewers hear nothing.
+            reconnectLiveAudio(true);
         } catch (err) {
             log('Could not open the microphone: ' + (err && err.message ? err.message : err), 'error');
+        } finally {
+            state.micPending = false;
+            button.disabled = false;
         }
     }
 
@@ -970,6 +1078,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const OPUS_SAMPLE_RATE = 48000;
 
     async function buildAudioGraph() {
+        // A closed context cannot create nodes or a destination. The page never
+        // closes it, but the browser can, and keeping a dead context made every
+        // later connectAudioSources() throw.
+        if (state.audioContext && state.audioContext.state === 'closed') {
+            state.audioContext = null;
+            state.audioDest = null;
+        }
         // An ended destination track means the mix output is dead. This should
         // be unreachable — nothing stops that track any more — but the failure
         // it causes is silent and permanent (a broadcast with the UI showing
@@ -983,7 +1098,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 state.audioDest = null;
             }
         }
-        if (state.audioContext) return state.audioContext;
+        if (state.audioContext) {
+            // The destination is what native publishing captures. Clearing it
+            // above without creating a replacement left it null and made the
+            // next gain.connect(null) throw after the UI had already entered
+            // "Starting...", so the session hung until the 75 s watchdog.
+            if (!state.audioDest) {
+                state.audioDest = state.audioContext.createMediaStreamDestination();
+            }
+            return state.audioContext;
+        }
         const AudioCtor = window.AudioContext || window.webkitAudioContext;
         if (!AudioCtor) {
             log('WebAudio is unavailable; this browser cannot mix audio.', 'error');
@@ -1012,22 +1136,54 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
         state.audioNodes = [];
+        state.audioGains = { system: null, mic: null };
 
         const systemTrack = state.screenStream ? state.screenStream.getAudioTracks()[0] : null;
         const micTrack = state.micStream ? state.micStream.getAudioTracks()[0] : null;
 
-        const add = (track, faderEl) => {
+        const add = (kind, track, faderEl) => {
             if (!track) return;
             const source = context.createMediaStreamSource(new MediaStream([track]));
             const gain = context.createGain();
             // Faders run 0..150%, so 100 maps to unity gain.
             gain.gain.value = (parseInt(faderEl.value, 10) || 0) / 100;
+            // Register before connecting: if a connect throws half-way, the
+            // teardown path still sees and releases both nodes.
+            state.audioNodes.push(source, gain);
+            state.audioGains[kind] = gain;
             source.connect(gain);
             gain.connect(state.audioDest);
-            state.audioNodes.push(source, gain);
         };
-        add(systemTrack, el['mix-system']);
-        add(micTrack, el['mix-mic']);
+        add('system', systemTrack, el['mix-system']);
+        add('mic', micTrack, el['mix-mic']);
+    }
+
+    // A source was toggled or replaced while a session may be running. If the
+    // session already sends an audio track, rebuild the per-source graph so the
+    // change is heard immediately. If it started video-only there is no sender
+    // to feed, and pretending otherwise is how the mute-mic-reporting-On bug
+    // happens; say so instead.
+    function reconnectLiveAudio(wantAudio) {
+        if (state.state !== 'live' && state.state !== 'preparing') return;
+        if (state.state === 'live' && !state.audioSender) {
+            if (wantAudio) {
+                log('This broadcast is publishing video only. Stop and press Go live '
+                    + 'again to include audio.', 'warn');
+            }
+            return;
+        }
+        try {
+            const pending = connectAudioSources();
+            if (pending && typeof pending.catch === 'function') {
+                pending.catch((err) => {
+                    log('Could not rebuild the audio mix: '
+                        + (err && err.message ? err.message : err), 'error');
+                });
+            }
+        } catch (err) {
+            log('Could not rebuild the audio mix: '
+                + (err && err.message ? err.message : err), 'error');
+        }
     }
 
     function audioSourceCount() {
@@ -1038,7 +1194,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Sample-accurate tap for the WebCodecs engine. Returns a node whose
     // port emits {timestamp, channels:[Float32Array]} every 10 ms.
-    async function attachPcmTap() {
+    async function attachPcmTap(token) {
         const context = state.audioContext;
         if (!context || !supports.audioWorklet) return null;
         if (state.audioWorkletNode) return state.audioWorkletNode;
@@ -1049,6 +1205,10 @@ document.addEventListener('DOMContentLoaded', () => {
             log('Could not load the audio tap: ' + (err && err.message ? err.message : err), 'error');
             return null;
         }
+        // stopBroadcast() may have run while the module was loading. Creating
+        // the node now would connect it to the persistent mix destination and
+        // leave it processing every 10 ms for a session that no longer exists.
+        if (token !== undefined && token !== state.sessionToken) return null;
 
         const node = new AudioWorkletNode(context, 'studio-pcm-tap', {
             numberOfInputs: 1,
@@ -1106,7 +1266,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return config;
     }
 
-    async function createVideoEncoder() {
+    async function createVideoEncoder(token) {
         const config = videoEncoderConfig();
         // isConfigSupported is the authority on what this machine can encode.
         // Probing first means an unsupported combination (a 4K AV1 level the
@@ -1119,6 +1279,11 @@ document.addEventListener('DOMContentLoaded', () => {
             log('Encoder probe failed: ' + (err && err.message ? err.message : err), 'error');
             return null;
         }
+        // A stop during the probe bumps the token and has already walked the
+        // state a teardown can see. Constructing the encoder now would assign
+        // it to a dead session, where nothing would ever close it or its
+        // hardware session.
+        if (token !== undefined && token !== state.sessionToken) return null;
         if (!support || !support.supported) {
             log('This browser cannot encode ' + config.codec + ' at '
                 + config.width + 'x' + config.height + '.', 'error');
@@ -1308,13 +1473,16 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
-    async function createAudioEncoder() {
+    async function createAudioEncoder(token) {
         let support = { supported: false };
         try {
             support = await AudioEncoder.isConfigSupported(audioEncoderConfig());
         } catch (err) {
             return null;
         }
+        // Same race as the video encoder: the probe is the only await, so a
+        // token change here means the session was torn down while it ran.
+        if (token !== undefined && token !== state.sessionToken) return null;
         if (!support || !support.supported) return null;
 
         const encoder = new AudioEncoder({
@@ -1397,11 +1565,10 @@ document.addEventListener('DOMContentLoaded', () => {
         return worker;
     }
 
-    // A sender needs a real MediaStreamTrack to exist. The stream we publish
-    // is WebCodecs output, so the track attached here is a BLANK canvas
-    // capture: it satisfies the sender, and because broadcast.js transfers its
-    // own TransformStream into the RTCRtpScriptTransform, anything the built-in
-    // encoder produces for it is discarded by the browser in favour of ours.
+    // A sender needs a real MediaStreamTrack to exist. This blank canvas track
+    // exists only to create the sender on the DISABLED WebCodecs path; it is
+    // not a source, and the browser's encoder output for it is not replaced by
+    // anything (no shipping API can inject WebCodecs chunks into a sender).
     //
     // The capture rate is 0, not 1. A previous revision used 1 fps, which
     // reliably produced one real frame per second from this track — feeding
@@ -1475,24 +1642,25 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // DISABLED. This function is unreachable while
+    // WEBCODECS_SENDER_INJECTION_SUPPORTED is false. It is kept so the intended
+    // architecture is visible if a sender-encoded-source API ever ships, but
+    // do not mistake the transfer list for injection:
+    //
+    //   - EncodedVideoChunk is not structured-cloneable, so it cannot travel
+    //     over this writer/port either;
+    //   - the constructor's transfer list is delivered to
+    //     `transformer.options`, while `transformer.readable` remains the
+    //     browser's OWN encoder output;
+    //   - `transformer.writable` accepts only frames owned by that encoder.
+    //     Writing a raw EncodedVideoChunk/Uint8Array was verified in Chrome 155
+    //     to throw "TypeError: Invalid frame".
+    //
+    // The main-thread writer below therefore has no consumer for its data.
     function attachTransform(sender, name) {
         const worker = ensureTransformWorker();
-
-        // EncodedVideoChunk / EncodedAudioChunk are NOT structured-cloneable,
-        // so they cannot travel over a MessagePort: postMessage rejects them
-        // with a DataCloneError before any bytes move. The only way to hand
-        // encoded media to an RTCRtpSender is the transfer argument of the
-        // RTCRtpScriptTransform constructor.
-        //
-        // So a TransformStream is created HERE, on the main thread. Its
-        // readable side is transferred into the transform, which means the
-        // worker receives it as `event.transformer.readable` and can pipe it
-        // straight into Chrome's packetizer. We keep the writable side and
-        // write chunks to it from the encoder output callbacks.
         const transport = new TransformStream();
-
         sender.transform = new RTCRtpScriptTransform(worker, { name }, [transport.readable]);
-
         const writer = transport.writable.getWriter();
         if (name === 'video') state.videoWriter = writer;
         else state.audioWriter = writer;
@@ -1679,20 +1847,45 @@ document.addEventListener('DOMContentLoaded', () => {
         applyOutputResolution();
         startCompositor();
 
+        // The TURN/STUN answer is independent of the local media setup, and a
+        // cold relay mint costs a round trip. Start it now so that latency
+        // overlaps the audio graph and canvas work instead of extending the
+        // "Starting..." window.
+        const iceServersPromise = fetchIceServers();
+
         // The audio graph is built for both engines: native captures its
         // MediaStreamDestination track, WebCodecs taps it through the worklet.
-        await buildAudioGraph();
-        if (state.audioContext && state.audioContext.state === 'suspended') {
-            try { await state.audioContext.resume(); } catch (err) { /* resumed by gesture */ }
+        // Failures here used to propagate out of a click handler that ignored
+        // the promise, leaving the page on "Starting..." with a live watchdog
+        // and no obvious recovery; stop cleanly instead.
+        try {
+            await buildAudioGraph();
+            if (token !== state.sessionToken) return;
+            if (state.audioContext && state.audioContext.state === 'suspended') {
+                try { await state.audioContext.resume(); } catch (err) { /* resumed by gesture */ }
+            }
+            // A stop during the resume cannot be seen by stopBroadcast() yet: it
+            // cleans state.canvasStream, and there is no stream to clean. Bail
+            // before creating one that the teardown will never see.
+            if (token !== state.sessionToken) return;
+            await connectAudioSources();
+        } catch (error) {
+            if (token !== state.sessionToken) return;
+            log('Could not start the audio mixer: '
+                + (error && error.message ? error.message : error), 'error');
+            stopBroadcast('Start failed.');
+            return;
         }
-        await connectAudioSources();
 
         const size = evenDimensionsFor(settings.width, settings.height);
         const canvas = el['studio-canvas'];
-        state.canvasStream = canvas.captureStream(settings.framerate);
 
-        const iceServers = await fetchIceServers();
+        const iceServers = await iceServersPromise;
         if (token !== state.sessionToken) return;
+        // Capture only once this attempt is known to be current. stopBroadcast()
+        // during any await above has already run, so a stream captured earlier
+        // would stay live and unreferenced for the rest of the page's life.
+        state.canvasStream = canvas.captureStream(settings.framerate);
         const pc = new RTCPeerConnection({ iceServers, bundlePolicy: 'max-bundle' });
         state.peerConnection = pc;
 
@@ -1783,14 +1976,18 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    /* ---- Track setup: WebCodecs engine ----------------------------------
-       Blank tracks create the senders; the transform worker replaces their
-       encoded output with our WebCodecs chunks. The transforms are attached
-       after addTransceiver but before the first encoded frame, so no frame is
-       lost to the race the MDN example warns about.
+    /* ---- Track setup: WebCodecs engine (DISABLED) -----------------------
+       resolveEngine() never selects this path today. It created blank tracks
+       to make the senders, then expected the transform worker to replace the
+       sender's encoded output with WebCodecs chunks — which no shipping API
+       allows. Kept behind WEBCODECS_SENDER_INJECTION_SUPPORTED so a future
+       browser can re-enable it; see attachTransform() for the API evidence.
     */
     async function setupWebCodecsTracks(pc, size, token) {
-        const encoder = await createVideoEncoder();
+        const encoder = await createVideoEncoder(token);
+        // A stop during the probe is a teardown, not an encoder failure: return
+        // without throwing so the normal stop path does not also log one.
+        if (token !== state.sessionToken) return;
         if (!encoder) {
             throw new Error('This browser cannot encode the selected codec at this resolution.');
         }
@@ -1802,8 +1999,10 @@ document.addEventListener('DOMContentLoaded', () => {
         attachTransform(videoTransceiver.sender, 'video');
 
         if (audioSourceCount() > 0) {
-            const tap = await attachPcmTap();
-            const audioEncoder = await createAudioEncoder();
+            const tap = await attachPcmTap(token);
+            if (token !== state.sessionToken) return;
+            const audioEncoder = tap ? await createAudioEncoder(token) : null;
+            if (token !== state.sessionToken) return;
             if (!tap || !audioEncoder) {
                 // Video-only is still a working broadcast; silence is not a
                 // failure of the video path, so degrade instead of aborting.
@@ -1880,8 +2079,11 @@ document.addEventListener('DOMContentLoaded', () => {
         // The Location header is the session resource; the DELETE at teardown
         // frees the publisher immediately instead of waiting for readTimeout.
         const location = response.headers.get('Location');
-        if (location) {
-            state.whipSessionUrl = new URL(location, window.location.origin).toString();
+        const sessionUrl = location
+            ? new URL(location, window.location.origin).toString()
+            : null;
+        if (sessionUrl) {
+            state.whipSessionUrl = sessionUrl;
         } else {
             log('No Location header from MediaMTX; the session cannot be released early.', 'warn');
         }
@@ -1890,10 +2092,14 @@ document.addEventListener('DOMContentLoaded', () => {
         if (token !== state.sessionToken) {
             // A late answer for a session that no longer exists still has to
             // release its server-side resource, or MediaMTX keeps publishing to
-            // nobody until the read timeout expires.
-            if (state.whipSessionUrl) {
-                fetch(state.whipSessionUrl, { method: 'DELETE', keepalive: true }).catch(() => {});
-                state.whipSessionUrl = null;
+            // nobody until the read timeout expires. Delete the URL captured
+            // for THIS request, never state.whipSessionUrl: a later start may
+            // own that field by now, and deleting it would tear down the new
+            // broadcast. A duplicate DELETE of a session stopBroadcast already
+            // released is a harmless 404.
+            if (sessionUrl) {
+                fetch(sessionUrl, { method: 'DELETE', keepalive: true }).catch(() => {});
+                if (state.whipSessionUrl === sessionUrl) state.whipSessionUrl = null;
             }
             return;
         }
@@ -2102,6 +2308,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
                 state.audioNodes = [];
             }
+            state.audioGains = { system: null, mic: null };
         }
 
         if (wasLive) {
@@ -2238,9 +2445,12 @@ document.addEventListener('DOMContentLoaded', () => {
     // Fader changes must take effect live, so they bypass the next-Go-live rule
     // that governs encoder settings.
     function applyFader(which, value) {
-        if (!state.audioContext || !state.audioNodes) return;
-        const index = which === 'system' ? 0 : 1;
-        const gain = state.audioNodes[index * 2 + 1];
+        if (!state.audioContext || !state.audioGains) return;
+        // Look the gain up by SOURCE NAME. The old indexing assumed the system
+        // and mic tracks were both present, so in a mic-only mix the mic gain
+        // sat at index 1 and this read index 3 — undefined — and the slider
+        // silently did nothing.
+        const gain = state.audioGains[which];
         if (gain && gain.gain) {
             gain.gain.value = (parseInt(value, 10) || 0) / 100;
         }

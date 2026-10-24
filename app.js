@@ -982,67 +982,36 @@ document.addEventListener('DOMContentLoaded', () => {
         return ((samplesDurationDeltaSec - wallSec) / wallSec) * 1e6;
     }
 
-    // True network loss, as opposed to the raw `dLost / (dRx + dLost)` ratio the
-    // stats loop used to publish.
+    // Network loss from getStats, already net of RTX repair.
     //
-    // Two spec facts make that ratio wrong in both directions:
-    //   1. `packetsReceived` is defined to INCLUDE retransmissions, so a link
-    //      that loses 20% of its packets and repairs 100% of them by RTX reads
-    //      ~0% loss. RTX is negotiated and working, so the viewer is smooth and
-    //      must NOT be told it is stressed.
-    //   2. `packetsLost` is the count of packets the receiver never got, which
-    //      already excludes repaired ones, so the ratio is not "loss", it is
-    //      "unrecovered loss" — but the retransmission is double-counted in the
-    //      denominator's favour.
+    // Two spec facts fix the arithmetic:
+    //   1. `packetsReceived` INCLUDES retransmissions (W3C webrtc-stats:
+    //      "This includes retransmissions"; RTX does not appear as a separate
+    //      inbound-rtp object). A repaired packet therefore appears in the
+    //      received count.
+    //   2. `packetsLost` is computed per RFC 3550 as expected minus received,
+    //      so a repaired packet fills its sequence-number gap and stops being
+    //      lost. Subtracting `retransmittedPacketsReceived` again double-counts
+    //      the repair: it understates real loss, keeps a genuinely congested
+    //      viewer on a bitrate the link cannot carry, and leaves the stutter
+    //      the ABR ladder exists to remove.
     //
-    // Meanwhile `packetsDiscarded` is the packet the JITTER BUFFER threw away
-    // locally, and MediaMTX's reader queue overflow (documented in
-    // _research/bwe.md: "a circular buffer that stores outgoing packets and
-    // drops packets if full") shows up as a burst of loss that no amount of
-    // receiver-side buffering can repair. Treating it separately lets the ABR
-    // ladder tell "the link is thin" (loss, which a lower rendition fixes) from
-    // "the buffer is too small" (discard, which a larger target fixes).
+    // `packetsDiscarded` is also a subset of `packetsReceived` (the packet
+    // arrived and the jitter buffer then rejected it as late/early), so adding
+    // it to the denominator double-counts it. Discards are a buffer problem,
+    // not a thin link; they remain visible through the picture-loss/QoE
+    // telemetry and must not dilute the loss rate that drives ABR.
     //
-    // Returns NET loss as a fraction of everything the link OFFERED, so the
-    // number keeps the same physical meaning the ABR thresholds were tuned
-    // against: "what fraction of the link did we fail to receive?"
-    //
-    // The denominator MUST include `dReceived`. An earlier version of this
-    // function divided by `lost + discarded` alone, which measures "the share
-    // of lost packets that RTX failed to repair" — a repair-rate, not a loss
-    // rate — and it is off by one to two orders of magnitude at realistic
-    // volumes. Measured at ~625 packets/s: 3 lost with 2 repaired reads 33.3%
-    // under that denominator and 0.16% under this one. Since 33% is above the
-    // 5% ABR threshold and the 2.5% stress threshold, a viewer on a link whose
-    // picture is perfectly fine would be pinned to the 3000k rendition, held at
-    // the 350ms buffer, and — because `abrCalm` needs loss < 2% for 20
-    // CONSECUTIVE ticks and such a link never dips that low — never allowed to
-    // upgrade back for the rest of the session. The whole point of netting out
-    // retransmissions is to stop punishing a viewer for loss the transport
-    // already repaired; dividing by the loss alone threw that away.
-    //
-    // `dReceived` is the received count for the window, which per spec
-    // INCLUDES retransmissions — and that is exactly what makes the ratio
-    // correct: repaired packets land in the numerator's absence and the
-    // denominator, which is what "arrived" should mean.
+    // Returns lost / (received + lost) as a percentage. The parameters are
+    // kept in the signature because the stats loop and unit tests pass the
+    // whole row; retransmissions and discards are deliberately unused here.
     // (Pure — unit-tested in js_checks.js `network-loss-accounting`.)
     function networkLossPct(dLost, dRetransmitted, dDiscarded, dReceived) {
         const lost = Number.isFinite(dLost) ? Math.max(0, dLost) : 0;
-        const retx = Number.isFinite(dRetransmitted) ? Math.max(0, dRetransmitted) : 0;
-        // A retransmission can only repair a loss, never exceed it. Clamping
-        // keeps a counter that resets/wraps on stream restart (RTX counts are
-        // per-SSRC and drop to 0 when the source re-keys) from producing a
-        // negative numerator and a nonsense negative loss percentage.
-        const netLost = Math.max(0, lost - retx);
-        const discarded = Number.isFinite(dDiscarded) ? Math.max(0, dDiscarded) : 0;
         const received = Number.isFinite(dReceived) ? Math.max(0, dReceived) : 0;
-        // Everything the link put on the wire this window: what arrived, plus
-        // what did not, plus what arrived and was then discarded locally. A
-        // local discard is still a picture the viewer did not get, so it has to
-        // be in the offered total even though it never appears in packetsLost.
-        const offered = received + lost + discarded;
+        const offered = received + lost;
         if (offered <= 0) return 0;
-        return Math.min(100, (netLost / offered) * 100);
+        return Math.min(100, (lost / offered) * 100);
     }
 
     // Picture-loss ratio — the standard broadcast QoE metric, and the one number
@@ -2159,7 +2128,13 @@ document.addEventListener('DOMContentLoaded', () => {
             const dpTracks = dpSource && Array.isArray(dpSource.tracks) ? dpSource.tracks : [];
             const dpSourceIsAv1 = dpTracks.some((t) => typeof t === 'string' && t.toUpperCase() === 'AV1');
             let hwPath = null;
-            if (dpSourceIsAv1 && activeStreamPath === 'live') {
+            // An AV1 source can put an AV1-capable viewer on `live-av1` too:
+            // when the source audio is AAC, that rendition is the only
+            // full-sound AV1 path. A software AV1 decoder burns out on either
+            // AV1 path, so both must be able to step onto the H264 transcode.
+            // The old guard only handled `live`, leaving the AAC/audio-rescue
+            // viewer with no way out of the decoding it could not sustain.
+            if (dpSourceIsAv1 && (activeStreamPath === 'live' || activeStreamPath === 'live-av1')) {
                 const h264Ready = renditionPathsItems.some((item) => item && item.name === 'live-h264'
                     && (item.ready === true || item.online === true));
                 hwPath = h264Ready ? 'live-h264' : null;
@@ -3771,7 +3746,16 @@ document.addEventListener('DOMContentLoaded', () => {
             const result = await navigator.mediaCapabilities.decodingInfo({
                 type: 'webrtc',
                 video: {
-                    contentType: 'video/AV1; profile="0"; level=13; tier=0;',
+                    // A bare, valid MIME type. The old value
+                    // 'video/AV1; profile="0"; level=13; tier=0;' is not a
+                    // MediaCapabilities contentType: Chrome throws on it, the
+                    // catch below turned that into `null`, and the AV1 decode
+                    // quality gate was silently disabled on every browser. The
+                    // width/height/framerate fields below are what the decoder
+                    // smoothness decision actually uses; codec parameters
+                    // belong in a `codecs="av01..."` parameter, not raw
+                    // profile/level keys.
+                    contentType: 'video/AV1',
                     width: 1920,
                     height: 1080,
                     bitrate: 20000000,
@@ -3800,8 +3784,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // a browser WITHOUT H265 receive support must never be sent to the native
     // path of an H265 source — MediaMTX would answer the handshake with a
     // stream the decoder cannot touch (connected, black, forever). Such a
-    // viewer rides the bridge's live-av1 rendition exactly like a legacy
-    // browser on an AV1 source, waiting for it when it is still starting.
+    // viewer rides the bridge's live-av1 rendition ONLY if it also decodes AV1
+    // smoothly; otherwise no compatible rendition exists and the caller waits
+    // instead of opening an undecodable session.
     //
     // Audio rescue: MediaMTX serves the AAC audio of an RTMP/SRT source to
     // nobody over WebRTC, so the native path plays VIDEO-ONLY for viewers of
@@ -3868,11 +3853,14 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         // H265 source + a browser without H265 receive capability: the native
         // path is undecodable there, so route it to the AV1 rendition the
-        // bridge publishes for H265 sources (it also carries the rescued
-        // Opus audio of an RTMP/SRT broadcast), waiting when it is not up.
+        // bridge publishes for H265 sources — but ONLY when this browser can
+        // also decode AV1 smoothly. The old branch returned live-av1
+        // unconditionally, so a browser with neither decoder was handed an AV1
+        // stream it could not decode: a connected black screen instead of the
+        // "connecting / incompatible" state. Return null and let the poll wait.
         const sourceIsH265 = upperTracks.includes('H265') || upperTracks.includes('HEVC');
         if (sourceIsH265 && h265Capable === false) {
-            return ready('live-av1') ? 'live-av1' : null;
+            return (av1Capable && av1Smooth !== false && ready('live-av1')) ? 'live-av1' : null;
         }
         // H264 (or other WebRTC-playable) source: when its audio cannot reach
         // WebRTC readers, the audio-rescue rendition is the only path with
@@ -4576,19 +4564,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
                     // Interval packet loss feeds the adaptive buffer supervisor.
                     //
-                    // The old reading was `dLost / (dRx + dLost)`, which is wrong
-                    // in the one direction that matters most: `packetsReceived`
-                    // is defined by the stats spec to INCLUDE retransmissions,
-                    // so a link dropping 20% of its packets that RTX then repairs
-                    // reads ~0% loss. RTX is negotiated and working, that viewer is
-                    // genuinely smooth, and the ABR ladder must not tear its
-                    // rendition down for a problem it does not have. Meanwhile a
-                    // MediaMTX reader-queue overflow — a real, unrepairable drop —
-                    // was invisible as a separate cause. networkLossPct() nets
-                    // retransmissions out of the loss term and charges local
-                    // jitter-buffer discards to the same denominator, so what the
-                    // supervisor sees is the loss that actually reached the
-                    // decoder. See networkLossPct() for the full derivation.
+                    // `packetsReceived` includes retransmissions and
+                    // `packetsLost` is computed from expected-minus-received, so
+                    // the counters are ALREADY net of RTX repair. Subtracting
+                    // retransmissions again (the previous form) made a
+                    // congested link look healthy and kept viewers on a
+                    // bitrate they could not carry. Local jitter-buffer
+                    // discards are a subset of received packets and stay out of
+                    // the denominator for the same reason. See
+                    // networkLossPct() for the spec citations.
                     const rxNow = videoStats.packetsReceived || 0;
                     const lostNow = videoStats.packetsLost || 0;
                     const retxNow = Number.isFinite(videoStats.retransmittedPacketsReceived)
@@ -4623,8 +4607,13 @@ document.addEventListener('DOMContentLoaded', () => {
                         const lostDelta = Math.max(0, dLost);
                         const discardDelta = Math.max(0, dDiscarded);
                         lastLossPct = networkLossPct(lostDelta, dRetx, discardDelta, dRx);
-                        // NACK effectiveness. `dRetx` is how much of the loss the
-                        // retransmission path actually repaired in this window.
+                        // NACK effectiveness. `packetsLost` is net of repair,
+                        // so `dLost` is the UNREPAIRED loss and `dRetx` is the
+                        // repaired count. Their sum is the original loss
+                        // attempt; dividing by `dLost` alone (the old form)
+                        // reported >100% whenever RTX repaired more than
+                        // survived, because the two counters measure disjoint
+                        // sets.
                         // Two failure modes look identical from `packetsLost`
                         // alone and are separated by this number:
                         //   - a low rate with high loss  => RTX is dead (no
@@ -4638,8 +4627,8 @@ document.addEventListener('DOMContentLoaded', () => {
                         // existing loss/jitter controllers, so this is an
                         // observability fix, not a control change.
                         const retxDelta = Math.max(0, dRetx);
-                        lastRepairRatePct = lostDelta > 0
-                            ? Math.min(100, (retxDelta / lostDelta) * 100)
+                        lastRepairRatePct = (lostDelta + retxDelta) > 0
+                            ? Math.min(100, (retxDelta / (lostDelta + retxDelta)) * 100)
                             : null;
                     }
                     lastPacketsReceived = rxNow;
@@ -4730,8 +4719,16 @@ document.addEventListener('DOMContentLoaded', () => {
                             // quiet window.
                             avgPlayoutDelayAt = performance.now();
                         }
-                        // (The DECODE baseline was moved above this block; see emittedDelta.)
+                        // These two baselines MUST advance together. Only the
+                        // delay total used to be assigned, so the emitted total
+                        // stayed at its initial 0 and windowedPlayoutDelayMs()
+                        // hit its `prevEmittedTotal <= 0` guard on EVERY tick.
+                        // The buffer supervisor was therefore blind to real
+                        // playout drift for the whole session.
+                        // (The DECODE baseline is deliberately separate; see
+                        // emittedDelta above.)
                         lastJitterDelayTotal = videoStats.jitterBufferDelay;
+                        lastJitterEmittedTotal = videoStats.jitterBufferEmittedCount;
                         // Accommodation feeds off the measured delay but only
                         // RAISES while late frames are actually being
                         // discarded and the buffer has outgrown the base
@@ -5407,6 +5404,23 @@ document.addEventListener('DOMContentLoaded', () => {
         frozenSince = 0;
     }
 
+    // Stage 1/2 success must be judged on PRESENTATION, not on the element's
+    // playback state. During a decoder stall the element still reports
+    // HAVE_FUTURE_DATA and is not paused while it holds the last decoded frame,
+    // so `readyState >= 3 && !paused` is true for the exact failure recovery
+    // exists to fix. That declared success on the first trip and returned,
+    // which kept Stage 2 (decoder flush) and Stage 3 (session renewal) from
+    // ever running; the only effective repair was the cap branch after
+    // MAX_RECOVERIES no-op cycles, leaving the picture frozen for 15-30s.
+    // requestVideoFrameCallback is the only signal that proves a frame reached
+    // the compositor. Without it lastFrameTime never advances, so the later
+    // stages run instead of guessing that the element is healthy.
+    function freezeRecoveryMadeProgress(startedAt) {
+        return player.readyState >= 3
+            && !player.paused
+            && lastFrameTime > startedAt;
+    }
+
     // Staged 3-Tier Auto-Recovery
     async function triggerFreezeRecovery(reason) {
         if (isRecovering) {
@@ -5489,13 +5503,13 @@ document.addEventListener('DOMContentLoaded', () => {
             // stays pending forever (nothing will ever reach HAVE_FUTURE_DATA),
             // and awaiting it unconditionally would wedge recovery here with
             // isRecovering stuck true — disabling the watchdog for good.
+            const stageStartedAt = performance.now();
             await Promise.race([
                 player.play(),
                 new Promise((resolve) => setTimeout(resolve, 1500))
             ]).catch(() => {});
-            lastFrameTime = performance.now();
             await new Promise(r => setTimeout(r, 150));
-            if (player.readyState >= 3 && !player.paused) {
+            if (freezeRecoveryMadeProgress(stageStartedAt)) {
                 console.log("[FreezeGuard] Stage 1 playout nudge resolved the pause!");
                 isRecovering = false;
                 ensureVideoFrameCallback();
@@ -5541,13 +5555,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     // restored playback — an unchecked return skipped stage 3
                     // (the only stage that can fix a broken session) whenever
                     // the rebind resolved without actually producing frames.
+                    const stageStartedAt = performance.now();
                     await Promise.race([
                         player.play(),
                         new Promise((resolve) => setTimeout(resolve, 1500))
                     ]).catch(() => {});
                     await new Promise(r => setTimeout(r, 150));
-                    if (player.readyState >= 3 && !player.paused) {
-                        lastFrameTime = performance.now();
+                    if (freezeRecoveryMadeProgress(stageStartedAt)) {
                         isRecovering = false;
                         ensureVideoFrameCallback();
                         console.log("[FreezeGuard] Stage 2 decoder flush succeeded!");

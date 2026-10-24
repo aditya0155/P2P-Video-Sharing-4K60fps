@@ -967,7 +967,8 @@ Object.assign(cases, {
         // --- H265 sources (WHIP HEVC ingest): MediaMTX answers a WHEP
         // handshake with the source codec even when the browser has no H265
         // receiver, which would be a connected-but-black session. Browsers
-        // without H265 support must ride the bridge's AV1 rendition instead.
+        // without H265 support ride the bridge's AV1 rendition only when they
+        // can decode AV1 smoothly; otherwise they wait.
         const h265Source = items([
             ready('live', ['H265', 'Opus']),
             { name: 'live-av1', ready: false, online: false }
@@ -978,10 +979,14 @@ Object.assign(cases, {
         ]);
         assertEqual(fn(h265Source, false, true, 'auto', true), 'live',
             'an H265-capable browser plays the native path of an H265 source');
-        assertEqual(fn(h265Source, false, true, 'auto', false), null,
-            'a browser without H265 decode must wait for the AV1 rendition, not take a black session');
-        assertEqual(fn(h265RenditionReady, false, true, 'auto', false), 'live-av1',
-            'a browser without H265 decode takes the AV1 rendition once ready');
+        assertEqual(fn(h265Source, true, true, 'auto', false), null,
+            'an AV1-capable browser without H265 must still wait for the rendition');
+        assertEqual(fn(h265RenditionReady, true, true, 'auto', false), 'live-av1',
+            'a browser without H265 decode takes the AV1 rendition once ready AND AV1-capable');
+        assertEqual(fn(h265RenditionReady, false, true, 'auto', false), null,
+            'a browser with neither H265 nor AV1 must not be handed an AV1 black screen');
+        assertEqual(fn(h265RenditionReady, true, false, 'auto', false), null,
+            'a browser whose AV1 decode is not smooth must wait, not take the AV1 rendition');
         assertEqual(fn(h265RenditionReady, false, true, 'auto', true), 'live',
             'H265 capability keeps the native path even when the rendition exists');
     },
@@ -1632,12 +1637,12 @@ Object.assign(cases, {
         assert(insideGap.writes === 0,
             `a delay inside the dead gap must produce no writes at all, got ${insideGap.writes}`);
     },
-    // `lastLossPct` used to be dLost/(dRx+dLost). packetsReceived INCLUDES
-    // retransmissions per the stats spec, so a link that loses 20% of its
-    // packets and repairs 100% of them by RTX reads ~0% loss — the ABR ladder
-    // then never steps a genuinely-smooth-but-lossy viewer down, and a
-    // MediaMTX queue overflow (a real, unrepairable drop) was invisible as a
-    // separate cause. These pin the corrected accounting.
+    // The two counters are already net of RTX repair: packetsReceived includes
+    // retransmissions, and packetsLost is computed per RFC 3550 from
+    // expected-minus-received. Subtracting retransmittedPacketsReceived a
+    // second time made real congestion look healthy; adding packetsDiscarded
+    // (a subset of received packets) to the denominator did the same. These
+    // pin the spec arithmetic.
     'network-loss-accounting'() {
         const { fn } = compileFunction('networkLossPct', {});
         // ~625 packets/s is a realistic window for a 6Mbps stream, which is the
@@ -1647,61 +1652,46 @@ Object.assign(cases, {
         // THE SCALE TRAP. The denominator is everything the link OFFERED, not
         // just the loss. Dividing by the loss alone measures "the share of lost
         // packets RTX failed to repair" — a repair rate — and inflates the
-        // reading by 1-2 orders of magnitude: 3 lost with 2 repaired reads 33%
-        // that way and 0.16% this way. Since 33% is above the 5% ABR threshold
-        // AND the 2.5% stress threshold, the repair-rate version pins a
+        // reading by 1-2 orders of magnitude: 3 lost in 620 reads 0.48% here,
+        // but 100% under a lost-only denominator. Since 100% is above the 5%
+        // ABR threshold AND the 2.5% stress threshold, that version pins a
         // perfectly smooth viewer to 3000k and to the 350ms buffer, and
         // `abrCalm` (loss < 2% for 20 consecutive ticks) can never be satisfied
         // so they never come back. These three assertions exist to stop that.
-        assert(fn(3, 2, 0, RX) < 1, 'a 0.5%-loss, 80%-repaired link must read as well under 1%');
-        assert(fn(1, 0, 0, RX) < 1, 'one unrepaired packet in 620 must not read as stressed');
+        assert(fn(3, 2, 0, RX) < 1, '3 lost in a 620-packet window must read well under 1%');
+        assert(fn(1, 0, 0, RX) < 1, 'one lost packet in 620 must not read as stressed');
         assert(fn(6, 0, 0, RX) < 1, 'a ~1% real loss rate must read near 1%, not near 100%');
 
-        // The headline behaviour the whole function exists for: RTX-repaired
-        // loss is NOT net loss. 0 is right because the retransmissions were
-        // subtracted, not because they inflated the denominator.
-        assertEqual(fn(20, 20, 0, RX), 0, 'a fully RTX-repaired window is not net loss');
-
-        // Half repaired: of 20 lost, 10 came back. 10 of 640 offered = 1.56%.
-        assertEqual(Math.round(fn(20, 10, 0, RX) * 100) / 100, 1.56,
-            'half-repaired loss reports the unrecovered share of the link');
-
-        // Nothing repaired: 20 of 640 offered = 3.13%, which is what the
-        // un-repaired 20-packet window actually is as a link-loss rate.
+        // `packetsLost` is the authority. A retransmission that repaired a
+        // packet removed it from packetsLost already; retransmittedPacketsReceived
+        // must NOT be subtracted again or the metric under-reports real loss.
+        assertEqual(fn(20, 20, 0, RX), fn(20, 0, 0, RX),
+            'retransmissions must not be subtracted from the loss counter');
         assertEqual(Math.round(fn(20, 0, 0, RX) * 100) / 100, 3.13,
-            'an unrepaired window reports its true link-loss share');
+            '20 lost in 640 offered is 3.13%');
 
-        // Monotonicity: more unrepaired loss can never read as LESS loss, and
-        // repairing packets can never INCREASE it.
-        assert(fn(10, 0, 0, RX) < fn(20, 0, 0, RX), 'loss must be monotonic in unrepaired count');
-        assert(fn(20, 0, 0, RX) > fn(20, 20, 0, RX), 'repair must strictly reduce reported loss');
-        assert(fn(20, 5, 0, RX) < fn(20, 0, 0, RX), 'some repair must still reduce reported loss');
-        assert(fn(20, 20, 0, RX) < fn(20, 0, 0, RX), 'full repair must beat no repair');
+        // Monotonicity: more loss can never read as LESS loss.
+        assert(fn(10, 0, 0, RX) < fn(20, 0, 0, RX), 'loss must be monotonic in lost count');
 
         // A genuine link failure still reads as failure: if the receiver gets
         // almost nothing, the metric must say so and let the ABR ladder act.
         assertEqual(fn(200, 0, 0, 0), 100, 'a link delivering nothing is 100% net loss');
         assert(fn(100, 0, 0, 50) > 50, 'a link losing two thirds of its packets reads as catastrophic');
 
-        // Local discards widen the denominator but must NOT become the
-        // numerator: a packet the jitter buffer dropped after it arrived is not
-        // network loss, and the ABR ladder must not treat it as a thin link.
-        // It does, however, have to be visible as a share of offered volume,
-        // which is what makes an over-tight buffer distinguishable from a
-        // congested one in the diagnostics.
-        assertEqual(fn(0, 0, 10, RX), 0, 'pure discard is not net network loss');
-        assertEqual(Math.round(fn(0, 0, 10, RX) * 100) / 100, 0,
-            'discard alone contributes nothing to net loss (0 of 640)');
-        // Combined with real loss, the discard only enlarges the denominator,
-        // so it can never make the reported rate look WORSE per unit of loss.
-        assert(fn(20, 0, 0, RX) > fn(20, 0, 10, RX), 'discard dilutes the loss rate, never inflates it');
+        // Local discards are packets that ARRIVED and were then rejected by the
+        // jitter buffer, so per spec they are already part of packetsReceived.
+        // Adding them to the denominator double-counts them; treating them as
+        // loss would make the ABR ladder blame a thin link for a buffer problem.
+        assertEqual(fn(0, 0, 10, RX), 0, 'pure discard is not network loss');
+        assertEqual(fn(20, 0, 10, RX), fn(20, 0, 0, RX),
+            'discard is already in packetsReceived and must not dilute the loss rate');
 
-        // A retransmission count can never exceed the loss it repairs: RTX
-        // counters are per-SSRC and reset to 0 when the source re-keys, so a
-        // stale baseline can produce retx > lost. That must clamp to 0, not go
-        // negative and poison the controller.
-        assertEqual(fn(5, 50, 0, RX), 0, 'retx beyond loss clamps to zero, never negative');
-        assertEqual(fn(0, 50, 0, RX), 0, 'retx with no loss is clamped, not negative');
+        // A retransmission count can exceed the surviving loss (counters are
+        // per-SSRC and a repaired loss leaves packetsLost), but it is unused,
+        // so it can never produce a negative or poisoned result.
+        assertEqual(fn(5, 50, 0, RX), fn(5, 0, 0, RX),
+            'retx beyond loss must not change the reading');
+        assertEqual(fn(0, 50, 0, RX), 0, 'retx with no loss is still 0%');
 
         // A window with no loss at all must not hand the supervisor a NaN from
         // a 0/0 division.
@@ -1730,18 +1720,19 @@ Object.assign(cases, {
         const ABR_CALM_PCT = 2;
         const RX = 620;   // ~625 packets/s, a 6Mbps stream
 
-        // A link losing 0.5% where RTX repairs 80% of it. The picture is FINE.
-        // Under the repair-rate denominator this reads 33% and pins the viewer
-        // to 3000k, holds their buffer at 350ms, and makes the upgrade-back
-        // unreachable (loss < 2% for 20 consecutive ticks) for the whole
-        // session — a permanent quality downgrade on a healthy link.
+        // A window with 3 lost packets out of 620 received. The picture is FINE,
+        // and any RTX repair has already removed those packets from
+        // packetsLost. Under a lost-only denominator this reads 100% and pins
+        // the viewer to 3000k, holds their buffer at 350ms, and makes the
+        // upgrade-back unreachable (loss < 2% for 20 consecutive ticks) for the
+        // whole session — a permanent quality downgrade on a healthy link.
         const smooth = fn(3, 2, 0, RX);
         assert(smooth < ABR_CALM_PCT,
-            `a 0.5%-loss, 80%-repaired link must read under the ${ABR_CALM_PCT}% calm bound, got ${smooth.toFixed(2)}%`);
+            `a 3-lost-in-620 link must read under the ${ABR_CALM_PCT}% calm bound, got ${smooth.toFixed(2)}%`);
         assert(smooth < STRESS_HOLD_PCT,
-            'a smooth repaired link must not trip the buffer-stress hold');
+            'a lightly-lossy link must not trip the buffer-stress hold');
         assert(smooth < ABR_DOWNGRADE_PCT,
-            'a smooth repaired link must not trip the ABR downgrade');
+            'a lightly-lossy link must not trip the ABR downgrade');
 
         // A genuinely marginal link must be allowed to reach the hold, or the
         // metric is now too insensitive and the controllers never act.
@@ -1782,7 +1773,7 @@ Object.assign(cases, {
                 bufferNoticeState: '', accommodationTargetMs: 0,
                 avgPlayoutDelayMs: 150, avgPlayoutDelayAt: 100000,
                 lastNetJitterMs: 10,
-                // The smooth-but-lossy link this guards: 0.16% net loss.
+                // The lightly-lossy link this guards: 3 of 623 = 0.48%.
                 lastLossPct: fn(3, 2, 0, RX),
                 lastAppliedTargetMs: null, jitterFloorEmaMs: 0,
                 abrBadSec: 0, abrCalmSec: 0, abrDowngradedForLink: false, catchUpRate: 1,
@@ -1927,6 +1918,36 @@ Object.assign(cases, {
         // A counter reset mid-session must read as "no evidence", never as a
         // stall (which would tear a healthy session down).
         assertEqual(fn(20000, -5, 60, W), false, 'a negative delta is a counter reset, not a stall');
+    },
+    // Freeze-recovery Stage 1/2 used to call any element that was "ready" and
+    // "not paused" a success. Both are true during the decoder stall those
+    // stages exist to repair: the element keeps reporting HAVE_FUTURE_DATA
+    // while it holds the last decoded frame. That returned before the decoder
+    // flush and session renewal, so the only effective repair was the cap
+    // branch after MAX_RECOVERIES no-op cycles. A frame callback AFTER the
+    // stage began is the only evidence that presentation actually resumed.
+    'freeze-recovery-requires-a-presented-frame'() {
+        const startedAt = 1000;
+        const run = (readyState, paused, lastFrameTime) => {
+            const { fn } = compileFunction('freezeRecoveryMadeProgress', {
+                player: { readyState, paused },
+                lastFrameTime,
+            });
+            return fn(startedAt);
+        };
+
+        assertEqual(run(4, false, startedAt + 1), true,
+            'a frame presented after the stage began is real progress');
+        assertEqual(run(4, false, startedAt), false,
+            'the frame at the mark is not evidence of progress');
+        assertEqual(run(4, false, startedAt - 500), false,
+            'a ready, unpaused element holding a stale frame is a decoder stall');
+        assertEqual(run(4, false, 0), false,
+            'without rVFC there is no presentation evidence, so later stages must run');
+        assertEqual(run(2, false, startedAt + 1), false,
+            'a frame callback without HAVE_FUTURE_DATA is still not playable');
+        assertEqual(run(4, true, startedAt + 1), false,
+            'a paused element has not resumed');
     },
     // The accommodation must be drop-gated: the measured jitter-buffer delay
     // always tracks the jitterBufferTarget hint Chrome was given, so a
@@ -2948,6 +2969,25 @@ Object.assign(cases, {
         aacHold.run();
         assertEqual(aacHold.sandbox.switchedTo, undefined,
             'without a ready full-sound rendition the viewer must stay put, not land on the muted path');
+
+        // AV1 source + AAC audio: the browser is on live-av1 for SOUND, not
+        // because the source codec is H264. A software AV1 decoder still cannot
+        // sustain it, and the old branch only handled activeStreamPath 'live',
+        // so this viewer had no escape to the H264 transcode. Both AV1 paths
+        // must be able to recover onto live-h264.
+        const av1AacSource = [
+            { name: 'live', ready: true, online: true, tracks: ['MPEG-4 Audio', 'AV1'] },
+            { name: 'live-av1', ready: true, online: true, tracks: ['AV1', 'Opus'] },
+            { name: 'live-h264', ready: true, online: true, tracks: ['H264', 'Opus'] }
+        ];
+        const av1AudioRescue = make({
+            renditionPathsItems: av1AacSource,
+            activeStreamPath: 'live-av1'
+        });
+        av1AudioRescue.run();
+        assertEqual(av1AudioRescue.sandbox.switchedTo, 'live-h264',
+            'decode pressure on an AV1 AAC source must leave live-av1 for live-h264');
+
         // Already on the hardware-decodable path: nothing to do.
         const already = make({
             renditionPathsItems: ladder.h264Source,
@@ -4152,25 +4192,112 @@ Object.assign(cases, {
             'AV1 codec string shape');
 
         const levelOf = (w, h, f) => parseInt(scope.av1CodecString(w, h, f).split('.')[2], 10);
+        // Exact seq_level_idx values from AOMedia AV1 Annex A. These are NOT
+        // the level digits: 1080p60 is 4.1 -> 9, 4K60 is 5.1 -> 13, and 6.0
+        // starts at 16. The old ladder emitted 17 for 4K60 and 18 for 1080p60,
+        // i.e. it declared a single 1080p stream as level 6.1 and a 4K stream
+        // as level 6.4 (undefined), so level-trusting decoders refused them.
+        const cases = [
+            [640, 480, 30, 4, '480p30 -> 3.0'],
+            [1280, 720, 30, 5, '720p30 -> 3.1'],
+            [1920, 1080, 30, 8, '1080p30 -> 4.0'],
+            [1920, 1080, 60, 9, '1080p60 -> 4.1'],
+            [3840, 2160, 60, 13, '4K60 -> 5.1'],
+            [3840, 2160, 120, 14, '4K120 -> 5.2'],
+            // 8K30 has the same luma/sample rate as 4K120, but exceeds level
+            // 5.2's MaxPicSize, so the picture-size cap must push it to 6.0.
+            [7680, 4320, 30, 16, '8K30 -> 6.0 (MaxPicSize, not just rate)'],
+            [7680, 4320, 60, 17, '8K60 -> 6.1'],
+            [7680, 4320, 120, 18, '8K120 -> 6.2'],
+        ];
+        for (const [w, h, fps, expected, label] of cases) {
+            assertEqual(levelOf(w, h, fps), expected, `AV1 ${label}`);
+        }
         // The declared level must be monotonic: a bigger frame or a faster frame
         // rate can never lower it, or a 4K60 broadcast would announce 4K30's
         // level and under-declare itself exactly like the H.264 case.
-        const ladder = [
-            levelOf(640, 480, 30),
-            levelOf(1280, 720, 30),
-            levelOf(1920, 1080, 30),
-            levelOf(1920, 1080, 60),
-            levelOf(3840, 2160, 60),
-        ];
+        const ladder = cases.map(([w, h, fps]) => levelOf(w, h, fps));
         for (let i = 1; i < ladder.length; i += 1) {
             assert(ladder[i] >= ladder[i - 1],
                 `AV1 level must not fall as the picture grows: ${ladder.join(' -> ')}`);
         }
-        assert(ladder[ladder.length - 1] > ladder[0], '4K60 must outrank 480p30');
+        assert(ladder[ladder.length - 1] > ladder[0], '8K120 must outrank 480p30');
         // The family dispatcher must agree with the per-family builders.
         assertEqual(scope.codecStringFor('av1', 1920, 1080, 30), scope.av1CodecString(1920, 1080, 30),
             'codecStringFor routes AV1 to the AV1 builder');
         assertEqual(scope.codecStringFor('vp8', 1920, 1080, 30), 'vp8', 'VP8 has no level suffix');
+    },
+
+    'studio-native-codec-preference-spells-av1-both-ways'() {
+        const ordered = [];
+        const RTCRtpSender = {
+            getCapabilities: () => ({
+                codecs: [
+                    { mimeType: 'video/VP8', clockRate: 90000 },
+                    { mimeType: 'video/H264', clockRate: 90000 },
+                    { mimeType: 'video/AV1', clockRate: 90000 },
+                    { mimeType: 'video/rtx', clockRate: 90000 }
+                ]
+            })
+        };
+        const transceiver = {
+            setCodecPreferences: (codecs) => ordered.push(codecs.map((c) => c.mimeType))
+        };
+        const scope = compileStudioFns(
+            ['nativeCodecScore', 'prioritiseNativeCodec'],
+            { RTCRtpSender }
+        );
+        // Chrome's native MIME is video/AV1 (or bare AV1), while WebCodecs uses
+        // video/av01.*. Matching only av01 scored native AV1 as "unknown" (50),
+        // below VP9 (70) and VP8 (60), so a requested AV1 stream silently went
+        // out as whatever the browser ranked first.
+        for (const mime of ['video/AV1', 'AV1', 'video/av01.0.09M.08']) {
+            assertEqual(scope.nativeCodecScore(mime), 80, `${mime} must outrank VP9 and VP8`);
+        }
+        assertEqual(scope.nativeCodecScore('video/H264'), 100, 'H264 remains the compatibility pick');
+        assertEqual(scope.nativeCodecScore('video/VP9'), 70, 'VP9 score unchanged');
+        assertEqual(scope.nativeCodecScore('video/rtx'), 100, 'repair payloads stay first');
+
+        assertEqual(scope.prioritiseNativeCodec(transceiver, 'av1'), true,
+            'a transceiver with setCodecPreferences must be reordered');
+        assertEqual(ordered.length, 1, 'exactly one preference list is installed');
+        const list = ordered[0];
+        assertEqual(list[0], 'video/rtx', 'RTX must stay ahead of media codecs');
+        assert(list.indexOf('video/AV1') < list.indexOf('video/H264'),
+            `requested AV1 must outrank H264 (got ${list.join(', ')})`);
+        assert(list.indexOf('video/AV1') < list.indexOf('video/VP8'),
+            'requested AV1 must outrank VP8');
+    },
+
+    'studio-webcodecs-engine-is-disabled-with-a-reason'() {
+        // No shipping browser can inject WebCodecs chunks into an RTCRtpSender.
+        // Claiming otherwise produced a blank-track publish: the sender encoded
+        // the placeholder canvas, not the studio canvas. The fallback must be
+        // explicit rather than silent, and must name the actual API gap.
+        const make = (engine) => compileStudioFns(
+            ['resolveEngine'],
+            {
+                el: { 'set-engine': { value: engine } },
+                settings: { engine: 'auto' },
+                supports: { fullWebCodecs: false }
+            }
+        );
+        for (const requested of ['webcodecs', 'auto']) {
+            const resolved = make(requested).resolveEngine();
+            assertEqual(resolved.engine, 'native', `${requested} must resolve to the native engine`);
+            assert(/no shipping browser can inject/.test(resolved.reason),
+                `${requested} fallback must explain the missing sender-injection API, got: ${resolved.reason}`);
+        }
+        const manual = compileStudioFns(
+            ['resolveEngine'],
+            {
+                el: { 'set-engine': { value: 'native' } },
+                settings: { engine: 'auto' },
+                supports: { fullWebCodecs: false }
+            }
+        ).resolveEngine();
+        assertEqual(manual.engine, 'native', 'an explicit native selection is honored');
+        assertEqual(manual.reason, 'Selected manually.', 'manual selection keeps its own reason');
     },
 
     'studio-odd-dimensions-are-forced-even'() {
@@ -4662,6 +4789,61 @@ Object.assign(cases, {
             'a VideoFrame failure must be counted, not silently swallowed');
     },
 
+    // A stop while the capability probe is in flight used to leak the encoder
+    // the probe created afterwards. stopBroadcast() bumps the token first and
+    // releases everything it can SEE; the encoder did not exist yet, so it was
+    // constructed and assigned to a session that had already torn down, and
+    // nothing ever closed it. The token is the only thing that can distinguish
+    // "still my session" from "started after the stop".
+    'studio-encoder-probe-cannot-outlive-a-stopped-session': async () => {
+        let constructed = 0;
+        let releaseProbe;
+        const scope = compileStudioFns(['createVideoEncoder'], {
+            state: { sessionToken: 7, videoEncoder: null },
+            videoEncoderConfig: () => ({ codec: 'avc1.42E01E', width: 1280, height: 720 }),
+            log() {},
+            VideoEncoder: class {
+                constructor() { constructed += 1; }
+                configure() {}
+                close() {}
+                static isConfigSupported() {
+                    return new Promise((resolve) => { releaseProbe = resolve; });
+                }
+            },
+        });
+
+        const pending = scope.createVideoEncoder(7);
+        // stopBroadcast() bumps the token, then releases what it can see. The
+        // probe is still pending and has created nothing to release.
+        scope.state.sessionToken = 8;
+        releaseProbe({ supported: true, config: { codec: 'avc1.42E01E' } });
+
+        assertEqual(await pending, null,
+            'a probe resolving after the stop must not construct an encoder');
+        assertEqual(constructed, 0, 'no VideoEncoder may be constructed for a dead session');
+        assertEqual(scope.state.videoEncoder, null,
+            'the stopped session must not be given an encoder to own');
+
+        // The guard must not disable the normal path: the current session still
+        // gets its encoder and owns it.
+        const live = compileStudioFns(['createVideoEncoder'], {
+            state: { sessionToken: 3, videoEncoder: null },
+            videoEncoderConfig: () => ({ codec: 'avc1.42E01E', width: 1280, height: 720 }),
+            log() {},
+            VideoEncoder: class {
+                constructor() { this.state = 'configured'; }
+                configure() {}
+                static isConfigSupported() {
+                    return Promise.resolve({ supported: true, config: { codec: 'avc1.42E01E' } });
+                }
+            },
+        });
+        const encoder = await live.createVideoEncoder(3);
+        assert(encoder, 'a current session must still get its encoder');
+        assertEqual(live.state.videoEncoder, encoder,
+            'the current session must own the encoder it created');
+    },
+
     'studio-worklet-emits-frames-at-the-correct-rate'() {
         // 1410 render quanta of 128 samples is 1410 * 128 = 180480 samples, which
         // at a 480-sample frame size is exactly 376 frames. Anything else means
@@ -4733,6 +4915,151 @@ Object.assign(cases, {
         for (let i = 0; i < 4; i += 1) instance.process([quantum(128, 0.25)]);
         assertEqual(posted.length, 1,
             'the processor must keep working after a failed post, not wedge');
+    },
+
+    'studio-mic-fader-works-in-a-mic-only-mix'() {
+        // The gain nodes used to be read positionally: system at index 1, mic
+        // at index 3. With no system track the array is [micSource, micGain],
+        // so the mic fader looked up undefined and did nothing. This is the
+        // common case for a screen share where "Share audio" was not ticked.
+        const micGain = { gain: { value: 1 } };
+        const scope = compileStudioFns(['applyFader'], {
+            state: { audioContext: {}, audioGains: { system: null, mic: micGain } },
+        });
+        scope.applyFader('mic', '40');
+        assertEqual(micGain.gain.value, 0.4,
+            'the mic fader must find the mic gain with no system source');
+        scope.applyFader('mic', '150');
+        assertEqual(micGain.gain.value, 1.5, '150% maps to 1.5x gain');
+        scope.applyFader('system', '0');
+        assertEqual(micGain.gain.value, 1.5, 'the other fader must not move the mic gain');
+        scope.applyFader('mic', '');
+        assertEqual(micGain.gain.value, 0, 'an empty slider value is silence, not unity');
+
+        // The graph builder must register that gain by name in the first place.
+        // Fake just the two WebAudio calls connectAudioSources() makes, so the
+        // test follows the real teardown/registration order.
+        const connections = [];
+        const context = {
+            createMediaStreamSource: () => ({
+                connect: (node) => { connections.push(node); },
+            }),
+            createGain: () => {
+                const gain = { gain: { value: 0 } };
+                gain.connect = (dest) => { connections.push(dest); };
+                return gain;
+            },
+        };
+        const micTrack = { readyState: 'live' };
+        const graph = compileStudioFns(['connectAudioSources', 'applyFader'], {
+            state: {
+                audioContext: context,
+                audioDest: { id: 'dest' },
+                audioNodes: [],
+                audioGains: { system: null, mic: null },
+                screenStream: null,
+                micStream: { getAudioTracks: () => [micTrack] },
+            },
+            el: {
+                'mix-system': { value: '100' },
+                'mix-mic': { value: '70' },
+            },
+            MediaStream: function MediaStream(tracks) { this.tracks = tracks; },
+        });
+        return Promise.resolve(graph.connectAudioSources()).then(() => {
+            assert(graph.state.audioGains.mic, 'the mic gain must be registered by name');
+            assertEqual(graph.state.audioGains.system, null, 'no system source means no system gain');
+            assertEqual(graph.state.audioNodes.length, 2,
+                'the source and gain must both be tracked for teardown');
+            assertEqual(connections.length, 2,
+                'source->gain and gain->destination must both be connected');
+            graph.applyFader('mic', '25');
+            assertEqual(graph.state.audioGains.mic.gain.value, 0.25,
+                'the registered mic gain is the one the fader moves');
+        });
+    },
+
+    'studio-dead-audio-destination-is-recreated'() {
+        // buildAudioGraph() used to clear state.audioDest and then return the
+        // still-existing context without making a replacement. The next
+        // gain.connect(null) threw, leaving the UI on "Starting..." until the
+        // 75 s watchdog. Check that the rebuild actually happens.
+        const created = [];
+        const context = {
+            state: 'running',
+            createMediaStreamDestination() {
+                const dest = {
+                    stream: { getAudioTracks: () => [{ readyState: 'live' }] },
+                };
+                created.push(dest);
+                return dest;
+            },
+        };
+        const dead = { stream: { getAudioTracks: () => [{ readyState: 'ended' }] } };
+        const scope = compileStudioFns(['buildAudioGraph'], {
+            state: { audioContext: context, audioDest: dead },
+            log: () => {},
+        });
+        return Promise.resolve(scope.buildAudioGraph()).then((result) => {
+            assertEqual(result, context, 'the existing context is reused');
+            assert(scope.state.audioDest !== dead,
+                'the ended mix destination must be replaced, not just cleared');
+            assertEqual(created.length, 1, 'exactly one replacement destination is created');
+            assertEqual(scope.state.audioDest, created[0],
+                'the new destination must be the one the context returned');
+        });
+    },
+
+    'studio-source-toggle-reconnects-live-audio'() {
+        // connectAudioSources() used to run only inside startBroadcast(), so a
+        // mic enabled or a screen replaced mid-broadcast never reached the
+        // mix. The helper also has to distinguish "no sender yet, setup is
+        // still in progress" from "this session is video-only forever".
+        const run = (stateOverrides, wantAudio) => {
+            const calls = { connect: 0, warnings: [] };
+            const scope = compileStudioFns(['reconnectLiveAudio'], {
+                state: Object.assign({ audioGains: {}, audioNodes: [] }, stateOverrides),
+                connectAudioSources: () => { calls.connect += 1; return Promise.resolve(); },
+                log: (message, level) => { calls.warnings.push({ message, level }); },
+            });
+            scope.reconnectLiveAudio(wantAudio);
+            return calls;
+        };
+
+        const live = run({ state: 'live', audioSender: {} }, true);
+        assertEqual(live.connect, 1, 'a live session with an audio sender rebuilds the mix');
+        assertEqual(live.warnings.length, 0, 'no warning when the audio can actually be sent');
+
+        const idle = run({ state: 'idle', audioSender: {} }, true);
+        assertEqual(idle.connect, 0, 'an idle studio has no live graph to rebuild');
+
+        const preparing = run({ state: 'preparing', audioSender: null }, true);
+        assertEqual(preparing.connect, 1, 'a source toggled during setup joins that start');
+
+        const videoOnly = run({ state: 'live', audioSender: null }, true);
+        assertEqual(videoOnly.connect, 0,
+            'a video-only session has no audio sender to feed');
+        assertEqual(videoOnly.warnings.length, 1,
+            'the user must be told that enabling the mic requires a restart');
+        assertEqual(videoOnly.warnings[0].level, 'warn', 'the restart notice is a warning');
+
+        const quietRemove = run({ state: 'live', audioSender: null }, false);
+        assertEqual(quietRemove.connect, 0, 'removing audio from a video-only session is a no-op');
+        assertEqual(quietRemove.warnings.length, 0,
+            'disabling a source that was never sent must not warn about a restart');
+    },
+
+    'studio-source-changes-actually-call-the-reconnect'() {
+        // The helper above is only useful if the source paths invoke it. These
+        // are the three transitions that used to leave the old graph in place.
+        const screen = extractFunction('pickScreenSource', BROADCAST_SOURCE);
+        assert(screen.includes('reconnectLiveAudio(Boolean(audioTrack))'),
+            'picking a new screen must rebuild the system-audio node');
+        const mic = extractFunction('toggleMic', BROADCAST_SOURCE);
+        assert(mic.includes('reconnectLiveAudio(true)'),
+            'enabling the mic during a broadcast must connect it');
+        assert(mic.includes('reconnectLiveAudio(false)'),
+            'disabling the mic during a broadcast must remove it');
     },
 });
 
