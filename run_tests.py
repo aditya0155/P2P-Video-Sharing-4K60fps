@@ -2842,9 +2842,9 @@ class StudioPageChecks(_SiteUnderTest):
         versions = set(re.findall(
             r"/streaming/(?:studio\.css|studio\.js|studio_ingest_client\.js)\?v=([^\"']+)",
             self.studio_html))
-        self.assertEqual(versions, {"3.0.0"},
+        self.assertEqual(versions, {"3.0.1"},
                          "studio assets must share one cache version, got {}".format(versions))
-        self.assertIn('href="/streaming/studio?v=3.0.0"', self.html)
+        self.assertIn('href="/streaming/studio?v=3.0.1"', self.html)
         self.assertIn("addModule(`${WORKLET_URL}?v=3`)", self.client_js)
 
     def test_studio_does_not_change_the_obs_pipeline(self):

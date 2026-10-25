@@ -41,6 +41,14 @@ dropped-frame meters, not the preview. Keep the small **On Air** window open
 while broadcasting: Chrome throttles hidden tabs, and that window keeps the
 encoder at full speed when you switch away.
 
+24 fps is the default because it matches the OBS profile; the frame-rate menu
+also offers 60, 30 and 15. Changing it re-applies the resolution cap in the same
+`applyConstraints()` call, because Chrome replaces the whole constraint set: a
+lone `frameRate` makes the capture fall back to the monitor's native size (a
+3840x2160 desktop), and the extra downscale on every frame is what used to pin
+the studio near 20 fps. With the cap kept, 1080p60 holds 60 fps with an empty
+encoder queue and zero relay drops on this laptop.
+
 The older WHIP page at `http://127.0.0.1:3000/broadcast` still ships, but it is
 not linked from the player. It offers codec (H.264 / AV1 / VP9 / VP8),
 resolution, frame rate, video and audio bitrate settings, plus a scene switcher

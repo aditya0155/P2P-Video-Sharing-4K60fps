@@ -768,6 +768,23 @@ document.addEventListener('DOMContentLoaded', () => {
     // Source capture
     // ==========================================================================
 
+    // Builds the full capture constraint set. Every applyConstraints() call
+    // must carry all of it: Chrome replaces the whole set, so sending only
+    // frameRate makes it forget the width/height cap and fall back to the
+    // monitor's native size (a 4K desktop then costs 4x the per-frame
+    // downscale and halves the encoder rate).
+    function captureConstraints(fps) {
+        const size = RESOLUTION_MAP[resolutionSelect ? resolutionSelect.value : '1080'];
+        const constraints = {
+            frameRate: { ideal: fps, max: fps }
+        };
+        if (size) {
+            constraints.width = { ideal: size.width, max: size.width };
+            constraints.height = { ideal: size.height, max: size.height };
+        }
+        return constraints;
+    }
+
     async function pickSource() {
         if (unsupported) return;
         if (hostAllowed === false) {
@@ -793,15 +810,8 @@ document.addEventListener('DOMContentLoaded', () => {
         // `max` is the constraint that actually caps, and unlike min/exact it
         // is legal on a display track. Both keys are set so the control is
         // real rather than advisory.
-        const width = RESOLUTION_MAP[resolutionSelect ? resolutionSelect.value : '1080'];
         const requestedFps = Number(framerateSelect ? framerateSelect.value : 24) || 24;
-        const videoConstraints = {
-            frameRate: { ideal: requestedFps, max: requestedFps }
-        };
-        if (width) {
-            videoConstraints.width = { ideal: width.width, max: width.width };
-            videoConstraints.height = { ideal: width.height, max: width.height };
-        }
+        const videoConstraints = captureConstraints(requestedFps);
 
         const constraints = {
             video: Object.assign({}, videoConstraints, {
@@ -1385,7 +1395,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (hasSource()) {
                     const track = displayStream.getVideoTracks()[0];
                     const fps = Number(framerateSelect.value) || 24;
-                    track.applyConstraints({ frameRate: { ideal: fps, max: fps } })
+                    track.applyConstraints(captureConstraints(fps))
                         .then(() => reportAchievedFrameRate(track))
                         .catch((err) => console.warn('[Studio] Frame rate constraint rejected:', err));
                 }
@@ -1419,10 +1429,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!entry) return; // "Match source" leaves the track alone.
 
         try {
-            await track.applyConstraints({
-                width: { ideal: entry.width, max: entry.width },
-                height: { ideal: entry.height, max: entry.height }
-            });
+            const fps = Number(framerateSelect ? framerateSelect.value : 24) || 24;
+            await track.applyConstraints(captureConstraints(fps));
         } catch (err) {
             console.warn('[Studio] Could not apply the resolution constraint:', err);
             showToast(`This source could not be forced to ${entry.width}×${entry.height}; it stays at the size the system chose.`, 'warning');

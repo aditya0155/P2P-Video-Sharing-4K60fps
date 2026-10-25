@@ -492,16 +492,16 @@
             const now = performance.now();
             const interval = 1000 / this.fps;
             const elapsed = now - this.lastTickAt;
-            // setInterval can fire a second callback immediately after a late
-            // one. Encoding both would put two frames on the wire at the same
-            // wall-clock instant, which ffmpeg turns into a visible stutter.
-            if (elapsed < interval * 0.5) return;
+            // Credit every elapsed millisecond. The timer runs at half a frame
+            // interval, so some turns arrive before a frame is due; those turns
+            // must still advance the clock, otherwise the time between them is
+            // discarded and the stream settles well below the requested rate.
             this.lastTickAt = now;
 
-            // Credit is capped just above one frame so a tab that was frozen
-            // for seconds resumes with at most one catch-up frame, not a burst
-            // that blows through the bitrate for the next half second.
-            this.frameBudget = Math.min(1.5, this.frameBudget + (elapsed / interval));
+            // Credit is capped at two frames so a tab that was frozen for
+            // seconds resumes with a short catch-up, not a burst that blows
+            // through the bitrate for the next half second.
+            this.frameBudget = Math.min(2, this.frameBudget + (elapsed / interval));
             if (this.frameBudget < 1) return;
 
             const encoder = this.encoder;
@@ -839,7 +839,7 @@
             this.pump = this._pump().catch((err) => {
                 if (!this.stopping) this._fail(err.message || String(err));
             });
-            this.timer = setInterval(() => this._tick(), interval);
+            this.timer = setInterval(() => this._tick(), Math.max(1, interval / 2));
             this._tick();
             this.statusTimer = setInterval(() => this._pollStatus(), 1000);
             this.emit('started', {
