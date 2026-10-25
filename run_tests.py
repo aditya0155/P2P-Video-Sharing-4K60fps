@@ -39,6 +39,13 @@ BROADCAST_HTML_PATH = ROOT / "broadcast.html"
 BROADCAST_JS_PATH = ROOT / "broadcast.js"
 BROADCAST_WORKER_PATH = ROOT / "broadcast_worker.js"
 BROADCAST_WORKLET_PATH = ROOT / "broadcast_audio_worklet.js"
+# The current studio (WebCodecs -> local relay). The legacy page above stays
+# served for old bookmarks but is no longer the broadcaster the player links to.
+STUDIO_HTML_PATH = ROOT / "studio.html"
+STUDIO_JS_PATH = ROOT / "studio.js"
+STUDIO_CLIENT_PATH = ROOT / "studio_ingest_client.js"
+STUDIO_INGEST_PATH = ROOT / "studio_ingest.js"
+STUDIO_CSS_PATH = ROOT / "studio.css"
 
 
 class IdCollector(HTMLParser):
@@ -54,6 +61,27 @@ class IdCollector(HTMLParser):
 
 def read_text(path):
     return path.read_text(encoding="utf-8")
+
+
+_JS_COMMENT_RE = re.compile(
+    r"""
+    (?P<string>'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`)
+    | (?P<block>/\*.*?\*/)
+    | (?P<line>//[^\n]*)
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+
+
+def strip_js_comments(source):
+    """Remove JS comments while leaving string literals alone.
+
+    The studio's header comments explain why WebRTC was removed and therefore
+    name the APIs that must no longer be used. A plain substring check cannot
+    tell that prose from executable code.
+    """
+    return _JS_COMMENT_RE.sub(
+        lambda match: match.group("string") or "", source)
 
 
 def find_free_port():
@@ -507,7 +535,8 @@ class LaptopHostChecks(unittest.TestCase):
     def test_node_files_parse(self):
         node = shutil.which("node")
         self.assertIsNotNone(node, "Node.js is required to host the site")
-        for path in (SERVER_PATH, APP_PATH, JS_CHECKS_PATH, BRIDGE_PATH):
+        for path in (SERVER_PATH, APP_PATH, JS_CHECKS_PATH, BRIDGE_PATH,
+                     STUDIO_JS_PATH, STUDIO_CLIENT_PATH, STUDIO_INGEST_PATH):
             result = subprocess.run(
                 [node, "--check", str(path)],
                 cwd=str(ROOT),
@@ -1066,8 +1095,12 @@ class JsLogicChecks(unittest.TestCase):
 
 
 
-class StudioJsLogicChecks(unittest.TestCase):
-    """Browser-logic checks for the broadcaster (broadcast.js).
+class LegacyBroadcastJsLogicChecks(unittest.TestCase):
+    """Browser-logic checks for the legacy broadcaster (broadcast.js).
+
+    The current studio lives in studio.js/studio_ingest_client.js and is
+    covered by StudioIngestClientChecks. These cases stay because the legacy
+    page is still served; they are not evidence about the current path.
 
     These are the decisions that silently break a broadcast rather than throwing:
     an H.264 level that under-declares the stream, an SDP fmtp attached to the
@@ -1626,6 +1659,201 @@ class StreamApiProxyChecks(_SiteUnderTest):
         self.assertEqual(self.signaling.requests, [], "the TURN endpoint must not reach MediaMTX")
         self.assertEqual(self.api.requests, [], "the TURN endpoint must not reach MediaMTX")
 
+class PublishPlaneSecurityChecks(_SiteUnderTest):
+    """The public page host must not be a public publisher.
+
+    MediaMTX's `live` path uses ``overridePublisher: yes`` and serves WHIP next
+    to WHEP on the WebRTC port. Forwarding every ``/stream-api/**`` request made
+    the browser-facing proxy a publishing endpoint for the whole internet: one
+    POST with an offer took the stream away from OBS, and the same endpoint
+    could replace ``live-h264`` / ``live-av1``. Publishing is now host-only;
+    viewing (WHEP) is deliberately unchanged.
+    """
+
+    SIGNALING_ROUTES = property(lambda self: {
+        ("POST", "/live/whip"): lambda stub: (
+            201,
+            {"Location": "http://127.0.0.1:{}/live/whip/session-1".format(stub.port)},
+            b"",
+        ),
+        ("PATCH", "/live/whip/session-1"): lambda stub: (204, {}, b""),
+        ("DELETE", "/live/whip/session-1"): lambda stub: (200, {}, b""),
+        ("POST", "/live/whep?token=abc"): lambda stub: (
+            201,
+            {"Location": "http://127.0.0.1:{}/live/whep/session-id".format(stub.port)},
+            b"",
+        ),
+        ("DELETE", "/live/whep/session-id"): lambda stub: (200, {}, b""),
+    })
+
+    API_ROUTES = property(lambda self: {
+        ("GET", "/v3/paths/list"): lambda stub: (
+            200, {"Content-Type": "application/json"}, b'{"items":[]}',
+        ),
+    })
+
+    SDP = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\n"
+
+    def setUp(self):
+        super().setUp()
+        self.start_site(signaling_routes=self.SIGNALING_ROUTES, api_routes=self.API_ROUTES)
+
+    def _publish(self, method="POST", path="/stream-api/live/whip", headers=None):
+        body = self.SDP if method in ("POST", "PATCH") else None
+        request_headers = {"Content-Type": "application/sdp"}
+        request_headers.update(headers or {})
+        return http_request(self.port, method, path, body=body, headers=request_headers)
+
+    def test_remote_whip_publish_is_refused_before_the_proxy(self):
+        # Every one of these is a request a remote or rebinding client can
+        # actually produce. The important assertion is not just the 403: the
+        # signalling stub must have seen NOTHING, which proves MediaMTX never
+        # got the offer and therefore never had a chance to evict OBS.
+        variants = (
+            ("cloudflare-tunnel", {"CF-Connecting-IP": "203.0.113.9"}),
+            ("x-forwarded-for", {"X-Forwarded-For": "203.0.113.9"}),
+            ("standard-forwarded", {"Forwarded": "for=203.0.113.9"}),
+            ("dns-rebinding-host", {"Host": "attacker.example"}),
+            ("cross-site-origin", {"Origin": "https://evil.example"}),
+            ("cross-site-fetch", {"Sec-Fetch-Site": "cross-site"}),
+        )
+        for name, headers in variants:
+            with self.subTest(name=name):
+                self.signaling.clear()
+                status, response_headers, body = self._publish(headers=headers)
+                self.assertEqual(status, 403, f"{name} must not be able to publish")
+                self.assertEqual(
+                    self.signaling.requests, [],
+                    f"{name} reached MediaMTX; the WHIP POST must be refused before the proxy",
+                )
+                self.assertEqual(response_headers.get("Access-Control-Allow-Origin"), "*")
+                self.assertIn("host-only", body.decode("utf-8"))
+
+    def test_local_host_and_browser_studio_can_still_publish(self):
+        # A non-browser host client (OBS-side tooling, tests) omits Origin.
+        status, _, _ = self._publish()
+        self.assertEqual(status, 201)
+        self.assertEqual(self.signaling.requests[-1]["path"], "/live/whip")
+
+        # The studio page's own fetch is same-origin, so it sends this Origin.
+        self.signaling.clear()
+        status, _, _ = self._publish(
+            headers={"Origin": "http://127.0.0.1:{}".format(self.port)})
+        self.assertEqual(status, 201, "the host's own studio must still be able to publish")
+        self.assertEqual(self.signaling.requests[-1]["path"], "/live/whip")
+
+    def test_whep_viewer_signalling_remains_public(self):
+        # Closing publishing must not close watching. A remote WHEP POST and
+        # its DELETE both arrive through the tunnel and must reach MediaMTX.
+        for method, path in (
+            ("POST", "/stream-api/live/whep?token=abc"),
+            ("DELETE", "/stream-api/live/whep/session-id"),
+        ):
+            with self.subTest(method=method):
+                self.signaling.clear()
+                status, _, _ = http_request(
+                    self.port, method, path,
+                    body=self.SDP if method == "POST" else None,
+                    headers={
+                        "CF-Connecting-IP": "203.0.113.9",
+                        "Content-Type": "application/sdp",
+                    },
+                )
+                self.assertIn(status, (200, 201), "a remote viewer must still be able to watch")
+                self.assertEqual(len(self.signaling.requests), 1,
+                                 "WHEP signalling must still be proxied for remote viewers")
+
+    def test_whip_session_mutations_are_host_only(self):
+        for method, path in (
+            ("PATCH", "/stream-api/live/whip/session-1"),
+            ("DELETE", "/stream-api/live/whip/session-1"),
+            ("POST", "/stream-api/live/whip/"),
+            ("POST", "/stream-api/live-h264/whip"),
+            ("POST", "/stream-api/live-av1/whip"),
+            ("POST", "/stream-api/live/%77hip"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.signaling.clear()
+                status, _, _ = self._publish(
+                    method=method, path=path,
+                    headers={"CF-Connecting-IP": "203.0.113.9"})
+                self.assertEqual(status, 403, f"{method} {path} must be refused")
+                self.assertEqual(self.signaling.requests, [],
+                                 f"{method} {path} slipped past the publish guard")
+
+        # Control: a host-local PATCH/DELETE must still be proxied.
+        status, _, _ = self._publish(method="PATCH", path="/stream-api/live/whip/session-1")
+        self.assertEqual(status, 204)
+        status, _, _ = self._publish(method="DELETE", path="/stream-api/live/whip/session-1")
+        self.assertEqual(status, 200)
+
+    def test_host_info_rejects_cross_site_and_rebinding_reads(self):
+        status, _, _ = http_request(self.port, "GET", "/stream-api/host-info")
+        self.assertEqual(status, 200, "the operator must still be able to read host diagnostics")
+
+        for name, headers in (
+            ("cross-site-origin", {"Origin": "https://evil.example"}),
+            ("dns-rebinding-host", {"Host": "attacker.example"}),
+            ("cross-site-fetch", {"Sec-Fetch-Site": "cross-site"}),
+            ("tunnel", {"CF-Connecting-IP": "203.0.113.9"}),
+        ):
+            with self.subTest(name=name):
+                status, _, _ = http_request(
+                    self.port, "GET", "/stream-api/host-info", headers=headers)
+                self.assertEqual(status, 403, f"host diagnostics leaked to {name}")
+
+    def test_studio_control_plane_rejects_cross_site_requests_before_spawning(self):
+        # A cross-site POST to the session route would spawn a local ffmpeg.
+        # It must be refused by the same host check; no session is created.
+        status, _, body = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body="{}",
+            headers={
+                "Origin": "https://evil.example",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("host machine", body.decode("utf-8"))
+
+    def test_checkout_path_header_is_not_published_through_the_tunnel(self):
+        status, headers, _ = http_request(
+            self.port, "GET", "/streaming/",
+            headers={"CF-Connecting-IP": "203.0.113.9"})
+        self.assertEqual(status, 200)
+        self.assertIsNone(
+            headers.get("X-Rydius-Served-From"),
+            "the operator's filesystem path must not be disclosed to remote viewers",
+        )
+
+        status, headers, _ = http_request(self.port, "GET", "/streaming/")
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(
+            headers.get("X-Rydius-Served-From"),
+            "the host still needs this header to tell which checkout served the page",
+        )
+
+    def test_request_timeout_is_finite(self):
+        # requestTimeout=0 was used for the old unbounded studio upload. The
+        # relay now sends finite batches, so removing every deadline would
+        # leave chat/reaction bodies open to a slow-body client forever.
+        server = read_text(SERVER_PATH)
+        self.assertNotIn(
+            "server.requestTimeout = 0", server,
+            "an unbounded request timeout lets one slow body hold a socket forever",
+        )
+        match = re.search(r"server\.requestTimeout\s*=\s*(\d+)\s*;", server)
+        self.assertIsNotNone(match, "requestTimeout must be set explicitly")
+        self.assertGreater(int(match.group(1)), 0)
+        self.assertLessEqual(int(match.group(1)), 60000,
+                             "the whole-request deadline must stay short enough to bound a stall")
+        # Node evaluates these deadlines on connectionsCheckingInterval, whose
+        # 30s default could stretch a deadline to nearly double. Pin the sweep.
+        self.assertIn(
+            "server.connectionsCheckingInterval = 5000", server,
+            "a tight checking interval is what makes the request deadline real",
+        )
+
 class TurnCredentialProxyChecks(_SiteUnderTest):
     """Remote viewers receive Cloudflare TURN credentials minted by the local server.
 
@@ -2017,14 +2245,12 @@ class SiteStartupDiagnosticsChecks(_SiteUnderTest):
             slow.shutdown()
             slow.server_close()
 
-class BrowserBroadcasterChecks(_SiteUnderTest):
-    """Rydius Studio: the browser screen-share publisher.
+class LegacyBroadcastPageChecks(_SiteUnderTest):
+    """The legacy /broadcast page (broadcast.html + broadcast.js).
 
-    The studio is a second way to publish to the SAME MediaMTX path OBS uses, so
-    these check the two things that matter: the studio is reachable and its
-    runtime assets actually load, and it publishes over WHIP through the same
-    proxy the player already uses. They also pin the "do not break OBS" rule:
-    nothing here may change the `live` path's configuration.
+    It is still served for old bookmarks, but the player and the /studio aliases
+    now point at studio.html. These checks keep the old page from rotting; they
+    do not describe the current publish path.
     """
 
     @classmethod
@@ -2385,6 +2611,470 @@ class BrowserBroadcasterChecks(_SiteUnderTest):
 
 
 
+class StudioPageChecks(_SiteUnderTest):
+    """The current studio: WebCodecs H.264 -> local relay -> RTSP.
+
+    These are the contracts that are expensive to discover in production: the
+    page is host-only, the ingest client loads before the controller, the
+    transport is finite batched POSTs (not a streamed body), video is copied by
+    ffmpeg, and the relay paces frames on the encoder's timeline.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.studio_html = read_text(STUDIO_HTML_PATH)
+        cls.studio_js = read_text(STUDIO_JS_PATH)
+        cls.client_js = read_text(STUDIO_CLIENT_PATH)
+        cls.ingest_js = read_text(STUDIO_INGEST_PATH)
+        cls.worklet = read_text(BROADCAST_WORKLET_PATH)
+        cls.css = read_text(STUDIO_CSS_PATH)
+        cls.server = read_text(SERVER_PATH)
+        cls.html = read_text(HTML_PATH)
+
+    def test_studio_files_exist_and_parse(self):
+        for path in (STUDIO_HTML_PATH, STUDIO_JS_PATH, STUDIO_CLIENT_PATH,
+                     STUDIO_INGEST_PATH, BROADCAST_WORKLET_PATH):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file(), "missing studio file {}".format(path.name))
+        for path in (STUDIO_JS_PATH, STUDIO_CLIENT_PATH, STUDIO_INGEST_PATH,
+                     BROADCAST_WORKLET_PATH):
+            with self.subTest(path=path.name):
+                result = subprocess.run(
+                    [self.node, "--check", str(path)], cwd=str(ROOT),
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_studio_page_is_served_and_loads_the_client_before_the_controller(self):
+        self.start_site()
+        for route in ("/studio", "/studio/", "/streaming/studio", "/streaming/studio/"):
+            with self.subTest(route=route):
+                status, headers, body = http_request(self.port, "GET", route)
+                self.assertEqual(status, 200, "{} must serve the studio".format(route))
+                text = body.decode("utf-8")
+                self.assertIn("Rydius Studio", text)
+                self.assertIn("html", headers.get("Content-Type", ""))
+                self.assertLess(
+                    text.index('<script src="/streaming/studio_ingest_client.js'),
+                    text.index('<script src="/streaming/studio.js'),
+                    "the ingest client must be defined before studio.js runs")
+
+        # The old page is still reachable, but it is not what /studio serves.
+        status, _, body = http_request(self.port, "GET", "/broadcast")
+        self.assertEqual(status, 200)
+        self.assertIn("broadcast.js", body.decode("utf-8"))
+
+    def test_studio_runtime_assets_are_served(self):
+        self.start_site()
+        assets = {
+            "/streaming/studio.js": "javascript",
+            "/streaming/studio_ingest_client.js": "javascript",
+            "/streaming/broadcast_audio_worklet.js": "javascript",
+            "/streaming/studio.css": "text/css",
+        }
+        for route, content_type in assets.items():
+            with self.subTest(route=route):
+                status, headers, body = http_request(self.port, "GET", route)
+                self.assertEqual(status, 200, "{} must be served".format(route))
+                self.assertGreater(len(body), 0, "{} must not be empty".format(route))
+                self.assertIn(content_type, headers.get("Content-Type", ""))
+
+    def test_studio_html_ids_are_unique_and_all_referenced(self):
+        parser = IdCollector()
+        parser.feed(self.studio_html)
+        self.assertEqual(len(parser.ids), len(set(parser.ids)),
+                         "studio.html contains duplicate IDs")
+        html_ids = set(parser.ids)
+        referenced = set(re.findall(r"getElementById\(['\"]([^'\"]+)['\"]\)", self.studio_js))
+        self.assertEqual(referenced - html_ids, set(),
+                         "studio.js references an id absent from studio.html")
+        # The source-mode control is a radiogroup, so it is queried by class.
+        self.assertIn("querySelectorAll('.studio-seg')", self.studio_js)
+
+    def test_studio_defaults_match_the_obs_profile(self):
+        self.assertRegex(self.studio_html, r'<option value="1080" selected>')
+        self.assertRegex(self.studio_html, r'<option value="24" selected>')
+        self.assertRegex(self.studio_html, r'id="rng-bitrate"[^>]*value="4000"')
+        self.assertRegex(self.studio_html, r'id="chk-cbr" checked')
+        self.assertIn("const KEYFRAME_INTERVAL_MS = 1000;", self.client_js)
+        self.assertIn("framerateSelect ? framerateSelect.value : 24", self.studio_js)
+        self.assertIn("bitrateSlider ? bitrateSlider.value : 4000", self.studio_js)
+
+    def test_studio_has_no_codec_picker_and_never_uses_webrtc(self):
+        for marker in ('id="sel-codec"', 'value="av1"', 'value="vp9"', 'value="vp8"'):
+            self.assertNotIn(marker, self.studio_html)
+        self.assertIn("studio-static", self.studio_html)
+        self.assertIn("H.264", self.studio_html)
+        studio_code = strip_js_comments(self.studio_js)
+        client_code = strip_js_comments(self.client_js)
+        for marker in ("codecSelect", "applyCodecPreference", "RTCPeerConnection",
+                       "WHIP_PATH", "addTransceiver"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, studio_code)
+                self.assertNotIn(marker, client_code)
+
+    def test_studio_is_host_only(self):
+        self.assertIn("const HOST_INFO_PATH = '/stream-api/host-info';", self.studio_js)
+        self.assertIn("hostAllowed = response.ok;", self.studio_js)
+        self.assertIn("hostAllowed !== true", self.studio_js)
+        self.assertIn("if (!isDirectLocal(req))", self.server)
+        self.assertIn("Browser broadcasting only works on the host machine.", self.server)
+
+    def test_studio_pageshow_keeps_the_host_only_verdict(self):
+        start = self.studio_js.find("window.addEventListener('pageshow'")
+        end = self.studio_js.find("document.addEventListener('visibilitychange'", start)
+        self.assertGreater(start, 0, "the pageshow handler was not found")
+        self.assertGreater(end, start, "the pageshow handler is not bounded")
+        handler = self.studio_js[start:end]
+        self.assertIn("hostAllowed === false", handler,
+                      "pageshow must not turn a tunneled page back into 'Ready'")
+        self.assertIn("setStatus('error', 'Host only')", handler)
+        self.assertIn("unsupported", handler)
+
+    def test_studio_opens_the_on_air_window_in_the_click_gesture(self):
+        start = self.studio_js.find("if (startBtn) {")
+        stop = self.studio_js.find("if (stopBtn)", start)
+        self.assertGreater(start, 0, "the Start handler was not found")
+        self.assertGreater(stop, start, "the Start handler is not bounded")
+        click = self.studio_js[start:stop]
+        self.assertLess(click.index("const pipPromise = openOnAirWindow();"),
+                        click.index("await requestMicrophone();"),
+                        "Document PiP must be requested before the first await")
+        self.assertIn("documentPictureInPicture", self.studio_js)
+        self.assertIn("Keep this tab visible", self.studio_js)
+        self.assertIn("active.stop({ keepalive: true })", self.studio_js)
+
+    def test_studio_locks_encoder_settings_for_the_broadcast(self):
+        self.assertIn("setEncoderControlsLocked(true);", self.studio_js)
+        self.assertIn("setEncoderControlsLocked(false);", self.studio_js)
+        for control in ("resolutionSelect", "framerateSelect", "bitrateSlider",
+                        "audioBitrateSelect", "cbrCheckbox", "contentHintSelect"):
+            with self.subTest(control=control):
+                self.assertIn(control, self.studio_js)
+        self.assertIn("Settings are fixed for this broadcast.", self.studio_js)
+
+    def test_studio_never_closes_an_encoded_video_chunk(self):
+        # EncodedVideoChunk has no close(); only VideoFrame does. Calling one
+        # threw inside the encoder's output callback on every frame, so the
+        # page reported Live while sending nothing.
+        self.assertNotIn("chunk.close()", self.client_js)
+        self.assertIn("videoFrameMessage(chunk)", self.client_js)
+
+    def test_studio_batches_whole_frames_and_waits_for_each_response(self):
+        for marker in ("const BATCH_DELAY_MS = 16;",
+                       "const BATCH_MAX_BYTES = 256 * 1024;",
+                       "const HEADER_BYTES = 13;",
+                       "takeBatch(BATCH_MAX_BYTES, BATCH_DELAY_MS)",
+                       "new global.Blob(batch.map((item) => item.data))",
+                       "body: blob"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.client_js)
+        self.assertNotIn("ReadableStream", self.client_js)
+        self.assertNotIn("duplex: 'half'", self.client_js)
+        pump = self.client_js[self.client_js.find("async _pump()"):]
+        pump = pump[:pump.find("\n        _describeFetchFailure(err) {")]
+        self.assertIn("await fetch(this.session.ingestUrl", pump)
+        self.assertIn("if (!response.ok)", pump)
+
+    def test_studio_teardown_releases_the_session_and_the_capture(self):
+        for marker in ("active.stop({ keepalive: true })",
+                       "videoTrack.onended = () =>",
+                       "handleCaptureEnded()"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.studio_js)
+        # The HTTP teardown lives in the publisher the page talks to, not in the
+        # page controller.
+        for marker in ("method: 'DELETE'",
+                       "AbortSignal.timeout(STOP_TIMEOUT_MS)"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.client_js)
+        fail = self.client_js[self.client_js.find("_fail(message)"):]
+        fail = fail[:fail.find("_closeLocal()")]
+        self.assertIn("method: 'DELETE'", fail)
+        self.assertIn("keepalive: true", fail)
+
+    def test_studio_relay_copies_video_and_publishes_rtsp(self):
+        for marker in ("'-c:v', 'copy'",
+                       "'-f', 'rtsp'",
+                       "'-rtsp_transport', 'tcp'",
+                       "'-use_wallclock_as_timestamps', '1'",
+                       "'-f', 'h264'",
+                       "'-f', 's16le', '-ar', '48000', '-ac', '2'",
+                       "'-application', 'lowdelay'",
+                       "'-map', '0:v:0'",
+                       "'-map', '1:a:0'"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.ingest_js)
+        # Wallclock stamping is for the raw H.264 input only; applying it to PCM
+        # produced non-monotonic DTS in testing.
+        self.assertEqual(self.ingest_js.count("'-use_wallclock_as_timestamps', '1'"), 1)
+        self.assertNotIn("libx264", self.ingest_js)
+
+    def test_studio_relay_paces_and_drops_late_video(self):
+        for marker in ("const VIDEO_LATE_DROP_US = 300000;",
+                       "const VIDEO_MIN_WRITE_GAP_MS = 2;",
+                       "const VIDEO_QUEUE_LIMIT = 4 * 1024 * 1024;",
+                       "function pacingDecision(nowUs, dueUs, lateDropUs)",
+                       "session.mediaStartUs = nowUs;",
+                       "session.needKeyframe = true;",
+                       "containsIdr(item.payload)"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.ingest_js)
+        self.assertIn("if (status.needKeyframe) this.forceKeyframe = true;", self.client_js)
+
+    def test_studio_relay_uses_one_active_session_and_replaces_it(self):
+        self.assertIn("let activeId = null;", self.ingest_js)
+        self.assertIn("if (activeId)", self.ingest_js)
+        self.assertIn("finishSession(previous, 'replaced')", self.ingest_js)
+        self.assertIn("killFfmpeg(previous, 'SIGKILL')", self.ingest_js)
+        self.assertIn("function finalizeSession(session)", self.ingest_js)
+        self.assertIn("FAILED_SESSION_TTL_MS", self.ingest_js)
+
+    def test_studio_static_allowlist_covers_the_new_assets(self):
+        for marker in ("['/studio', 'studio.html']",
+                       "['/streaming/studio', 'studio.html']",
+                       "['/studio.js', 'studio.js']",
+                       "['/streaming/studio_ingest_client.js', 'studio_ingest_client.js']",
+                       "['/streaming/broadcast_audio_worklet.js', 'broadcast_audio_worklet.js']"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.server)
+
+    def test_studio_assets_share_one_cache_version(self):
+        versions = set(re.findall(
+            r"/streaming/(?:studio\.css|studio\.js|studio_ingest_client\.js)\?v=([^\"']+)",
+            self.studio_html))
+        self.assertEqual(versions, {"3.0.0"},
+                         "studio assets must share one cache version, got {}".format(versions))
+        self.assertIn('href="/streaming/studio?v=3.0.0"', self.html)
+        self.assertIn("addModule(`${WORKLET_URL}?v=3`)", self.client_js)
+
+    def test_studio_does_not_change_the_obs_pipeline(self):
+        config = read_text(CONFIG_PATH)
+        for path in ("live-test", "browser", "studio"):
+            with self.subTest(path=path):
+                self.assertNotRegex(
+                    config, r"^\s*{}:".format(re.escape(path)),
+                    "the studio must not require a new MediaMTX path")
+        self.assertIn("rtmp://127.0.0.1:1935/live", self.html)
+        self.assertIn("http://127.0.0.1:8889/live/whip", self.html)
+        self.assertIn('runOnAvailable: node "codec_bridge.js"', config)
+        self.assertIn("overridePublisher: yes", config)
+
+    def test_studio_reports_the_hardware_encoder_and_loud_failures(self):
+        self.assertIn("chooseEncoderConfig", self.client_js)
+        self.assertIn("isConfigSupported", self.client_js)
+        self.assertIn("This machine cannot encode H.264", self.client_js)
+        self.assertIn("handlePublisherError", self.studio_js)
+        self.assertIn("audio-unavailable", self.client_js)
+        self.assertIn("NO AUDIO", self.studio_js)
+
+    def test_studio_is_reachable_from_the_player(self):
+        self.assertIn('id="studio-launch-btn"', self.html)
+        self.assertIn('href="/streaming/studio', self.html)
+
+
+class StudioIngestClientChecks(unittest.TestCase):
+    """Pure helpers from the shipped studio_ingest_client.js."""
+
+    def test_frame_header_is_thirteen_bytes_big_endian(self):
+        run_js_check(self, "studio-ingest-frame-header-is-thirteen-bytes-big-endian")
+
+    def test_frame_message_keeps_the_payload_intact(self):
+        run_js_check(self, "studio-ingest-frame-message-keeps-payload-intact")
+
+    def test_video_chunk_is_framed_without_closing_it(self):
+        run_js_check(self, "studio-ingest-video-chunk-is-framed-without-closing-it")
+
+    def test_h264_level_tracks_resolution_and_framerate(self):
+        run_js_check(self, "studio-ingest-h264-level-tracks-resolution-and-framerate")
+
+    def test_h264_codec_candidates_use_the_computed_level(self):
+        run_js_check(self, "studio-ingest-h264-codec-candidates-use-the-computed-level")
+
+    def test_encoder_config_prefers_cbr_and_hardware(self):
+        run_js_check(self, "studio-ingest-encoder-config-prefers-cbr-and-hardware")
+
+    def test_dimensions_are_even_and_capped(self):
+        run_js_check(self, "studio-ingest-dimensions-are-even-and-capped")
+
+    def test_backpressure_sacrifices_video_first(self):
+        run_js_check(self, "studio-ingest-backpressure-sacrifices-video-first")
+
+    def test_batches_whole_frames_only(self):
+        run_js_check(self, "studio-ingest-batches-whole-frames-only")
+
+    def test_worklet_s16le_is_interleaved_and_clamped(self):
+        run_js_check(self, "studio-worklet-s16le-is-interleaved-and-clamped")
+
+
+class StudioIngestRouteChecks(_SiteUnderTest):
+    """The host-only HTTP surface the browser uses to start and feed a session."""
+
+    MISSING_FFMPEG = "studio-test-no-ffmpeg.exe"
+
+    def setUp(self):
+        super().setUp()
+        self.start_site(extra_env={"STUDIO_FFMPEG": str(ROOT / self.MISSING_FFMPEG)})
+
+    def test_session_route_rejects_non_post(self):
+        status, headers, body = http_request(
+            self.port, "GET", "/stream-api/studio/session")
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("Allow"), "POST")
+        self.assertIn("Method Not Allowed", body.decode("utf-8"))
+
+    def test_session_route_rejects_invalid_json(self):
+        status, headers, body = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body=b"{not json", headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 400)
+        self.assertIn("json", headers.get("Content-Type", ""))
+        self.assertEqual(json.loads(body.decode("utf-8"))["error"], "Invalid JSON.")
+
+    def test_session_route_rejects_an_oversized_body(self):
+        status, _, body = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body=b"x" * 9000, headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 413)
+        self.assertIn("too large", body.decode("utf-8"))
+
+    def test_unknown_session_and_ingest_are_json_404(self):
+        for route in ("/stream-api/studio/session/0123456789abcdef",
+                      "/stream-api/studio/ingest/0123456789abcdef"):
+            with self.subTest(route=route):
+                status, headers, body = http_request(self.port, "GET", route)
+                self.assertEqual(status, 404)
+                self.assertIn("json", headers.get("Content-Type", ""))
+                self.assertIn("No such studio ingest session",
+                              json.loads(body.decode("utf-8"))["error"])
+
+    def test_unknown_studio_subpath_is_404_not_a_hang(self):
+        status, _, body = http_request(self.port, "GET", "/stream-api/studio/nope")
+        self.assertEqual(status, 404)
+        self.assertIn("404 Not Found", body.decode("utf-8"))
+
+    def test_missing_ffmpeg_fails_the_session_readably(self):
+        status, headers, body = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body=json.dumps({"width": 1920, "height": 1080, "fps": 24,
+                             "bitrate": 4000000, "audio": False}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 500)
+        self.assertIn("json", headers.get("Content-Type", ""))
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("ffmpeg was not found", payload["error"])
+        self.assertRegex(payload["id"], r"^[a-f0-9]{16}$")
+
+    def test_studio_routes_reject_a_proxied_request(self):
+        status, headers, body = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body=b"{}", headers={
+                "Content-Type": "application/json",
+                "X-Forwarded-For": "203.0.113.5",
+            })
+        self.assertEqual(status, 403)
+        self.assertIn("json", headers.get("Content-Type", ""))
+        self.assertIn("host machine", body.decode("utf-8"))
+
+    def test_host_info_is_local_only(self):
+        status, _, body = http_request(self.port, "GET", "/stream-api/host-info")
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("dir", payload)
+        self.assertIn("pid", payload)
+
+        status, _, body = http_request(
+            self.port, "GET", "/stream-api/host-info",
+            headers={"X-Forwarded-For": "203.0.113.5"})
+        self.assertEqual(status, 403)
+        self.assertIn("local-only", body.decode("utf-8"))
+
+
+class StudioRelayChecks(unittest.TestCase):
+    """The relay's pure decisions and the ffmpeg command it builds."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        assert cls.node is not None, "Node.js is required to host the site"
+        cls.source = read_text(STUDIO_INGEST_PATH)
+
+    def _run(self, body):
+        script = (
+            "const assert = require('assert');"
+            "const m = require('./studio_ingest');"
+            + body
+        )
+        result = subprocess.run(
+            [self.node, "-e", script], cwd=str(ROOT),
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_header_constants_match_the_client(self):
+        self._run(
+            "assert.strictEqual(m.HEADER_BYTES, 13);"
+            "assert.strictEqual(m.VIDEO, 1);"
+            "assert.strictEqual(m.AUDIO, 2);"
+        )
+
+    def test_pacing_decision_writes_waits_and_drops(self):
+        self._run(
+            "assert.strictEqual(m.pacingDecision(1000000, 1000000, 300000), 'write');"
+            "assert.strictEqual(m.pacingDecision(1000000, 900000, 300000), 'write');"
+            "assert.strictEqual(m.pacingDecision(1000000, 1200000, 300000), 'wait');"
+            "assert.strictEqual(m.pacingDecision(1000000, 600000, 300000), 'drop');"
+        )
+
+    def test_contains_idr_recognises_both_start_codes(self):
+        self._run(
+            "assert.strictEqual(m.containsIdr(Buffer.from([0, 0, 1, 0x65, 0x88])), true);"
+            "assert.strictEqual(m.containsIdr(Buffer.from([0, 0, 0, 1, 0x65, 0x88])), true);"
+            "assert.strictEqual(m.containsIdr(Buffer.from([0, 0, 1, 0x41, 0x88])), false);"
+            "assert.strictEqual(m.containsIdr(Buffer.from([0x00, 0x00, 0x01])), false);"
+        )
+
+    def test_pipe_names_are_per_session_and_per_stream(self):
+        self._run(
+            "assert.strictEqual(m.pipeName('abc', 'v'), '\\\\\\\\.\\\\pipe\\\\rydius_studio_abc_v');"
+            "assert.notStrictEqual(m.pipeName('abc', 'v'), m.pipeName('abc', 'a'));"
+            "assert.notStrictEqual(m.pipeName('abc', 'v'), m.pipeName('def', 'v'));"
+        )
+
+    def test_config_is_clamped_and_made_even(self):
+        self._run(
+            "const c = m.normaliseConfig({width: 1919, height: 1079, fps: 0,"
+            " bitrate: 1, audio: 1, audioBitrate: 999999});"
+            "assert.strictEqual(c.width, 1918);"
+            "assert.strictEqual(c.height, 1078);"
+            "assert.strictEqual(c.fps, 1);"
+            "assert.strictEqual(c.bitrate, 100000);"
+            "assert.strictEqual(c.audio, true);"
+            "assert.strictEqual(c.audioBitrate, 320000);"
+            "const d = m.normaliseConfig(null);"
+            "assert.strictEqual(d.width, 1920);"
+            "assert.strictEqual(d.height, 1080);"
+            "assert.strictEqual(d.fps, 60);"
+            "assert.strictEqual(d.bitrate, 6000000);"
+            "assert.strictEqual(d.audio, false);"
+        )
+
+    def test_video_is_copied_and_only_the_video_input_is_wallclock_stamped(self):
+        self.assertEqual(self.source.count("'-use_wallclock_as_timestamps', '1'"), 1)
+        self.assertIn("'-f', 'h264'", self.source)
+        self.assertIn("'-f', 's16le'", self.source)
+        self.assertIn("'-c:v', 'copy'", self.source)
+        self.assertIn("'-c:a', 'libopus'", self.source)
+        self.assertIn("'-f', 'rtsp'", self.source)
+        self.assertIn("'-rtsp_transport', 'tcp'", self.source)
+
+    def test_the_relay_has_one_active_session_and_a_finalize_backstop(self):
+        self.assertIn("let activeId = null;", self.source)
+        self.assertIn("finishSession(previous, 'replaced')", self.source)
+        self.assertIn("killFfmpeg(previous, 'SIGKILL')", self.source)
+        self.assertIn("function finalizeSession(session)", self.source)
+        self.assertIn("FAILED_SESSION_TTL_MS", self.source)
+        self.assertIn("function closeAll()", self.source)
+
+
 class StartupConfigurationChecks(unittest.TestCase):
     """A bad PORT must abort at boot instead of silently binding something else."""
 
@@ -2513,7 +3203,11 @@ class CrossFileConsistencyChecks(unittest.TestCase):
                               "{} is missing from the server.js STATIC_FILES allowlist".format(asset_path))
                 version = re.search(r"[?&]v=([^&]+)", "?" + query)
                 self.assertIsNotNone(version, "{} has no ?v= cache buster".format(reference))
-                versions.add(version.group(1))
+                # The studio is a separate page with its own asset set and
+                # cache version (pinned by StudioPageChecks). Only the files
+                # this page itself loads have to share a version.
+                if asset_path != "/streaming/studio":
+                    versions.add(version.group(1))
         self.assertEqual(len(versions), 1,
                          "all page assets must share one cache version, got {}".format(sorted(versions)))
 
@@ -4587,7 +5281,14 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         handshake is a POST, which browsers do not reliably retry on a reused
         socket -> failed handshake -> visible freeze on a healthy link."""
         self.assertIn("server.keepAliveTimeout = 65000", self.server)
-        self.assertIn("server.headersTimeout = 66000", self.server)
+        # headersTimeout is not an idle deadline: it only bounds how long a
+        # client may take to send its headers. It must be finite (a stalled
+        # upload cannot hold the socket forever) and comfortably longer than
+        # any real request's header write.
+        match = re.search(r"server\.headersTimeout\s*=\s*(\d+)\s*;", self.server)
+        self.assertIsNotNone(match, "headersTimeout must be set explicitly")
+        self.assertGreaterEqual(int(match.group(1)), 10000)
+        self.assertLessEqual(int(match.group(1)), 66000)
 
     def test_forwarded_headers_are_only_trusted_behind_the_tunnel(self):
         """x-forwarded-for is attacker-controlled. A unique value per request
@@ -6411,33 +7112,50 @@ class StudioOverlayVisibilityChecks(unittest.TestCase):
                       "while it is idle, or one CSS regression bricks the page")
 
 
-class StudioCodecSelectionChecks(unittest.TestCase):
-    """The older `/streaming/studio` codec picker.
+class StudioEncoderSurfaceChecks(unittest.TestCase):
+    """The current studio has one video codec: hardware H.264.
 
-    `studio.js` bakes the codec into the WHIP offer, so changing it mid-session
-    cannot affect the live broadcast. It must still keep the user's choice for
-    the next one: the old handler popped the select back to `h264`, which made
-    the toast ("applies on the next broadcast") false and silently started the
-    next session with a codec the operator had not chosen.
+    The old page let the operator pick AV1/VP9/VP8 for a WebRTC session. On this
+    laptop every one of those paths topped out near 16 fps, and the relay copies
+    H.264 access units without re-encoding. A codec picker now would be a lie:
+    the browser encoder, the level table, the Annex B framing and the relay all
+    assume H.264.
     """
 
     def setUp(self):
-        self.js = read_text(ROOT / "studio.js")
+        self.html = read_text(STUDIO_HTML_PATH)
+        self.js = read_text(STUDIO_JS_PATH)
+        self.client = read_text(STUDIO_CLIENT_PATH)
 
-    def test_changing_codec_during_a_broadcast_keeps_the_next_session_choice(self):
-        start = self.js.find("if (codecSelect) {")
-        end = self.js.find("if (audioBitrateSelect)", start)
-        self.assertGreater(start, 0, "the codec change handler was not found")
-        self.assertGreater(end, start, "the codec change handler is not bounded")
-        handler = self.js[start:end]
-        self.assertIn("Codec is fixed for a WHIP session", handler,
-                      "the user must be told the change applies to the next broadcast")
-        self.assertNotIn("codecSelect.value", handler,
-                         "the handler must not overwrite the selection it just accepted")
-        # The selection is not decorative: the next publish reads it when it
-        # builds the offer.
-        self.assertIn("applyCodecPreference(pc, codecSelect.value)", self.js,
-                      "the next broadcast must actually use the kept selection")
+    def test_html_has_a_static_h264_readout_not_a_codec_picker(self):
+        self.assertNotIn('id="sel-codec"', self.html)
+        for value in ("av1", "vp9", "vp8"):
+            self.assertNotIn('value="{}"'.format(value), self.html)
+        self.assertIn("studio-static", self.html)
+        self.assertIn("H.264", self.html)
+        self.assertIn("hardware encoder", self.html)
+
+    def test_js_has_no_codec_selection_or_webrtc_publish_path(self):
+        js_code = strip_js_comments(self.js)
+        client_code = strip_js_comments(self.client)
+        for marker in ("codecSelect", "applyCodecPreference", "RTCPeerConnection",
+                       "WHIP_PATH", "addTransceiver"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, js_code)
+                self.assertNotIn(marker, client_code)
+
+    def test_client_only_configures_h264(self):
+        self.assertIn("h264CodecCandidates", self.client)
+        self.assertIn("avc1.", self.client)
+        for other in ("av01", "vp09", "vp8"):
+            self.assertNotIn(other, self.client)
+
+    def test_encoder_failures_are_surfaced_not_swallowed(self):
+        self.assertIn("This machine cannot encode H.264", self.client)
+        self.assertIn("Could not start the H.264 encoder", self.client)
+        self.assertIn("handlePublisherError", self.js)
+        self.assertIn("audio-unavailable", self.client)
+        self.assertIn("NO AUDIO", self.js)
 
 
 if __name__ == "__main__":

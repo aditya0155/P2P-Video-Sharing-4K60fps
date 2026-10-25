@@ -9,12 +9,12 @@
          URL and must never be indexed or linkable from a crawler. -->
     <meta name="robots" content="noindex, noimageindex">
     <title>Rydius Studio — Broadcast from this browser</title>
-    <meta name="description" content="Broadcast a screen, window or tab over WebRTC WHIP with no install.">
+    <meta name="description" content="Broadcast a screen, window or tab from the host laptop with hardware H.264 and no install.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-    <link rel="stylesheet" href="/streaming/studio.css?v=2.26.1">
+    <link rel="stylesheet" href="/streaming/studio.css?v=3.0.0">
 </head>
 <body>
     <div class="ambient-bg" aria-hidden="true">
@@ -42,40 +42,26 @@
             </div>
         </header>
 
-        <!-- Experimental notice. Deliberately above the fold and NOT dismissible:
-             the failure it warns about is invisible in the LOCAL PREVIEW, which
-             plays the raw capture track (studio.js) and not the encoded stream.
-             So the preview stays perfectly smooth while the broadcast degrades -
-             the meters are the only honest feedback, which is why the notice
-             points at them. A close button would just train people to hide the
-             one message that matters. -->
-        <section class="studio-notice" aria-labelledby="studio-notice-title">
+        <!-- Standing notice. The local preview plays the raw capture, not the
+             encoded stream, so it cannot prove the broadcast is healthy. The
+             meters are the honest feedback; this notice explains the path and
+             the one thing the operator must do (keep the On Air window open). -->
+        <section class="studio-notice is-info" id="studio-notice" aria-labelledby="studio-notice-title">
             <div class="studio-notice-head">
-                <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
-                <h2 class="studio-notice-title" id="studio-notice-title">Experimental &mdash; expect a very low frame rate</h2>
+                <i class="fa-solid fa-bolt" id="studio-notice-icon" aria-hidden="true"></i>
+                <h2 class="studio-notice-title" id="studio-notice-title">Hardware H.264, encoded once</h2>
             </div>
 
-            <p class="studio-notice-body">
-                Broadcasting from this browser is <b>experimental and buggy</b>, and it very likely
-                gives you <b>very low FPS</b>. This page has to capture, encode and upload the video
-                on the same machine at the same time. The preview above plays the raw screen capture,
-                <b>not</b> the encoded stream, so it keeps looking smooth while the real broadcast
-                is struggling &mdash; watch the <b>FPS</b> and <b>Resolution</b> meters, not the preview.
-                For a real broadcast, use <b>OBS Studio over WHIP</b> instead &mdash; it is stable and
-                holds full frame rate:
+            <p class="studio-notice-body" id="studio-notice-body">
+                This page captures the screen, encodes it with the GPU, and hands the encoded frames
+                to a local relay that publishes to the same <code>live</code> path OBS uses. No second
+                encode and no WebRTC ceiling. It runs <b>only on the host laptop</b>.
             </p>
 
-            <ol class="studio-notice-steps">
-                <li>In OBS open <b>Settings &rarr; Stream</b> and set <b>Service</b> to <code>WHIP</code>.</li>
-                <li>Set <b>Server</b> to <code>http://127.0.0.1:8889/live/whip</code> and leave the <b>Bearer token</b> empty.</li>
-                <li>Under <b>Output &rarr; Streaming</b>: encoder <code>NVENC AV1</code> (or <code>NVENC H.264</code>), rate control <b>CBR</b>, keyframe interval <b>1 second</b>, <b>Max B-frames 0</b>, and disable <b>Look-ahead</b>.</li>
-                <li>Click <b>Start Streaming</b>. WHIP is also the only OBS path that carries sound natively (Opus), so viewers hear audio.</li>
-            </ol>
-
-            <p class="studio-notice-foot">
-                Both paths publish to the same <code>live</code> stream, so a viewer sees one stream
-                either way &mdash; but the browser path is far likelier to stutter. The full settings
-                list is on the <a class="studio-notice-link" href="/streaming/">watch page</a>.
+            <p class="studio-notice-foot" id="studio-notice-foot">
+                Defaults match the OBS profile: 1920&times;1080, 24 fps, CBR 4 Mbps, 1 s keyframes.
+                Keep the small <b>On Air</b> window open while you broadcast &mdash; Chrome throttles
+                hidden tabs, and that window keeps the encoder at full speed when you switch away.
             </p>
         </section>
 
@@ -108,8 +94,8 @@
                             <span class="studio-meter-value" id="meter-codec">—</span>
                         </div>
                         <div class="studio-meter">
-                            <span class="studio-meter-label">RTT</span>
-                            <span class="studio-meter-value" id="meter-rtt">— ms</span>
+                            <span class="studio-meter-label">Dropped</span>
+                            <span class="studio-meter-value" id="meter-dropped">0</span>
                         </div>
                         <div class="studio-meter">
                             <span class="studio-meter-label">Keyframes</span>
@@ -138,11 +124,8 @@
                     <div class="studio-field">
                         <span class="studio-label" id="source-mode-label">Share</span>
                         <!-- Roving tabindex: a role="radiogroup" must be a single tab
-                             stop with the arrow keys moving within it. All three
-                             buttons used to be in the tab order, so Tab walked
-                             straight past a control that announces itself as a
-                             single choice. studio.js keeps tabIndex in sync with
-                             the .active class on every change. -->
+                             stop with the arrow keys moving within it. studio.js
+                             keeps tabIndex in sync with the .active class. -->
                         <div class="studio-segmented" role="radiogroup" aria-labelledby="source-mode-label">
                             <button type="button" class="studio-seg active" id="mode-screen" role="radio" aria-checked="true" tabindex="0" data-mode="monitor">Screen</button>
                             <button type="button" class="studio-seg" id="mode-window" role="radio" aria-checked="false" tabindex="-1" data-mode="window">Window</button>
@@ -195,16 +178,11 @@
                     <div class="studio-meter-bar-wrap">
                         <!-- aria-hidden: studio.js rewrites the fill width every
                              animation frame, so exposing it as a live value would
-                             flood assistive technology. The channel states are
-                             announced through the real inputs and #audio-hint. -->
+                             flood assistive technology. -->
                         <div class="studio-meter-bar" aria-hidden="true"><div class="studio-meter-bar-fill" id="outgoing-level" style="width:0%"></div></div>
                         <div class="studio-meter-scale" aria-hidden="true"><i></i><i></i><i></i></div>
                         <span class="studio-meter-bar-label">Outgoing mix</span>
                     </div>
-                    <!-- role=status because studio.js REPLACES this text whenever
-                         system-audio availability changes (syncAudioAvailability).
-                         Without it, a screen-reader user gets no signal that the
-                         stream has just silently gone video-only. -->
                     <p class="studio-hint" id="audio-hint" role="status">
                         System audio is offered by the picker itself. If it is not offered, the stream
                         is published video-only.
@@ -215,17 +193,15 @@
                     <h2 class="studio-group-title"><i class="fa-solid fa-sliders" aria-hidden="true"></i> Encoder</h2>
 
                     <div class="studio-field">
-                        <label class="studio-label" for="sel-codec">Codec</label>
-                        <select id="sel-codec" class="studio-select">
-                            <option value="h264" selected>H.264 (best compatibility)</option>
-                            <option value="av1">AV1 (lowest bandwidth)</option>
-                            <option value="vp9">VP9</option>
-                            <option value="vp8">VP8 (lowest CPU)</option>
-                        </select>
+                        <span class="studio-label">Video codec</span>
+                        <div class="studio-static">
+                            <i class="fa-solid fa-microchip" aria-hidden="true"></i>
+                            <span>H.264 &middot; hardware encoder</span>
+                        </div>
                     </div>
                     <p class="studio-hint" id="codec-hint">
-                        H.264 plays in every browser. AV1 saves the most upload; the host re-encodes the
-                        other codec automatically so no viewer is left out.
+                        The GPU encodes H.264 once; ffmpeg copies those frames into the stream without
+                        re-encoding. AV1, VP9 and VP8 are not used on this path.
                     </p>
 
                     <div class="studio-field">
@@ -243,9 +219,9 @@
                     <div class="studio-field">
                         <label class="studio-label" for="sel-framerate">Frame rate</label>
                         <select id="sel-framerate" class="studio-select">
-                            <option value="60" selected>60 fps</option>
+                            <option value="60">60 fps</option>
                             <option value="30">30 fps</option>
-                            <option value="24">24 fps</option>
+                            <option value="24" selected>24 fps — matches OBS</option>
                             <option value="15">15 fps</option>
                         </select>
                     </div>
@@ -253,9 +229,9 @@
                     <div class="studio-field">
                         <label class="studio-label" for="rng-bitrate">
                             Video bitrate
-                            <span class="studio-label-value" id="bitrate-value">6000 kbps</span>
+                            <span class="studio-label-value" id="bitrate-value">4000 kbps</span>
                         </label>
-                        <input type="range" id="rng-bitrate" class="studio-slider" min="500" max="20000" step="250" value="6000" title="Video bitrate" aria-label="Video bitrate">
+                        <input type="range" id="rng-bitrate" class="studio-slider" min="500" max="20000" step="250" value="4000" title="Video bitrate" aria-label="Video bitrate">
                     </div>
 
                     <div class="studio-field">
@@ -285,7 +261,7 @@
                     </div>
 
                     <p class="studio-hint" id="encoder-hint">
-                        Leave ~25% of your upload free. Changes apply live — no need to restart.
+                        Settings are locked in when you go live. Leave ~25% of your upload free.
                     </p>
                 </div>
             </aside>
@@ -306,6 +282,9 @@
         </div>
     </div>
 
-    <script src="/streaming/studio.js?v=2.26.1"></script>
+    <!-- The ingest client defines window.StudioIngest, which studio.js uses.
+         Classic scripts execute in order, so this must stay before studio.js. -->
+    <script src="/streaming/studio_ingest_client.js?v=3.0.0"></script>
+    <script src="/streaming/studio.js?v=3.0.0"></script>
 </body>
 </html>

@@ -25,6 +25,11 @@ const APP_SOURCE = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 // and evaluated against a stub sandbox, so the tests can never drift from the
 // code that actually runs in the browser.
 const BROADCAST_SOURCE = fs.readFileSync(path.join(__dirname, 'broadcast.js'), 'utf8');
+// The current studio's publish client is a browser IIFE that exposes its pure
+// protocol helpers on window.StudioIngest._pure. Loading the whole shipped file
+// in a vm keeps the tests tied to the exact constants and framing the browser
+// sends, instead of a copy that can drift.
+const STUDIO_CLIENT_SOURCE = fs.readFileSync(path.join(__dirname, 'studio_ingest_client.js'), 'utf8');
 
 /* --------------------------------------------------------------------------
    Assertion helpers
@@ -176,7 +181,7 @@ function quietConsole() {
     return { log() {}, warn() {}, error() {}, info() {} };
 }
 
-module.exports = { APP_SOURCE, BROADCAST_SOURCE, assert, assertEqual, countLine, extractFunction, extractConst, evaluateConst, compileFunction, quietConsole };
+module.exports = { APP_SOURCE, BROADCAST_SOURCE, STUDIO_CLIENT_SOURCE, assert, assertEqual, countLine, extractFunction, extractConst, evaluateConst, compileFunction, quietConsole };
 
 /* --------------------------------------------------------------------------
    Studio (broadcast.js) helpers
@@ -216,6 +221,41 @@ function studioLevelTable() {
     return vm.runInContext(`(${extractConst('H264_LEVEL_TABLE', BROADCAST_SOURCE)})`, context);
 }
 
+// Loads the real studio_ingest_client.js in a vm and hands back the pure
+// helpers it publishes. `overrides` lets a test supply a fake VideoEncoder
+// without touching the file's framing, level table or queue implementation.
+function studioIngestPure(overrides) {
+    const sandbox = Object.assign({
+        window: {},
+        console: quietConsole(),
+        Math,
+        Number,
+        Object,
+        Array,
+        JSON,
+        String,
+        Uint8Array,
+        Int16Array,
+        setTimeout,
+        clearTimeout,
+        performance: { now: () => 0 },
+        Blob: function Blob(parts) { this.parts = parts; },
+        AbortController: function AbortController() {
+            this.signal = {};
+            this.abort = () => {};
+        },
+        fetch: async () => { throw new Error('fetch is not available in this test'); }
+    }, overrides || {});
+    // The IIFE receives `window` as its `global`, so a fake VideoEncoder has to
+    // exist on that object as well as on the vm's global scope.
+    sandbox.window = Object.assign({}, sandbox.window || {}, overrides || {});
+    const context = vm.createContext(sandbox, { name: 'studio_ingest_client.js' });
+    vm.runInContext(STUDIO_CLIENT_SOURCE, context, { filename: 'studio_ingest_client.js' });
+    const studio = context.window.StudioIngest;
+    if (!studio || !studio._pure) throw new Error('studio_ingest_client.js did not expose _pure');
+    return studio._pure;
+}
+
 // A harness for encodeOnce, the per-frame encode step.
 //
 // This exists because the only alternative was grepping the source for a string
@@ -240,7 +280,7 @@ function studioLevelTable() {
 // path — 3.75x the correct rate — which played audio fast, underran, and drifted
 // roughly 730 ms against video every second of broadcast. Only a test that
 // actually counts emitted frames catches that.
-function compileWorklet(frameSize, channels) {
+function compileWorklet(frameSize, channels, format) {
     const posted = [];
     const workletSource = fs.readFileSync(path.join(__dirname, 'broadcast_audio_worklet.js'), 'utf8');
     // Take the class body only, then stub the two browser globals it touches.
@@ -250,6 +290,7 @@ function compileWorklet(frameSize, channels) {
     );
     const sandbox = {
         Float32Array,
+        Int16Array,
         Math,
         registerProcessor: () => {},
         // The audio clock the processor stamps frames with.
@@ -265,7 +306,7 @@ function compileWorklet(frameSize, channels) {
     vm.runInContext(`${classBody}\nglobalThis.StudioPcmTap = StudioPcmTap;`, context,
         { filename: 'broadcast_audio_worklet.js' });
     const instance = new context.StudioPcmTap({
-        processorOptions: { frameSize, channels },
+        processorOptions: { frameSize, channels, format },
     });
     return { instance, posted, context };
 }
@@ -5060,6 +5101,241 @@ Object.assign(cases, {
             'enabling the mic during a broadcast must connect it');
         assert(mic.includes('reconnectLiveAudio(false)'),
             'disabling the mic during a broadcast must remove it');
+    },
+
+    /* ----------------------------------------------------------------------
+       Studio ingest client — the current WebCodecs -> relay path
+       ---------------------------------------------------------------------- */
+
+    'studio-ingest-frame-header-is-thirteen-bytes-big-endian'() {
+        const pure = studioIngestPure();
+        const header = pure.frameHeader(1, 0x01020304, 0x100000000);
+        assertEqual(header.byteLength, 13, 'the wire header must be 13 bytes');
+        assertEqual(Array.from(header), [
+            1,
+            1, 2, 3, 4,
+            0, 0, 0, 1,
+            0, 0, 0, 0
+        ], 'type, length and the high word of the timestamp must be big-endian');
+
+        const low = pure.frameHeader(2, 5, 0x12345678);
+        assertEqual(Array.from(low), [
+            2,
+            0, 0, 0, 5,
+            0, 0, 0, 0,
+            0x12, 0x34, 0x56, 0x78
+        ], 'a timestamp below 2^32 must land in the low word');
+
+        const clamped = pure.frameHeader(2, 0, -5);
+        assertEqual(Array.from(clamped), [
+            2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ], 'a negative timestamp must clamp to zero, not wrap');
+    },
+
+    'studio-ingest-frame-message-keeps-payload-intact'() {
+        const pure = studioIngestPure();
+        const payload = new Uint8Array([9, 8, 7, 6]);
+        const message = pure.frameMessage(2, payload, 123456789);
+        assertEqual(message.byteLength, 13 + payload.byteLength,
+            'a message is exactly one header plus the payload');
+        assertEqual(Array.from(message.slice(0, 13)),
+            Array.from(pure.frameHeader(2, 4, 123456789)),
+            'the message header must describe the payload it carries');
+        assertEqual(Array.from(message.slice(13)), [9, 8, 7, 6],
+            'the payload bytes must not be shifted or truncated');
+    },
+
+    'studio-ingest-video-chunk-is-framed-without-closing-it'() {
+        const pure = studioIngestPure();
+        const payload = new Uint8Array([0, 0, 0, 1, 0x65, 0x88, 0x84]);
+        let closed = false;
+        const chunk = {
+            byteLength: payload.byteLength,
+            timestamp: 123456,
+            type: 'key',
+            copyTo(target) { target.set(payload); },
+            close() { closed = true; }
+        };
+        const { framed, isKey } = pure.videoFrameMessage(chunk);
+        assertEqual(isKey, true, 'a key chunk must be reported as a keyframe');
+        assertEqual(framed.byteLength, 13 + payload.byteLength,
+            'a video message is one header plus the access unit');
+        assertEqual(Array.from(framed.slice(0, 13)),
+            Array.from(pure.frameHeader(1, payload.byteLength, 123456)),
+            'the header must carry the chunk timestamp');
+        assertEqual(Array.from(framed.slice(13)), Array.from(payload),
+            'the access unit must be copied verbatim');
+        assertEqual(closed, false,
+            'EncodedVideoChunk has no close(); the encoder owns it');
+    },
+
+    'studio-ingest-h264-level-tracks-resolution-and-framerate'() {
+        const pure = studioIngestPure();
+        assertEqual(pure.h264LevelIdc(1280, 720, 30), 31, '720p30 is level 3.1');
+        assertEqual(pure.h264LevelIdc(1280, 720, 60), 32, '720p60 is level 3.2');
+        assertEqual(pure.h264LevelIdc(1920, 1080, 24), 40, '1080p24 is level 4.0');
+        assertEqual(pure.h264LevelIdc(1920, 1080, 60), 42, '1080p60 needs level 4.2');
+        assertEqual(pure.h264LevelIdc(2560, 1440, 60), 51, '1440p60 needs level 5.1');
+        assertEqual(pure.h264LevelIdc(3840, 2160, 60), 52, '4K60 needs level 5.2');
+
+        // Raising the frame rate can never lower the declared level: an
+        // under-declared level makes isConfigSupported() fail on hardware.
+        for (const [width, height] of [[1280, 720], [1920, 1080], [2560, 1440], [3840, 2160]]) {
+            let previous = 0;
+            for (const fps of [15, 24, 30, 60, 120]) {
+                const level = pure.h264LevelIdc(width, height, fps);
+                assert(level >= previous, `${width}x${height} level fell when fps rose to ${fps}`);
+                previous = level;
+            }
+        }
+    },
+
+    'studio-ingest-h264-codec-candidates-use-the-computed-level'() {
+        const pure = studioIngestPure();
+        const list = pure.h264CodecCandidates(1920, 1080, 60);
+        assertEqual(list[0], 'avc1.42E02A', 'constrained baseline must carry level 4.2');
+        assertEqual(list[1], 'avc1.4D402A', 'main profile is the first fallback');
+        assertEqual(list[2], 'avc1.64002A', 'high profile is the second fallback');
+        assertEqual(list[list.length - 1], 'avc1.42001E',
+            'the final fallback must be the level-3.0 baseline every H.264 decoder accepts');
+        assertEqual(new Set(list).size, list.length, 'candidates must not repeat');
+
+        const hd = pure.h264CodecCandidates(1920, 1080, 24);
+        assertEqual(hd[0], 'avc1.42E028', '1080p24 uses level 4.0 (0x28)');
+    },
+
+    'studio-ingest-encoder-config-prefers-cbr-and-hardware'() {
+        const seen = [];
+        const fakeEncoder = function VideoEncoder() {};
+        fakeEncoder.isConfigSupported = async (config) => {
+            seen.push(config);
+            const supported = config.bitrateMode === 'variable'
+                && config.hardwareAcceleration === 'no-preference';
+            return { supported, config };
+        };
+        return (async () => {
+            const pure = studioIngestPure({ VideoEncoder: fakeEncoder });
+            const config = await pure.chooseEncoderConfig({
+                width: 1920,
+                height: 1080,
+                fps: 24,
+                bitrate: 4000000,
+                cbr: true,
+                contentHint: 'detail'
+            });
+            assert(config, 'a supported fallback must be returned');
+            assertEqual(config.bitrateMode, 'variable',
+                'CBR must fall back to VBR when the hardware refuses constant mode');
+            assertEqual(config.hardwareAcceleration, 'no-preference',
+                'prefer-hardware must fall back to no-preference');
+            assertEqual(config.codec, 'avc1.42E028', 'the level must match 1080p24');
+            assertEqual(config.avc.format, 'annexb', 'the relay expects Annex B, not length-prefixed');
+            assertEqual(config.latencyMode, 'realtime', 'a live encoder must not buffer for quality');
+            assertEqual(config.contentHint, 'detail', 'the page content hint must reach the encoder');
+            assert(seen.length > 1, 'the first refused candidate must not end the search');
+
+            const noSupport = function VideoEncoder() {};
+            noSupport.isConfigSupported = async () => ({ supported: false });
+            const none = studioIngestPure({ VideoEncoder: noSupport });
+            const rejected = await none.chooseEncoderConfig({
+                width: 1920, height: 1080, fps: 24, bitrate: 4000000,
+                cbr: true, contentHint: 'detail'
+            });
+            assertEqual(rejected, null, 'no supported configuration must return null, not throw');
+        })();
+    },
+
+    'studio-ingest-dimensions-are-even-and-capped'() {
+        const pure = studioIngestPure();
+        assertEqual(pure.evenInt(1919, 0), 1918, 'an odd width must round down to even');
+        assertEqual(pure.evenInt(1918, 0), 1918, 'an even width must be left alone');
+        assertEqual(pure.evenInt(0, 1080), 1080, 'zero is invalid and takes the fallback');
+        assertEqual(pure.evenInt('nope', 720), 720, 'NaN is invalid and takes the fallback');
+
+        assertEqual(pure.presetDimensions(1080), { width: 1920, height: 1080 });
+        assertEqual(pure.presetDimensions(480), { width: 854, height: 480 });
+        assertEqual(pure.presetDimensions(360), { width: 640, height: 360 });
+        assertEqual(pure.presetDimensions(0), null, 'an unknown preset has no dimensions');
+
+        assertEqual(pure.matchSourceDimensions(7680, 4320, 3840, 2160),
+            { width: 3840, height: 2160 }, '8K must be capped at 4K, not refused');
+        assertEqual(pure.matchSourceDimensions(1919, 1079, 3840, 2160),
+            { width: 1918, height: 1078 }, 'odd source dimensions must be made even');
+        assertEqual(pure.matchSourceDimensions(0, 0, 3840, 2160),
+            { width: 1920, height: 1080 }, 'a missing source size falls back to 1080p');
+    },
+
+    'studio-ingest-backpressure-sacrifices-video-first'() {
+        const pure = studioIngestPure();
+        const twoMb = 2 * 1024 * 1024;
+        const hardLimit = 12 * 1024 * 1024;
+        assertEqual(pure.backpressureDecision('video', 0), 'accept');
+        assertEqual(pure.backpressureDecision('audio', 0), 'accept');
+        assertEqual(pure.backpressureDecision('video', twoMb), 'accept',
+            'the video cap is a ceiling, not a threshold at equality');
+        assertEqual(pure.backpressureDecision('video', twoMb + 1), 'drop',
+            'video is sacrificed before the queue can grow without bound');
+        assertEqual(pure.backpressureDecision('audio', twoMb + 1), 'accept',
+            'audio is small and must survive a video-sized backlog');
+        assertEqual(pure.backpressureDecision('audio', hardLimit), 'accept');
+        assertEqual(pure.backpressureDecision('audio', hardLimit + 1), 'abort',
+            'a queue past the hard limit means the relay is not reading at all');
+        assertEqual(pure.backpressureDecision('video', hardLimit + 1), 'abort');
+    },
+
+    'studio-ingest-batches-whole-frames-only': async () => {
+        const pure = studioIngestPure();
+        const queue = pure.createChunkQueue();
+        const first = { data: new Uint8Array(100).fill(1), kind: 'video' };
+        const second = { data: new Uint8Array(100).fill(2), kind: 'audio' };
+        const third = { data: new Uint8Array(100).fill(3), kind: 'video' };
+        queue.push(first);
+        queue.push(second);
+        queue.push(third);
+
+        const batch = await queue.takeBatch(150, 0);
+        assertEqual(batch.length, 2,
+            'the byte cap must stop at a frame boundary, not split the second frame');
+        assert(batch[0] === first && batch[1] === second,
+            'a batch must preserve queue order');
+        assertEqual(queue.length, 1, 'the frame that did not fit must stay queued');
+
+        const rest = await queue.takeBatch(150, 0);
+        assertEqual(rest.length, 1);
+        assert(rest[0] === third, 'the remaining frame must be sent next');
+
+        const oversized = { data: new Uint8Array(500).fill(4), kind: 'video' };
+        queue.push(oversized);
+        const big = await queue.takeBatch(150, 0);
+        assertEqual(big.length, 1);
+        assert(big[0] === oversized, 'a frame larger than the cap is still sent whole');
+        assertEqual(big[0].data.byteLength, 500);
+
+        queue.close();
+        assertEqual(await queue.takeBatch(150, 0), null,
+            'a closed queue must end the pump instead of waiting forever');
+    },
+
+    'studio-worklet-s16le-is-interleaved-and-clamped'() {
+        const { instance, posted } = compileWorklet(4, 2, 's16le');
+        instance.process([[
+            Float32Array.from([0.5, -0.5, 1.5, -1.5]),
+            Float32Array.from([0.25, -0.25, 0.75, -0.75])
+        ]]);
+
+        assertEqual(posted.length, 1, 'one complete 4-sample frame must be posted');
+        const message = posted[0];
+        assertEqual(message.format, 's16le', 'the ingest path must ask for raw PCM');
+        assertEqual(message.frames, 4, 'the message must state the sample frames per channel');
+        assertEqual(message.channels, undefined, 's16le must be interleaved, not planar');
+        assertEqual(Array.from(new Int16Array(message.buffer)), [
+            16384, 8192,
+            -16384, -8192,
+            32767, 24575,
+            -32768, -24576
+        ], 'channels must interleave L/R and clamp beyond unity instead of wrapping');
+        assertEqual(message.buffer.byteLength, 4 * 2 * 2,
+            's16le stereo is four bytes per sample frame');
     },
 });
 

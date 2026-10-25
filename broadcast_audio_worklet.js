@@ -27,6 +27,10 @@ class StudioPcmTap extends AudioWorkletProcessor {
         const opts = (options && options.processorOptions) || {};
         this.frameSize = opts.frameSize || 480;
         this.channels = Math.max(1, opts.channels || 2);
+        // The studio's ingest path wants interleaved 16-bit PCM for ffmpeg;
+        // broadcast.js still consumes the planar float frames. Both shapes come
+        // out of the same accumulator so the two paths cannot drift apart.
+        this.s16le = opts.format === 's16le';
         // One interleaved-free planar buffer per channel, grown as needed.
         this.buffers = [];
         for (let c = 0; c < this.channels; c += 1) {
@@ -134,23 +138,44 @@ class StudioPcmTap extends AudioWorkletProcessor {
         // one, which is what the receiver's jitter buffer needs.
         const timestamp = Math.round(currentTime * 1000000);
         const transfers = [];
-        const payload = { timestamp, channels: [] };
-        const snapshots = [];
+        // The accumulator is reset BEFORE the post. If postMessage threw while
+        // `filled` was still frameSize, the next process() would compute a room
+        // of 0 and loop forever on the real-time thread.
+        const snapshots = this.s16le ? null : [];
         for (let c = 0; c < this.channels; c += 1) {
+            if (this.s16le) continue;
             const copy = this.buffers[c].slice(0);
             snapshots.push(copy);
             transfers.push(copy.buffer);
         }
-        // The accumulator is reset BEFORE the post. If postMessage threw while
-        // `filled` was still frameSize, the next process() would compute a room
-        // of 0 and loop forever on the real-time thread.
+
+        let message;
+        if (this.s16le) {
+            // Interleaved, little-endian, exactly what `-f s16le -ar 48000
+            // -ac 2` expects. Clamping before the multiply is what stops a
+            // summed mix above unity from wrapping to full-scale noise.
+            const interleaved = new Int16Array(this.frameSize * this.channels);
+            for (let i = 0; i < this.frameSize; i += 1) {
+                for (let c = 0; c < this.channels; c += 1) {
+                    const sample = this.buffers[c][i];
+                    const clamped = sample > 1 ? 1 : (sample < -1 ? -1 : sample);
+                    interleaved[i * this.channels + c] = clamped < 0
+                        ? Math.round(clamped * 32768)
+                        : Math.round(clamped * 32767);
+                }
+            }
+            transfers.push(interleaved.buffer);
+            message = { timestamp, format: 's16le', frames: this.frameSize, buffer: interleaved.buffer };
+        } else {
+            message = { timestamp, channels: snapshots };
+        }
+
         this.filled = 0;
         // A failed post is swallowed deliberately. Letting it propagate out of
         // process() tears down the audio thread for the whole context, and the
         // only thing lost is one 10 ms frame — which the next frame replaces.
-        // The accumulator is already reset, so the processor simply continues.
         try {
-            this.port.postMessage({ timestamp, channels: snapshots }, transfers);
+            this.port.postMessage(message, transfers);
         } catch (err) {
             // Intentionally ignored; see above.
         }

@@ -7,6 +7,7 @@ const zlib = require('zlib');
 const { pipeline } = require('stream');
 const { URL } = require('url');
 const { execFileSync } = require('child_process');
+const { createStudioIngest } = require('./studio_ingest');
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const MEDIAMTX_HOST = '127.0.0.1';
@@ -234,6 +235,11 @@ const STATIC_FILES = new Map([
     ['/streaming/broadcast_worker.js', 'broadcast_worker.js'],
     ['/broadcast_audio_worklet.js', 'broadcast_audio_worklet.js'],
     ['/streaming/broadcast_audio_worklet.js', 'broadcast_audio_worklet.js'],
+    // The studio's ingest client: WebCodecs H.264 -> framed POST -> local
+    // ffmpeg -> RTSP. Fetched by the page as a plain script, so it needs the
+    // same allowlist entry every other page asset has.
+    ['/studio_ingest_client.js', 'studio_ingest_client.js'],
+    ['/streaming/studio_ingest_client.js', 'studio_ingest_client.js'],
 ]);
 
 // Writes the CORS headers onto a response, replacing any that are already there.
@@ -561,11 +567,92 @@ const SSE_MAX_QUEUED_BYTES = 256 * 1024;
 // browser. This range remains exactly representable in JavaScript numbers.
 let lastChatMessageId = Date.now() * 1000;
 
+// True only for a request that a browser on THIS machine made to this machine.
+//
+// The socket address is not enough. cloudflared (and Tailscale Serve) dial this
+// process over loopback, so every remote viewer also arrives from 127.0.0.1;
+// the proxy headers are what distinguish them when the proxy sets one. A
+// DNS-rebinding page is the harder case: it makes the browser connect to
+// 127.0.0.1 with no proxy headers, but the Host header is the attacker's own
+// hostname, and the browser's Origin is the attacker's origin. Both are checked
+// here so a rebinding page cannot read /stream-api/host-info, spawn the studio
+// relay's ffmpeg, or publish to WHIP through the loopback interface.
+//
+// This is the same answer as "is this the host?", because it is the same fact:
+// HOST chat badges, host diagnostics and publish rights must not disagree.
+function loopbackHost(req) {
+    const host = req.headers.host;
+    if (typeof host !== 'string' || !host) return null;
+    try {
+        const parsed = new URL(`http://${host}`);
+        if (parsed.hostname !== '127.0.0.1'
+            && parsed.hostname !== 'localhost'
+            && parsed.hostname !== '[::1]'
+            && parsed.hostname !== '::1') {
+            return null;
+        }
+        return parsed.host.toLowerCase();
+    } catch (_) {
+        return null;
+    }
+}
+
 function isDirectLocal(req) {
     const ip = req.socket && req.socket.remoteAddress;
     const isLoopbackIp = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
-    const hasProxyHeaders = Boolean(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']);
-    return isLoopbackIp && !hasProxyHeaders;
+    const hasProxyHeaders = Boolean(
+        req.headers['cf-connecting-ip']
+        || req.headers['x-forwarded-for']
+        || req.headers['forwarded']
+    );
+    if (!isLoopbackIp || hasProxyHeaders) return false;
+
+    const host = loopbackHost(req);
+    if (!host) return false;
+
+    // A local page's own fetches carry an Origin that matches the Host exactly.
+    // Any other Origin is a cross-site request, which no part of the host-only
+    // control plane accepts. Non-browser tools omit Origin and are allowed.
+    const origin = req.headers.origin;
+    if (origin !== undefined) {
+        try {
+            const parsed = new URL(origin);
+            if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+                || parsed.host.toLowerCase() !== host) {
+                return false;
+            }
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // Defense in depth for browsers that send it; absent for curl/OBS.
+    return req.headers['sec-fetch-site'] !== 'cross-site';
+}
+
+// MediaMTX serves WHIP on the same WebRTC HTTP port as WHEP, and `live` (plus
+// both renditions) sets `overridePublisher: yes`. A POSTed offer therefore took
+// the public stream from whoever owned it. Before this guard, an internet
+// client could publish to https://stream.rydius.in/stream-api/live/whip and
+// evict OBS; a DNS-rebinding page could do the same from this machine's own
+// browser. Nothing legitimate needs that: OBS's WHIP ingest is configured
+// against http://127.0.0.1:8889/live/whip directly (bypassing this proxy), and
+// the browser studio's relay is host-only for the same reason.
+//
+// WHEP is deliberately untouched. Readers need to create, trickle and DELETE
+// sessions from anywhere, and WHEP paths contain `whep`, not `whip`.
+const WHIP_PUBLISH_METHODS = new Set(['POST', 'PATCH', 'DELETE', 'PUT']);
+
+function isWhipPublishRequest(req, requestUrl) {
+    if (!WHIP_PUBLISH_METHODS.has(req.method)) return false;
+    if (!requestUrl.pathname.startsWith('/stream-api/')) return false;
+    // Decode once before matching so /live/%77hip cannot slip past the guard
+    // and be decoded into /live/whip by an upstream that normalizes paths.
+    let pathname = requestUrl.pathname;
+    try {
+        pathname = decodeURIComponent(pathname);
+    } catch (_) { /* keep the raw path; malformed escapes cannot match */ }
+    return /(?:^|\/)whip(?:\/|$)/i.test(pathname.slice('/stream-api'.length));
 }
 
 // Client identity for rate limiting.
@@ -1179,6 +1266,16 @@ function handleChat(req, res, requestUrl) {
     res.end('404 Not Found');
 }
 
+// The browser studio's publish path. Instead of asking the browser to encode
+// for WebRTC (which is what pinned this laptop at ~16 fps), the page encodes
+// with WebCodecs and streams framed H.264 + PCM here; this process hands the
+// frames to a local ffmpeg that copies the video and publishes RTSP to the same
+// `live` path OBS uses. Only ever created for a request that passed
+// isDirectLocal(), because it spawns a child process.
+const studioIngest = createStudioIngest({
+    log: (line) => console.log(line)
+});
+
 const server = http.createServer((req, res) => {
     // A response can legitimately error after its request handler already
     // returned (a socket write racing the client's disconnect, a half-closed
@@ -1194,8 +1291,15 @@ const server = http.createServer((req, res) => {
     // description is memoised) and set before any writeHead, so it rides along
     // on static assets and proxied responses alike; an explicit header of the
     // same name elsewhere would still win.
+    //
+    // Host-only. The operator reads this on the machine that serves the page;
+    // publishing it to the Cloudflare tunnel would disclose the Windows
+    // username and checkout layout, which is exactly why /stream-api/host-info
+    // is gated the same way.
     try {
-        res.setHeader('X-Rydius-Served-From', describeCheckout().dir);
+        if (isDirectLocal(req)) {
+            res.setHeader('X-Rydius-Served-From', describeCheckout().dir);
+        }
     } catch (_) { /* never let diagnostics break a response */ }
 
     let requestUrl;
@@ -1211,6 +1315,55 @@ const server = http.createServer((req, res) => {
         if (req.method === 'OPTIONS') {
             res.writeHead(204, setCorsHeaders({ 'Cache-Control': CACHE_CONTROL }));
             res.end();
+            return;
+        }
+        // Publishing is host-only: see isWhipPublishRequest(). Refusing here,
+        // before the proxy, means a remote publisher never reaches MediaMTX at
+        // all and cannot take the `live` path from OBS.
+        if (isWhipPublishRequest(req, requestUrl) && !isDirectLocal(req)) {
+            const body = JSON.stringify({
+                error: 'Publishing is host-only. OBS: use http://127.0.0.1:8889/live/whip. '
+                    + 'Browser studio: open http://127.0.0.1:3000/streaming/studio on the '
+                    + 'computer that runs the stream.'
+            });
+            res.writeHead(403, setCorsHeaders({
+                'Content-Type': 'application/json; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL,
+                'Content-Length': Buffer.byteLength(body)
+            }));
+            res.end(body);
+            return;
+        }
+        if (requestUrl.pathname === '/stream-api/studio/session'
+            || requestUrl.pathname.startsWith('/stream-api/studio/')) {
+            // Not proxied, and deliberately not reachable through the tunnel:
+            // these routes spawn ffmpeg and bind named pipes on this machine.
+            // The check is the request's real socket plus the absence of any
+            // proxy header, the same rule /stream-api/host-info uses to decide
+            // "is this the host?" - so a tunneled visitor is told to broadcast
+            // from the host rather than silently controlling its processes.
+            if (!isDirectLocal(req)) {
+                const body = JSON.stringify({
+                    error: 'Browser broadcasting only works on the host machine. '
+                        + 'Open http://127.0.0.1:3000/streaming/studio on the PC that runs the stream.'
+                });
+                res.writeHead(403, setCorsHeaders({
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL,
+                    'Content-Length': Buffer.byteLength(body)
+                }));
+                res.end(body);
+                return;
+            }
+            if (studioIngest.handle(req, res, requestUrl)) return;
+            // A path under /stream-api/studio/ that the relay does not know.
+            // Without this the request would fall through with no response and
+            // hang until the browser's own timeout.
+            res.writeHead(404, setCorsHeaders({
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL
+            }));
+            res.end('404 Not Found');
             return;
         }
         if (requestUrl.pathname === '/stream-api/turn') {
@@ -1471,10 +1624,33 @@ process.on('uncaughtException', (err) => {
 // socket was being torn down in a race with the very next request. A WHEP
 // handshake is a POST, and browsers do not reliably retry a failed POST on a
 // reused socket: losing that race produced a failed handshake, a reconnect and
-// a visible freeze on a perfectly healthy link. 65s is the conventional pairing
-// with the 60s header timeout and leaves ample margin.
+// a visible freeze on a perfectly healthy link. 65s leaves ample margin over
+// every client cadence in the project.
 server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
+// A finite request must not be allowed to hold a socket forever. Node's
+// requestTimeout measures receipt of the ENTIRE request, so the old value (0)
+// removed the only bound on a slow-body client: chat and reaction bodies are
+// read by readJsonBody(), and an attacker could send headers plus a few bytes
+// and keep the connection open indefinitely. The studio relay does NOT need an
+// unbounded request - it deliberately sends finite batches and waits for each
+// response (studio_ingest.js), so 15s is orders of magnitude above a healthy
+// batch while still reclaiming a stalled one.
+//
+// The enforcement sweep is the part that is easy to miss: Node only evaluates
+// these deadlines on server.connectionsCheckingInterval, which defaults to 30s.
+// With the default, a 30s requestTimeout could hold a socket for up to ~60s -
+// measured here with a stalled upload that was still open at 40s. 5s keeps the
+// worst case close to the configured deadline without waking often enough to
+// matter.
+//
+// headersTimeout must not exceed requestTimeout. Node destroys the connection
+// on min(headersTimeout, requestTimeout), so the previous 66s header timeout
+// silently disabled the 15s request deadline (measured: a stalled body was
+// still open after 25s with headers=66s, and closed in 2.4s with both at 2s).
+// Both are 15s now; every legitimate client sends headers immediately.
+server.headersTimeout = 15000;
+server.requestTimeout = 15000;
+server.connectionsCheckingInterval = 5000;
 
 server.listen(PORT, '127.0.0.1', () => {
     console.log('Rydius Stream host is running on this laptop.');
@@ -1509,3 +1685,13 @@ server.listen(PORT, '127.0.0.1', () => {
     console.log('Remote viewers: share https://stream.rydius.in once setup_cloudflared.ps1 has been run (the Tailscale URL also still works).');
     console.log('Keep this window open while streaming.');
 });
+
+// Ctrl+C in the launcher window must take the studio's ffmpeg with it. Without
+// this the child outlives the host, keeps the RTSP publisher slot, and the next
+// broadcast silently displaces nothing while the old feed stays frozen on air.
+for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+        try { studioIngest.closeAll(); } catch (_) { /* best effort */ }
+        process.exit(0);
+    });
+}

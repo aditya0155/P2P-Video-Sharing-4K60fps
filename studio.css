@@ -314,12 +314,11 @@ body {
     50% { opacity: 0.25; }
 }
 
-/* --- Experimental notice ------------------------------------------------- */
+/* --- Standing notice ---------------------------------------------------- */
 
-/* Amber rather than red: red is the colour this page already spends on a hard
-   failure (the status pill's data-state="error"), and reusing it here would
-   make a standing advisory read as a broken broadcast. Amber says "look at
-   this" without claiming the encoder has already given up. */
+/* Amber is the default advisory colour. The studio's standing notice is
+   informational (cyan) and the off-host state is a hard stop (red); both
+   override the base block below. */
 .studio-notice {
     margin-bottom: 18px;
     padding: 16px 18px;
@@ -327,6 +326,26 @@ body {
     border-left: 3px solid var(--amber);
     border-radius: var(--radius-lg);
     background: rgba(245, 158, 11, 0.07);
+}
+
+.studio-notice.is-info {
+    border-color: rgba(34, 211, 238, 0.28);
+    border-left-color: var(--cyan);
+    background: rgba(34, 211, 238, 0.06);
+}
+
+.studio-notice.is-info .studio-notice-head i {
+    color: var(--cyan);
+}
+
+.studio-notice.is-error {
+    border-color: rgba(239, 68, 68, 0.34);
+    border-left-color: var(--red);
+    background: var(--red-dim);
+}
+
+.studio-notice.is-error .studio-notice-head i {
+    color: var(--red);
 }
 
 /* Same head treatment as .studio-group-title, so the notice reads as part of
@@ -815,6 +834,34 @@ body {
 .studio-select option {
     background: var(--bg-deep);
     color: var(--text-primary);
+}
+
+/* Encoder settings are locked for the life of a broadcast. The disabled state
+   has to be visible, not just non-interactive. */
+.studio-select:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    border-color: var(--border-subtle);
+}
+
+/* Read-only encoder fact (the codec). Same footprint as a select so the
+   control column keeps its rhythm. */
+.studio-static {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 9px 11px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-deep);
+    color: var(--text-primary);
+    font-size: 13px;
+}
+
+.studio-static i {
+    color: var(--cyan);
+    font-size: 12px;
 }
 
 /* The first .studio-field after a .studio-hint needs to clear that hint.
