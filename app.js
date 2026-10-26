@@ -164,6 +164,14 @@ document.addEventListener('DOMContentLoaded', () => {
     let elementStreamSessionId = -1;     // Which session built the stream currently on the element
     let viewerPausedByChoice = false;    // True when the viewer (not a controller) paused playback
     let activeStreamPath = 'live';       // Path chosen for this session: live, live-av1 or live-h264
+    // A viewer whose software decoder cannot sustain the source resolution is
+    // moved to the bridge's 720p live-h264 rendition. Persist that verdict so a
+    // reload does not spend the first seconds stuttering on 1080p again.
+    const H264_RESCUE_STORAGE_KEY = 'rydius_h264_rescue';
+    let preferH264Rescue = false;
+    try {
+        preferH264Rescue = localStorage.getItem(H264_RESCUE_STORAGE_KEY) === '1';
+    } catch (e) { /* storage unavailable: default to full quality */ }
     let isConnected = false;
     let isConnecting = false;
     let connectionStartTime = 0;
@@ -176,6 +184,17 @@ document.addEventListener('DOMContentLoaded', () => {
     let lastFramesReceived = 0;         // framesReceived baseline (decode-pressure detection)
     let lastFramesDiscarded = 0;        // framesDiscarded baseline (decoder's own drops)
     let decodeLagSec = 0;               // Consecutive seconds decoded lags received (decode pressure)
+    // Sustained presentation-deficit state. `decodeLagSec` cannot see a
+    // software decoder that is simply too slow for the source: the jitter
+    // buffer discards frames before emitting them, so decoded/emitted stays
+    // near 1.0. This window compares frames RECEIVED with frames PRESENTED.
+    const DECODE_DEFICIT_WINDOW_TICKS = 5;
+    const DECODE_DEFICIT_TRIGGER_TICKS = 3;
+    let decodeDeficitWindow = [];       // 1 = deficit tick, 0 = clean tick
+    let decodeDeficitActive = false;
+    let decodeDeficitTicks = 0;
+    let lastReceivedFps = null;
+    let lastDecodedFps = null;
     let lastStatsTime = 0;
     let controlsHideTimeout = null;
     // Last pointer position that counted as real activity. A resting hand
@@ -1335,6 +1354,46 @@ document.addEventListener('DOMContentLoaded', () => {
         return Math.max(0, lagSec - 1);
     }
 
+    // Sustained presentation-deficit detector (pure — unit-tested).
+    //
+    // The existing decode-pressure ratio is decoded/emitted, which is blind to
+    // a decoder that is too slow for the SOURCE resolution: the jitter buffer
+    // discards late frames before the decoder ever sees them, so the decoder
+    // processes ~100% of what it is handed while the viewer sees a slideshow.
+    // The signature measured in Firefox at 1080p60 H.264 is unambiguous:
+    // framesReceived ~60/s, framesDecoded 10-39/s, framesDropped 5-60/s,
+    // pictureLoss 37-82%, packetsLost 0.
+    //
+    // A tick is a deficit when frames arrive at a real rate, the network is
+    // clean, picture loss is large, and the presentation rate is far below the
+    // arrival rate. Three such ticks in the last five (not necessarily
+    // consecutive) are enough: a 60fps decode collapse alternates with partial
+    // recovery as the buffer sheds frames, and a strict streak never fires.
+    function updateDecodeDeficit(window, sample) {
+        const prior = Array.isArray(window)
+            ? window.slice(-(DECODE_DEFICIT_WINDOW_TICKS - 1))
+            : [];
+        const s = sample || {};
+        const receivedFps = Number.isFinite(s.receivedFps) ? s.receivedFps : null;
+        const presentedFps = Number.isFinite(s.presentedFps) ? s.presentedFps : null;
+        const plrPct = Number.isFinite(s.plrPct) ? s.plrPct : null;
+        const netLossPct = Number.isFinite(s.netLossPct) ? s.netLossPct : null;
+        const measurable = receivedFps !== null && presentedFps !== null
+            && plrPct !== null && netLossPct !== null;
+        const deficit = measurable
+            && receivedFps >= 15
+            && netLossPct <= 1
+            && plrPct >= 25
+            && presentedFps < receivedFps * 0.7;
+        const next = prior.concat(deficit ? 1 : 0);
+        const deficitTicks = next.reduce((sum, value) => sum + value, 0);
+        return {
+            window: next,
+            deficitTicks,
+            active: deficitTicks >= DECODE_DEFICIT_TRIGGER_TICKS,
+        };
+    }
+
     // Base playout/jitter-buffer target before accommodation: what the user
     // selected plus what the measured network needs right now.
     function baseBufferTargetMs() {
@@ -1975,6 +2034,18 @@ document.addEventListener('DOMContentLoaded', () => {
             try { player.cancelVideoFrameCallback(freezeWatchdogId); } catch (e) { /* already fired */ }
         }
         freezeWatchdogId = null;
+        // Assigning srcObject tears the element's pipeline down and silently
+        // drops the pending callback, but `freezeWatchdogId` keeps the dead
+        // handle. ensureVideoFrameCallback() refuses to register while it is
+        // set, so the replacement session ran with NO presentation signal:
+        // lastFrameTime froze at the switch, and 3-4.5s later the watchdog tore
+        // down a perfectly healthy picture (measured: reconnects every ~15s on
+        // a 720p stream whose currentTime advanced smoothly). Reset the
+        // staleness baseline with the handle — the deliberate rebuild gap is
+        // not a freeze, and counting it guaranteed the false positive.
+        lastFrameTime = performance.now();
+        frozenSince = 0;
+        focusedStallSince = 0;
         ensureVideoFrameCallback();
     }
 
@@ -2002,6 +2073,11 @@ document.addEventListener('DOMContentLoaded', () => {
         // measurementSuspended: true.
         currentFrameRate = null;
         lastPlrPct = null;
+        decodeDeficitWindow = [];
+        decodeDeficitActive = false;
+        decodeDeficitTicks = 0;
+        lastReceivedFps = null;
+        lastDecodedFps = null;
         specFreezeMs = null;
         stallDetectMs = null;
         frozenSince = 0;
@@ -2023,6 +2099,11 @@ document.addEventListener('DOMContentLoaded', () => {
         lastPresentedFramesAtTick = lastPresentedFrames;
         lastPresentedTickAt = 0;
         lastPlrPct = null;
+        decodeDeficitWindow = [];
+        decodeDeficitActive = false;
+        decodeDeficitTicks = 0;
+        lastReceivedFps = null;
+        lastDecodedFps = null;
         frozenSince = 0;
         focusedStallSince = 0;
         presentationRebasePending = true;
@@ -2165,12 +2246,23 @@ document.addEventListener('DOMContentLoaded', () => {
             const ladderSource = renditionPathsItems.find((item) => item && item.name === 'live');
             const sourceTracks = ladderSource && Array.isArray(ladderSource.tracks) ? ladderSource.tracks : [];
             const sourceIsAv1 = sourceTracks.some((t) => typeof t === 'string' && t.toUpperCase() === 'AV1');
+            const sourceIsH264 = sourceTracks.some((t) => typeof t === 'string' && t.toUpperCase() === 'H264');
+            const sourceHasOpus = sourceTracks.some((t) => typeof t === 'string' && t.toUpperCase() === 'OPUS');
             const rendReady = renditionPathsItems.some((item) => item && item.name === 'live-av1'
                 && (item.ready === true || item.online === true));
             // 'live-h264' is included because an audio-rescue viewer sits on it
             // (full source bitrate, no sound on the native path) — a weak link
             // must be able to step down to the 3000k rendition from there too.
-            const onFullBitratePath = activeStreamPath === 'live' || activeStreamPath === 'live-h264';
+            //
+            // The 720p H.264 rescue is the exception. It exists because the
+            // decoder cannot sustain 1080p, so "downgrading" it to the 1080p
+            // AV1 rendition on network stress would hand the same slow decoder
+            // a larger picture. It stays put; the buffer supervisor still
+            // handles the link.
+            const onH264RescuePath = sourceIsH264 && sourceHasOpus
+                && activeStreamPath === 'live-h264';
+            const onFullBitratePath = activeStreamPath === 'live'
+                || (activeStreamPath === 'live-h264' && !onH264RescuePath);
             // The downgrade target DECODES AV1: a browser without AV1 support
             // (or with software-only decode) would land in an undecodable
             // session — strictly worse than the stutter it is escaping. Those
@@ -2214,7 +2306,8 @@ document.addEventListener('DOMContentLoaded', () => {
                         ? true : false,
                     av1DecodeSmooth,
                     'preferNonTranscode',
-                    browserSupportsH265()
+                    browserSupportsH265(),
+                    preferH264Rescue
                 );
                 if (upgradeTarget && upgradeTarget !== 'live-av1') {
                     // Back at full quality on a link that has held calm for 20s,
@@ -2224,6 +2317,43 @@ document.addEventListener('DOMContentLoaded', () => {
                         'Connection recovered — back to the full-quality rendition.');
                     return;
                 }
+            }
+        }
+
+        // --- Sustained presentation deficit: 720p H.264 rescue ---
+        // The decode-pressure ratio below cannot see this failure: the jitter
+        // buffer discards frames before the decoder sees them, so
+        // decoded/emitted stays near 1.0 while the viewer gets a slideshow.
+        // This branch acts on received-vs-presented instead, and only for the
+        // H264 + Opus source that publishes the 720p rendition. A viewer
+        // already at or below 720p has nothing to gain from a teardown.
+        if (decodeDeficitActive && now - lastRenditionSwitchAt > 60000 && !isConnecting
+            && Array.isArray(renditionPathsItems)) {
+            const rescueSource = renditionPathsItems.find((item) => item && item.name === 'live');
+            const rescueTracks = rescueSource && Array.isArray(rescueSource.tracks)
+                ? rescueSource.tracks : [];
+            const rescueUpper = rescueTracks
+                .filter((t) => typeof t === 'string')
+                .map((t) => t.toUpperCase());
+            const rescueIsH264 = rescueUpper.includes('H264');
+            const rescueHasOpus = rescueUpper.includes('OPUS');
+            const rescueReady = renditionPathsItems.some((item) => item && item.name === 'live-h264'
+                && (item.ready === true || item.online === true));
+            // 0 means the first frame has not landed yet (unknown); do not let
+            // that block a genuine rescue. 720p and below need no smaller copy.
+            const sourceHeight = player && Number.isFinite(player.videoHeight)
+                ? player.videoHeight : 0;
+            const sourceTooLarge = sourceHeight === 0 || sourceHeight > 720;
+            if (rescueIsH264 && rescueHasOpus && rescueReady && sourceTooLarge
+                && activeStreamPath === 'live') {
+                rememberH264Rescue();
+                decodeDeficitWindow = [];
+                decodeDeficitActive = false;
+                decodeDeficitTicks = 0;
+                switchRendition('live-h264',
+                    'This device decodes the full-resolution stream too slowly — '
+                    + 'switched to a 720p rendition for smooth playback.');
+                return;
             }
         }
 
@@ -2489,6 +2619,14 @@ document.addEventListener('DOMContentLoaded', () => {
         // catch-up/probe fight). The window itself is sliding, so a link that
         // settles stops reading as uneven and the streak decays on its own.
         const presentationUnevenness = frameGapUnevenness(frameGapWindow);
+        // A slow decoder also presents an uneven cadence, and it is the one
+        // cause a deeper buffer cannot fix: the frames are being discarded
+        // before decode, so holding more of them only adds latency. The
+        // signature is the decode-deficit one — high picture loss with a clean
+        // transport. Leave the buffer alone and let the rendition rescue act.
+        const evennessLoss = typeof lastLossPct === 'number' ? lastLossPct : null;
+        const decodeStarved = typeof lastPlrPct === 'number' && lastPlrPct >= 25
+            && (evennessLoss === null || evennessLoss <= 1);
         if (presentationUnevenness !== null) {
             // 0.35 is a coefficient of variation of the inter-frame interval.
             // Measured separation (see frameGapUnevenness): a steady stream ~0.00,
@@ -2497,7 +2635,8 @@ document.addEventListener('DOMContentLoaded', () => {
             // every "must not fire" case and below every "must fire" case.
             const UNEVEN_THRESHOLD = 0.35;
             const UNEVEN_STREAK = 3;
-            if (!unevenWidenApplied && presentationUnevenness > UNEVEN_THRESHOLD) {
+            if (!unevenWidenApplied && !decodeStarved
+                && presentationUnevenness > UNEVEN_THRESHOLD) {
                 unevenStreakTicks += 1;
                 if (unevenStreakTicks >= UNEVEN_STREAK) {
                     // A DEDICATED floor, not `accommodationTargetMs`. That variable
@@ -2510,8 +2649,18 @@ document.addEventListener('DOMContentLoaded', () => {
                     // not owned or decayed by the accommodation controller, so the
                     // widen survives; the only decay it has is the slow release
                     // below, which a manual latency-mode change also clears.
-                    unevenFloorMs = Math.min(2200, Math.max(baseBufferTargetMs() + 200, 600));
-                    if (unevenFloorMs > currentBufferTargetMs()) {
+                    //
+                    // Compute the candidate BEFORE assigning it. `baseBuffer-
+                    // TargetMs()` includes `unevenFloorMs`, so assigning first
+                    // made `unevenFloorMs > currentBufferTargetMs()` compare the
+                    // new floor against itself — always false. The latch never
+                    // set, and every three uneven ticks re-based the floor on the
+                    // previous one: 1200 -> 1400 -> ... -> 2200ms in ~18s, with
+                    // presentation collapsing behind it. Measured live on the
+                    // 720p H.264 rescue as a 2fps slideshow.
+                    const widenTo = Math.min(2200, Math.max(baseBufferTargetMs() + 200, 600));
+                    if (widenTo > currentBufferTargetMs()) {
+                        unevenFloorMs = widenTo;
                         unevenWidenApplied = true;
                         console.log('[AdaptiveBuffer] Presentation is continuously uneven '
                             + `(gap cv ${presentationUnevenness.toFixed(2)}) with no loss, `
@@ -2867,6 +3016,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (r.track) replacement.addTrack(r.track);
                     });
                     player.srcObject = replacement;
+                    // The element was just reset; re-arm rVFC or the watchdog
+                    // runs blind for the rest of this session.
+                    rearmVideoFrameCallback();
                     elementStreamSessionId = currentSessionId;
                     closeRenditionSeam();
                     console.log(`[ABR] Seam closed: ${replacement.getTracks().length} track(s) now on screen.`);
@@ -2882,6 +3034,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (r.track) fresh.addTrack(r.track);
                     });
                     player.srcObject = fresh;
+                    rearmVideoFrameCallback();
                     elementStreamSessionId = currentSessionId;
                     closeRenditionSeam();
                     console.log(`[WebRTC] Rebuilt player.srcObject for session ${currentSessionId} `
@@ -2889,6 +3042,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else if (!player.srcObject || !(player.srcObject instanceof MediaStream)) {
                     // Initialize srcObject as a new MediaStream if it doesn't exist yet
                     player.srcObject = new MediaStream();
+                    rearmVideoFrameCallback();
                     elementStreamSessionId = currentSessionId;
                     closeRenditionSeam();
                     console.log("[WebRTC] Initialized player.srcObject with a new MediaStream.");
@@ -3900,6 +4054,16 @@ document.addEventListener('DOMContentLoaded', () => {
         return av1DecodeSmooth;
     }
 
+    // Persist a decode-rescue verdict. Called only when the 720p rendition is
+    // actually about to be used, so a viewer who never needs it keeps full
+    // quality on later loads.
+    function rememberH264Rescue() {
+        preferH264Rescue = true;
+        try {
+            localStorage.setItem(H264_RESCUE_STORAGE_KEY, '1');
+        } catch (e) { /* storage unavailable: the in-memory verdict still applies */ }
+    }
+
     // Pick the stream path this browser should play, from a MediaMTX
     // /v3/paths/list response. Pure function (unit-tested in js_checks.js).
     //
@@ -3940,9 +4104,14 @@ document.addEventListener('DOMContentLoaded', () => {
     // code' moves a recovered viewer back to the source; 'auto' (default) is
     // the plain quality-first matrix.
     //
+    // h264Rescue is the persisted decode verdict: a viewer that already failed
+    // to sustain this source's resolution starts on the 720p H.264 rescue
+    // instead of re-testing 1080p on every load.
+    //
     // Returns a path name, or null when the source is up but no compatible
     // rendition exists yet (codec_bridge.js is still starting).
-    function chooseStreamPath(items, av1Capable, av1Smooth = true, preference = 'auto', h265Capable = true) {
+    function chooseStreamPath(items, av1Capable, av1Smooth = true, preference = 'auto',
+        h265Capable = true, h264Rescue = false) {
         if (!Array.isArray(items)) return null;
         const source = items.find((item) => item && item.name === 'live');
         if (!source || !(source.ready === true || source.online === true)) return null;
@@ -3951,6 +4120,7 @@ document.addEventListener('DOMContentLoaded', () => {
             .filter((t) => typeof t === 'string')
             .map((t) => t.toUpperCase());
         const sourceIsAv1 = upperTracks.includes('AV1');
+        const sourceIsH264 = upperTracks.includes('H264');
         const hasOpusAudio = upperTracks.includes('OPUS');
         // Every non-video track MediaMTX reports is audio ('Opus',
         // 'MPEG-4 Audio', ...), mirroring codec_bridge.js's rule.
@@ -4023,6 +4193,14 @@ document.addEventListener('DOMContentLoaded', () => {
         // that cannot carry the source now degrades on evidence, and a viewer on
         // a healthy link keeps full quality. `preferTranscode` is still honoured
         // for callers that explicitly want the cheap rung.
+        //
+        // A decode-rescued viewer is the exception: the native path is exactly
+        // what its decoder could not sustain, so it starts (and ABR-upgrades)
+        // on the bridge's 720p H.264 rescue. Only H264 sources publish that
+        // rendition, and the AAC audio-rescue branch above already returned.
+        if (sourceIsH264 && h264Rescue && ready('live-h264')) {
+            return 'live-h264';
+        }
         if (preference === 'preferTranscode') {
             return (av1Capable && av1Smooth !== false && ready('live-av1')) ? 'live-av1' : 'live';
         }
@@ -4077,7 +4255,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     browserSupportsAv1(),
                     await probeAv1DecodeSmooth(),
                     'auto',
-                    browserSupportsH265()
+                    browserSupportsH265(),
+                    preferH264Rescue
                 );
                 if (chosenPath) {
                     activeStreamPath = chosenPath;
@@ -4247,6 +4426,11 @@ document.addEventListener('DOMContentLoaded', () => {
         lastFramesReceived = 0;
         lastFramesDiscarded = 0;
         decodeLagSec = 0;
+        decodeDeficitWindow = [];
+        decodeDeficitActive = false;
+        decodeDeficitTicks = 0;
+        lastReceivedFps = null;
+        lastDecodedFps = null;
         lastStatsTime = performance.now();
         lastStatsWindowMs = 0;
 
@@ -4934,7 +5118,29 @@ document.addEventListener('DOMContentLoaded', () => {
                         // ~2200ms (the code's own comment puts a hidden span at
                         // 1.7-2.8s) and leave it inert for the rest of the
                         // session. Re-baseline instead of acting.
-                        if (rebaseThisTick) {
+                        // A decoder that cannot keep up is not a link that
+                        // needs a deeper buffer. The signature is the one the
+                        // decode-deficit detector documents above: frames
+                        // arrive at a real rate, the transport is clean, and
+                        // picture loss is large because the jitter buffer
+                        // discarded frames before the decoder could use them.
+                        // Raising the target in that state parks even more
+                        // frames behind the same slow decoder. Measured live
+                        // on the 720p H.264 rescue: the accommodation walked
+                        // to its 2200ms cap while presentation collapsed to
+                        // 7fps, and holding the 1000ms base instead kept the
+                        // same stream at ~60fps. Drain any earlier raise and
+                        // let the decode-deficit branch switch renditions.
+                        const plrNow = dReceived > 0
+                            ? pictureLossRatioPct(dReceived, dDecoded)
+                            : lastPlrPct;
+                        const decoderStarvedWindow = Number.isFinite(plrNow)
+                            && plrNow >= 25
+                            && (lastLossPct === null || lastLossPct <= 1);
+                        if (decoderStarvedWindow) {
+                            accommodationTargetMs = Math.max(0, accommodationTargetMs - 100);
+                            accommodationCalmTicks = 0;
+                        } else if (rebaseThisTick) {
                             accommodationCalmTicks = 0;
                         } else if (!measurementValid) {
                             // A covered window's drop and late-frame evidence
@@ -5008,6 +5214,35 @@ document.addEventListener('DOMContentLoaded', () => {
                     currentFrameRate = measurementValid
                         ? (presentedFpsValid ? lastPresentedFps : (reportedFps ?? measuredFps))
                         : null;
+                    // Sustained presentation deficit. `decodeLagSec` above is
+                    // blind to a software decoder that is too slow for the
+                    // SOURCE resolution: the jitter buffer discards late
+                    // frames before the decoder sees them, so decoded/emitted
+                    // stays near 1.0 while the viewer gets a slideshow.
+                    // Compare arrivals with what actually reached the screen.
+                    if (measurementValid && timeDiffSec > 0.5 && dReceived > 0) {
+                        const receivedFps = dReceived / timeDiffSec;
+                        const decodedFps = decodedDiff >= 0 ? decodedDiff / timeDiffSec : null;
+                        const presentedFps = presentedFpsValid && Number.isFinite(lastPresentedFps)
+                            ? lastPresentedFps : decodedFps;
+                        const deficit = updateDecodeDeficit(decodeDeficitWindow, {
+                            receivedFps,
+                            presentedFps,
+                            plrPct: lastPlrPct,
+                            netLossPct: lastLossPct,
+                        });
+                        decodeDeficitWindow = deficit.window;
+                        decodeDeficitActive = deficit.active;
+                        decodeDeficitTicks = deficit.deficitTicks;
+                        lastReceivedFps = receivedFps;
+                        lastDecodedFps = decodedFps;
+                    } else {
+                        decodeDeficitWindow = [];
+                        decodeDeficitActive = false;
+                        decodeDeficitTicks = 0;
+                        lastReceivedFps = null;
+                        lastDecodedFps = null;
+                    }
                     // The spec's freeze bound moves with the frame rate, so it
                     // has to be derived from the rate actually in force rather
                     // than from a constant that is only correct at one rate. In
@@ -5185,6 +5420,11 @@ document.addEventListener('DOMContentLoaded', () => {
         currentFrameRate = null;
         lastPresentedFps = null;
         presentedFpsValid = false;
+        decodeDeficitWindow = [];
+        decodeDeficitActive = false;
+        decodeDeficitTicks = 0;
+        lastReceivedFps = null;
+        lastDecodedFps = null;
         renderStreamSummary('offline');
     }
 
@@ -5298,6 +5538,27 @@ document.addEventListener('DOMContentLoaded', () => {
                     netLossPct: lastLossPct === null ? 'unavailable' : Number(lastLossPct.toFixed(2)),
                     rtxRepairRatePct: lastRepairRatePct === null ? 'no loss in this window' : Number(lastRepairRatePct.toFixed(1))
                 },
+                // Why a clean network can still produce a slideshow: a software
+                // decoder that cannot sustain the source resolution leaves
+                // frames in the jitter buffer, which discards them before the
+                // decoder sees them. `decodeLagSec` stays near 0; the deficit
+                // window is the measurement that actually fires.
+                decode: {
+                    decodeLagSec: Number(decodeLagSec.toFixed(2)),
+                    nominalFps: stallReferenceFps === null
+                        ? 'unavailable' : Number(stallReferenceFps.toFixed(2)),
+                    receivedFps: lastReceivedFps === null
+                        ? 'unavailable' : Number(lastReceivedFps.toFixed(2)),
+                    decodedFps: lastDecodedFps === null
+                        ? 'unavailable' : Number(lastDecodedFps.toFixed(2)),
+                    presentedFps: lastPresentedFps === null
+                        ? 'unavailable' : Number(lastPresentedFps.toFixed(2)),
+                    plrPct: lastPlrPct === null ? 'unavailable' : Number(lastPlrPct.toFixed(2)),
+                    netLossPct: lastLossPct === null ? 'unavailable' : Number(lastLossPct.toFixed(2)),
+                    deficitTicks: decodeDeficitTicks,
+                    deficitActive: decodeDeficitActive,
+                    preferH264Rescue
+                },
                 bitrateHistory: bitrateHistory.slice(-10)
             };
             const jsonText = JSON.stringify(report, null, 2);
@@ -5400,7 +5661,10 @@ document.addEventListener('DOMContentLoaded', () => {
         stallReferenceFps = null;
         stallDetectMs = null;
 
-        ensureVideoFrameCallback();
+        // A handle left over from a replaced srcObject never fires, and
+        // ensureVideoFrameCallback() refuses to register while it is set. Re-arm
+        // explicitly so the new session gets a presentation signal at all.
+        rearmVideoFrameCallback();
 
         if (freezeCheckInterval) clearInterval(freezeCheckInterval);
         freezeCheckInterval = setInterval(() => {
@@ -5539,11 +5803,22 @@ document.addEventListener('DOMContentLoaded', () => {
                     console.error(`[FreezeGuard] CONFIRMED FREEZE for ${Math.round(now - frozenSince)}ms. Triggering staged recovery...`);
                     triggerFreezeRecovery('decoder_stall');
                 }
-            } else {
+            } else if (!isFrameStale) {
                 if (frozenSince > 0) {
                     console.log("[FreezeGuard] Stream recovered naturally. Clearing freeze state.");
                     frozenSince = 0;
                 }
+                // Only a FRESH frame proves recovery. When the frame is still
+                // stale but the decoder-rate test cannot act — bytesDelta is 0
+                // because the stats snapshot did not advance, or the transport
+                // briefly reported nothing — this branch used to announce
+                // "recovered naturally" and clear the confirmation timer while
+                // the picture was still frozen. The presentation-stall branch
+                // below then fired on the same tick with the full staleness:
+                // visible in the log as "Stream recovered naturally" followed
+                // immediately by "Presentation stalled for 6296ms". Keeping the
+                // timer is what makes a real stall still confirm; a real
+                // recovery clears it on the next fresh frame.
             }
 
             // Presentation-only stall. The decoder-rate test above requires
@@ -5771,6 +6046,10 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (r.track) freshStream.addTrack(r.track);
                     });
                     player.srcObject = freshStream;
+                    // Stage 2 is itself a pipeline rebuild. Without this the
+                    // dead handle from the previous srcObject blocks rVFC, and
+                    // the "success" test below can never see a new frame.
+                    rearmVideoFrameCallback();
                     elementStreamSessionId = currentSessionId;
                     // Same invariant as the ontrack branches: the element is now
                     // showing THIS session, so a pending rendition seam is over.

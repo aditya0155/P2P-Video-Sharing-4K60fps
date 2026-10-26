@@ -2823,6 +2823,9 @@ class StudioPageChecks(_SiteUnderTest):
                        "function pacingDecision(nowUs, dueUs, lateDropUs)",
                        "session.mediaStartUs = nowUs;",
                        "session.needKeyframe = true;",
+                       "function videoNeedsResync(nowUs, mediaStartUs, firstPtsUs, headPtsUs, queuedFrames, lateUs)",
+                       "session.mediaStartUs = resyncNowUs;",
+                       "session.resyncs += 1;",
                        "containsIdr(item.payload)"):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.ingest_js)
@@ -3029,6 +3032,22 @@ class StudioRelayChecks(unittest.TestCase):
             "assert.strictEqual(m.pacingDecision(1000000, 900000, 300000), 'write');"
             "assert.strictEqual(m.pacingDecision(1000000, 1200000, 300000), 'wait');"
             "assert.strictEqual(m.pacingDecision(1000000, 600000, 300000), 'drop');"
+        )
+
+    def test_a_backed_up_video_queue_is_reanchored_not_drained(self):
+        """A wedged relay drops ~100% of frames forever. One late frame is a
+        hiccup; a queue whose head is late cannot recover by dropping frames
+        one at a time, because the frames that are due are the ones already
+        queued. Only a collapse-and-re-anchor reaches the live edge."""
+        self._run(
+            # Healthy: head due now, nothing to do.
+            "assert.strictEqual(m.videoNeedsResync(1000000, 900000, 0, 100000, 2, 300000), false);"
+            # One frame late, or a single queued frame: the per-frame path owns it.
+            "assert.strictEqual(m.videoNeedsResync(1000000, 500000, 600000, 600000, 1, 300000), false);"
+            # Whole queue stale: re-anchor.
+            "assert.strictEqual(m.videoNeedsResync(1000000, 500000, 600000, 600000, 2, 300000), true);"
+            # Never before the first frame has anchored the clock.
+            "assert.strictEqual(m.videoNeedsResync(1000000, null, 0, 100000, 5, 300000), false);"
         )
 
     def test_contains_idr_recognises_both_start_codes(self):
@@ -3840,8 +3859,10 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertIn("mediaCapabilities", app, "Media Capabilities probe missing")
         self.assertIn("decodingInfo", app, "decodingInfo call missing")
         self.assertIn("async function probeAv1DecodeSmooth()", app)
-        self.assertIn("function chooseStreamPath(items, av1Capable, av1Smooth = true, preference = 'auto', h265Capable = true)",
+        self.assertIn("function chooseStreamPath(items, av1Capable, av1Smooth = true, preference = 'auto',",
                       app, "path selection must take the decode-quality and ABR arguments")
+        self.assertIn("h265Capable = true, h264Rescue = false)", app,
+                      "path selection must take the persisted decode-rescue verdict")
         # A legacy browser on an AV1-only broadcast must be told WHY nothing
         # plays instead of waiting on "connecting" forever.
         self.assertIn("renditionWaitPolls", app, "rendition wait counter missing")
@@ -3903,6 +3924,24 @@ class ReceiverLagFixChecks(unittest.TestCase):
 
     def test_decode_pressure_switching(self):
         run_js_check(self, "decode-pressure-switching")
+
+    def test_decode_deficit_detection(self):
+        """A too-slow software decoder drops frames BEFORE the decoder.
+
+        decoded/emitted therefore stays near 1.0 and the decode-lag state
+        machine never fires, while framesReceived ~60/s, framesDecoded 10-39/s
+        and pictureLoss is 37-82% with packetsLost 0. The detector must compare
+        arrivals with presentation and require sustained evidence.
+        """
+        run_js_check(self, "decode-deficit-detection")
+
+    def test_h264_rescue_path_preference(self):
+        """A rescued viewer starts (and ABR-upgrades) on the 720p rendition.
+
+        The preference must never reroute an AAC source (where live-h264 is a
+        full-quality audio-rescue copy) or a non-H264 source.
+        """
+        run_js_check(self, "h264-rescue-path-preference")
 
     def test_hidden_tab_return_recovers_playout_delay(self):
         run_js_check(self, "catch-up-arms-on-visibility-return")
@@ -4261,11 +4300,49 @@ class StreamingHardeningChecks(unittest.TestCase):
             "if(!line.includes('rtmp://127.0.0.1:1935/live-av1')) throw new Error('primary output missing');"
             "if(!line.includes('rtmp://127.0.0.1:1935/live-h264')) throw new Error('rescue output missing');"
             "if((line.match(/-map 0:v:0/g)||[]).length!==2) throw new Error('each output needs its own maps');"
-            "const q=b.decideBridge(['H264','Opus']);"
-            "if(q.extraOutputs) throw new Error('Opus sources must not get a rescue output');"
             "if(b.planTargets(p).join(',')!=='live-av1,live-h264') throw new Error('planTargets wrong');"
             "const r=b.decideBridge(['MPEG-4 Audio','AV1']);"
             "if(!r.extraOutputs||r.extraOutputs[0].target!=='live-av1') throw new Error('AV1-source rescue missing');"
+        )
+        result = subprocess.run([node, "-e", script], cwd=str(ROOT), capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_bridge_publishes_a_720p_h264_decode_rescue(self):
+        """H264 + Opus sources get a smaller H264 rendition.
+
+        Firefox software-decodes 1080p60 H264 at ~24 fps on this host while
+        framesReceived stays ~60/s and packetsLost is 0 -- a decoder that is
+        simply too slow, which no buffer setting can fix. The bridge must
+        publish a 720p H264 rendition (re-encoded, unlike the AAC audio rescue
+        which copies video) so the player can move such a viewer down.
+        """
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to exercise the bridge plan")
+        script = (
+            "const b=require('./codec_bridge.js');"
+            "const p=b.decideBridge(['H264','Opus'],{gopFrames:'30'});"
+            "if(!p.extraOutputs||p.extraOutputs.length!==1) throw new Error('missing 720p rescue output');"
+            "const r=p.extraOutputs[0];"
+            "if(r.target!=='live-h264') throw new Error('wrong rescue target');"
+            "if(r.videoArgs.join(' ')==='-c:v copy') throw new Error('the decode rescue must re-encode');"
+            "if(r.videoArgs[r.videoArgs.indexOf('-c:v')+1]!=='h264_nvenc') throw new Error('rescue must encode H264');"
+            "if(r.videoArgs[r.videoArgs.indexOf('-b:v')+1]!=='2500k') throw new Error('rescue bitrate wrong');"
+            "if(r.videoArgs[r.videoArgs.indexOf('-bf')+1]!=='0') throw new Error('rescue must not use B-frames');"
+            "if(r.scale.maxWidth!==1280||r.scale.maxHeight!==720) throw new Error('rescue must be 720p');"
+            "if(b.planTargets(p).join(',')!=='live-av1,live-h264') throw new Error('planTargets wrong');"
+            "const sw=b.buildFfmpegArgs(p);"
+            "const vf=sw.indexOf('-vf');"
+            "if(vf===-1||!sw[vf+1].startsWith('scale=')) throw new Error('software decode needs the CPU scale filter');"
+            "if(!sw[vf+1].includes('min(1280,iw)')||!sw[vf+1].includes('min(720,ih)')) "
+            "throw new Error('the scale must be capped, never upscaling');"
+            "if(!sw[vf+1].includes('force_divisible_by=2')) throw new Error('yuv420p needs even dimensions');"
+            "const gpu=b.buildFfmpegArgs(p,{},b.pickDecoderArgs('H264',{gpuDecoders:['h264_cuvid']}));"
+            "const gvf=gpu.indexOf('-vf');"
+            "if(gvf===-1||!gpu[gvf+1].startsWith('scale=')) "
+            "throw new Error('cuvid frames are system-memory nv12, so the rescue must use CPU scale');"
+            "const aac=b.decideBridge(['MPEG-4 Audio','H264']);"
+            "if(aac.extraOutputs[0].videoArgs.join(' ')!=='-c:v copy') "
+            "throw new Error('the AAC audio rescue must keep copying video');"
         )
         result = subprocess.run([node, "-e", script], cwd=str(ROOT), capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
@@ -5242,7 +5319,12 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
                            "the accommodation must be gated on the CAPTURED intent, not on the cleared flag")
         self.assertIn("accommodationCalmTicks", window[guard:guard + 200],
                       "the hidden-span branch must re-baseline the accommodation")
-        self.assertIn("bufferAccommodationMs", window[guard:],
+        # Search forward from the guard in the FULL source. A fixed window is
+        # brittle: any legitimate branch inserted ahead of the hidden-span guard
+        # (the decode-starvation hold is one) pushes the call past the slice and
+        # fails this check for a reason that has nothing to do with the intent.
+        guard_abs = max(0, idx - 1500) + guard
+        self.assertIn("bufferAccommodationMs", code[guard_abs:guard_abs + 4000],
                       "the accommodation update must be in the ELSE of that branch")
 
     def test_freeze_watchdog_does_not_walk_the_stats_graph_twice(self):
@@ -5286,6 +5368,22 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         link stutter on top of whatever it was already struggling with."""
         self.assertIn("stage2AttemptedThisSession", self.app)
         self.assertIn("!stage2AttemptedThisSession", self.app)
+
+    def test_a_stale_frame_is_never_called_a_natural_recovery(self):
+        """The decoder branch cleared frozenSince whenever isActualDecoderStall
+        was false — including when the frame was still stale but bytesDelta was
+        0 because the stats snapshot had not advanced. The log then read
+        "Stream recovered naturally" and, on the same tick, "Presentation
+        stalled for 6296ms", and the confirmation timer restarted from zero.
+        Recovery may only be declared on a FRESH frame."""
+        code = self._strip_comments(self.app, "js")
+        self.assertIn("} else if (!isFrameStale) {", code,
+                      "recovery must be gated on a fresh frame, not merely on "
+                      "the absence of a decoder-stall verdict")
+        idx = code.find("Stream recovered naturally")
+        self.assertGreater(idx, 0, "the recovery log was not found")
+        self.assertIn("!isFrameStale", code[max(0, idx - 500):idx],
+                      "the recovery log must live inside the fresh-frame branch")
 
     def test_degradation_preference_pins_picture_detail(self):
         """The default 'balanced' lets Chrome trade resolution away silently;
@@ -5694,6 +5792,39 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
                 self.assertTrue(
                     "getReceivers()" in window or "addTrack(event.track)" in window,
                     "a stream assigned to the element must carry every available track")
+
+    def test_replacing_srcobject_rearms_the_frame_callback(self):
+        """Assigning srcObject tears the element's pipeline down and silently
+        drops the pending requestVideoFrameCallback, but the handle stays set.
+        ensureVideoFrameCallback() refuses to register while it is set, so the
+        replacement session ran with no presentation signal: lastFrameTime froze
+        at the switch and 3-4.5s later the watchdog tore down a healthy picture.
+        Measured live: reconnects every ~15s on a 720p stream whose currentTime
+        advanced smoothly, with `decodedDelta: 0` in every freeze warning."""
+        code = self._strip_comments(self.app, "js")
+        body = self._js_function_body(code, "rearmVideoFrameCallback")
+        self.assertIsNotNone(body, "rearmVideoFrameCallback() was not found")
+        self.assertIn("freezeWatchdogId = null", body,
+                      "the dead handle must be cleared or ensureVideoFrameCallback() is a no-op")
+        self.assertIn("lastFrameTime = performance.now()", body,
+                      "the deliberate rebuild gap must not count toward staleness")
+        self.assertIn("ensureVideoFrameCallback()", body,
+                      "re-arming must actually register the callback")
+        # Every assignment that installs a live stream must re-arm. Teardown
+        # assignments (player.pause() immediately before srcObject = null) are
+        # the exception: they deliberately stop presentation.
+        sites = [m.start() for m in re.finditer(r"player\.srcObject = ", code)]
+        self.assertGreaterEqual(len(sites), 4)
+        for start in sites:
+            window = code[max(0, start - 80): start + 400]
+            if "player.pause()" in window[:120] and "= null" in window[:120]:
+                continue
+            self.assertIn("rearmVideoFrameCallback", window,
+                          "a live srcObject assignment leaves the frame callback stranded")
+        start_watchdog = self._js_function_body(code, "startFreezeWatchdog")
+        self.assertIsNotNone(start_watchdog)
+        self.assertIn("rearmVideoFrameCallback()", start_watchdog,
+                      "a new session must cancel any dead handle before registering")
 
     def test_element_stream_is_rebuilt_for_a_new_session(self):
         """The black-screen root cause.

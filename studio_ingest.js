@@ -154,6 +154,24 @@ function pacingDecision(nowUs, dueUs, lateDropUs) {
     return 'write';
 }
 
+// Pure: has the WHOLE queue fallen behind the wall clock?
+//
+// One late frame is a hiccup, and the per-frame drop in pumpVideo() handles it:
+// the queue drains until the head carries a current timestamp. A queue whose
+// head is already past the late threshold is a different state. Every frame in
+// it is stale by construction, and dropping them one per timer turn cannot
+// catch up, because the frames that are due are the ones already queued. The
+// old code then asked for an IDR on every drop; the IDR was stale too, so the
+// request re-armed forever. Measured live after a studio restart: 60 fps
+// arriving, 65 fps dropped, needKeyframe stuck true, and the published path
+// carried audio only for 26 minutes. The exit is to collapse the queue to its
+// newest frame and re-anchor the media clock to now.
+function videoNeedsResync(nowUs, mediaStartUs, firstPtsUs, headPtsUs, queuedFrames, lateUs) {
+    if (mediaStartUs === null || queuedFrames < 2) return false;
+    const dueUs = mediaStartUs + (headPtsUs - firstPtsUs);
+    return nowUs - dueUs > lateUs;
+}
+
 function createStudioIngest(options = {}) {
     const sessions = new Map();
     let activeId = null;
@@ -182,6 +200,7 @@ function createStudioIngest(options = {}) {
             audioFrames: session.audioFrames,
             droppedVideo: session.droppedVideo,
             droppedAudio: session.droppedAudio,
+            resyncs: session.resyncs,
             needKeyframe: session.needKeyframe,
             connected: {
                 video: Boolean(session.videoSocket && !session.videoSocket.destroyed),
@@ -366,6 +385,32 @@ function createStudioIngest(options = {}) {
         if (session.videoTimer) return;
         const socket = session.videoSocket;
         if (!socket || socket.destroyed) return;
+
+        // Live-edge resync. See videoNeedsResync(): once the head of the queue
+        // is stale, no amount of one-at-a-time dropping can catch up, and the
+        // keyframe request only makes the backlog bigger. Drop everything but
+        // the newest frame, re-anchor the clock to it, and let the next IDR
+        // repair the reference chain.
+        const resyncNowUs = Date.now() * 1000;
+        if (session.videoQueue.length
+            && videoNeedsResync(resyncNowUs, session.mediaStartUs, session.firstPtsUs,
+                session.videoQueue[0].ptsUs, session.videoQueue.length, VIDEO_LATE_DROP_US)) {
+            const headDueUs = session.mediaStartUs
+                + (session.videoQueue[0].ptsUs - session.firstPtsUs);
+            const behindMs = Math.round((resyncNowUs - headDueUs) / 1000);
+            const staleCount = session.videoQueue.length - 1;
+            while (session.videoQueue.length > 1) {
+                const stale = session.videoQueue.shift();
+                session.videoQueueBytes -= stale.payload.length;
+            }
+            session.droppedVideo += staleCount;
+            session.mediaStartUs = resyncNowUs;
+            session.firstPtsUs = session.videoQueue[0].ptsUs;
+            session.needKeyframe = true;
+            session.resyncs += 1;
+            log(`[StudioIngest] Video queue was ${behindMs}ms behind the wall clock; `
+                + `dropped ${staleCount} queued frames and re-anchored to the live edge.`);
+        }
 
         while (session.videoQueue.length) {
             if (socket.writableLength > VIDEO_HIGH_WATER) {
@@ -608,6 +653,7 @@ function createStudioIngest(options = {}) {
             audioFrames: 0,
             droppedVideo: 0,
             droppedAudio: 0,
+            resyncs: 0,
             needKeyframe: false,
             videoQueue: [],
             videoQueueBytes: 0,
@@ -913,6 +959,7 @@ module.exports = {
     normaliseConfig,
     containsIdr,
     pacingDecision,
+    videoNeedsResync,
     pipeName,
     VIDEO,
     AUDIO,

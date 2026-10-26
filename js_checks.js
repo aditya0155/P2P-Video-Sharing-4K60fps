@@ -549,6 +549,7 @@ function makePollSandbox(options = {}) {
         reconnectAttempts: options.reconnectAttempts ?? 0,
         renditionWaitPolls: 0,
         renditionWaitWarned: false,
+        preferH264Rescue: false,
         window: { location: { origin: 'http://127.0.0.1:3000' } },
         console: quietConsole(),
         updateUIState(state) { calls.ui.push(state); },
@@ -751,6 +752,36 @@ Object.assign(cases, {
         assert(h264Plan.videoArgs.includes('-bf'), 'WebRTC-safe streams declare a B-frame policy');
         assertEqual(h264Plan.videoArgs[h264Plan.videoArgs.indexOf('-bf') + 1], '0',
             'B-frames break WebRTC decoders (README rule)');
+
+        // H264 + Opus (the in-browser studio) also publishes a 720p H264
+        // rescue: Firefox software-decodes 1080p60 at ~24 fps while the
+        // transport is clean, and no buffer setting can fix a slow decoder.
+        assertEqual(bridge.planTargets(h264Plan).join(','), 'live-av1,live-h264',
+            'an H264+Opus source must publish the AV1 rendition and the 720p H264 rescue');
+        const rescue = h264Plan.extraOutputs.find((out) => out.target === 'live-h264');
+        assert(rescue, 'the 720p H264 rescue output is missing');
+        assertEqual(rescue.scale.maxWidth, 1280, 'the rescue width must be capped at 1280');
+        assertEqual(rescue.scale.maxHeight, 720, 'the rescue height must be capped at 720');
+        assertEqual(rescue.videoArgs[rescue.videoArgs.indexOf('-b:v') + 1], '2500k',
+            'the rescue must use its own bitrate, not the source or AV1 rate');
+        assertEqual(rescue.videoArgs[rescue.videoArgs.indexOf('-c:v') + 1], 'h264_nvenc',
+            'the rescue must re-encode H264 at 720p, not copy the 1080p source');
+        const rescueArgs = bridge.buildFfmpegArgs(h264Plan);
+        const rescueFilterIdx = rescueArgs.indexOf('-vf');
+        assert(rescueFilterIdx !== -1, 'the rescue output needs a scale filter');
+        assert(rescueArgs[rescueFilterIdx + 1].startsWith('scale='),
+            'software decode must use the CPU scale filter');
+        assert(rescueArgs[rescueFilterIdx + 1].includes('min(1280,iw)')
+            && rescueArgs[rescueFilterIdx + 1].includes('min(720,ih)'),
+            'the rescue must never upscale a smaller source');
+        assert(rescueArgs[rescueFilterIdx + 1].includes('force_divisible_by=2'),
+            'the rescue must stay valid for yuv420p');
+        const gpuRescueArgs = bridge.buildFfmpegArgs(h264Plan, {},
+            bridge.pickDecoderArgs('H264', { gpuDecoders: ['h264_cuvid'] }));
+        const gpuFilterIdx = gpuRescueArgs.indexOf('-vf');
+        assert(gpuFilterIdx !== -1 && gpuRescueArgs[gpuFilterIdx + 1].startsWith('scale='),
+            'cuvid delivers system-memory nv12 frames, so the rescue must use CPU scale '
+            + '(scale_cuda cannot negotiate nv12 -> cuda without an explicit hwupload)');
 
         const aacPlan = bridge.decideBridge(['MPEG-4 Audio', 'H264']);
         const aacArgs = aacPlan.audioArgs.join(' ');
@@ -1030,6 +1061,55 @@ Object.assign(cases, {
             'a browser whose AV1 decode is not smooth must wait, not take the AV1 rendition');
         assertEqual(fn(h265RenditionReady, false, true, 'auto', true), 'live',
             'H265 capability keeps the native path even when the rendition exists');
+    },
+
+    // A viewer that already failed to sustain the source resolution starts on
+    // the bridge's 720p H.264 rescue, and the ABR upgrade path returns there
+    // instead of walking it back onto 1080p. The preference must never leak
+    // onto an AAC source (where live-h264 is a full-quality audio-rescue copy)
+    // or onto a non-H264 source.
+    'h264-rescue-path-preference'() {
+        const { fn } = compileFunction('chooseStreamPath', { console: quietConsole() });
+        const ready = (name, tracks) => ({ name, ready: true, online: true, ...(tracks ? { tracks } : {}) });
+        const h264Opus = [
+            ready('live', ['H264', 'Opus']),
+            ready('live-av1', ['AV1', 'Opus']),
+            ready('live-h264', ['H264', 'Opus'])
+        ];
+        assertEqual(fn(h264Opus, true), 'live',
+            'without a rescue verdict the native full-quality path stays the default');
+        assertEqual(fn(h264Opus, true, true, 'auto', true, true), 'live-h264',
+            'a rescued viewer must start on the 720p H.264 rendition');
+        assertEqual(fn(h264Opus, true, true, 'preferNonTranscode', true, true), 'live-h264',
+            'the ABR upgrade must return a rescued viewer to 720p, not 1080p');
+        assertEqual(fn(h264Opus, true, true, 'preferTranscode', true, true), 'live-h264',
+            'the rescue preference must beat the low-bitrate AV1 rung');
+        assertEqual(fn(h264Opus, true, true, 'auto', true, false), 'live',
+            'a viewer with no rescue verdict keeps full quality');
+
+        // AAC sources use live-h264 as a full-resolution audio-rescue copy;
+        // the 720p preference must not reroute an AV1-smooth viewer there.
+        const h264Aac = [
+            ready('live', ['H264', 'MPEG-4 Audio']),
+            ready('live-av1', ['AV1', 'Opus']),
+            ready('live-h264', ['H264', 'Opus'])
+        ];
+        assertEqual(fn(h264Aac, true, true, 'auto', true, true), 'live-av1',
+            'an AAC source must keep its bandwidth-saving AV1 default for AV1-smooth viewers');
+
+        // Without a published rescue rendition the native path is still the
+        // only playable option; the detector will retry when it appears.
+        const noRescue = [ready('live', ['H264', 'Opus'])];
+        assertEqual(fn(noRescue, true, true, 'auto', true, true), 'live',
+            'without a published rescue rendition the native path remains the only option');
+
+        // A persisted H264 verdict must never reroute an AV1 source.
+        const av1Source = [
+            ready('live', ['AV1', 'Opus']),
+            ready('live-h264', ['H264', 'Opus'])
+        ];
+        assertEqual(fn(av1Source, true, true, 'auto', true, true), 'live',
+            'an AV1 source must not be routed to the H264 rescue by an H264 verdict');
     },
 
     // AV1 source + browser without AV1 + bridge not ready: the poll must keep
@@ -1810,6 +1890,8 @@ Object.assign(cases, {
                     smooth: { ms: 350, driftLimitMs: 3000 }
                 },
                 rejoinDriftSec: 0, decodeLagSec: 0, lastFramesReceived: 0,
+                decodeDeficitActive: false, decodeDeficitWindow: [], decodeDeficitTicks: 0,
+                preferH264Rescue: false,
                 adaptiveRaiseLevelMs: 0, stressRunSec: 0, calmRunSec: 0,
                 bufferNoticeState: '', accommodationTargetMs: 0,
                 avgPlayoutDelayMs: 150, avgPlayoutDelayAt: 100000,
@@ -1835,6 +1917,7 @@ Object.assign(cases, {
                 // throws. See the other ABR sandbox above.
                 ADAPTIVE_RAISE_MS: 350,
                 switchRendition(path) { recoverySandbox.switchedTo = path; },
+                rememberH264Rescue() {},
                 // Presentation evenness: superviseAdaptiveBuffer() reads these on
                 // every tick, so the sandbox must provide them or the extracted
                 // function throws "frameGapUnevenness is not defined" before any
@@ -2095,6 +2178,10 @@ Object.assign(cases, {
                 },
                 rejoinDriftSec: 2,
                 decodeLagSec: 0,
+                decodeDeficitActive: false,
+                decodeDeficitWindow: [],
+                decodeDeficitTicks: 0,
+                preferH264Rescue: false,
                 lastFramesReceived: 0,
                 adaptiveRaiseLevelMs: 0,
                 stressRunSec: 0,
@@ -2134,6 +2221,7 @@ Object.assign(cases, {
                 updateBufferHud(state) { sandbox.hudStates = (sandbox.hudStates || []).concat(state || []); },
                 addSystemMessage(text) { sandbox.messages = (sandbox.messages || []).concat(text); },
                 switchRendition(path) { sandbox.switchedTo = path; },
+                rememberH264Rescue() {},
                 ...overrides
             };
             const { fn } = compileFunction('superviseAdaptiveBuffer', sandbox);
@@ -2233,6 +2321,10 @@ Object.assign(cases, {
                 activeStreamPath: 'live',
                 rejoinDriftSec: 0,
                 decodeLagSec: 0,
+                decodeDeficitActive: false,
+                decodeDeficitWindow: [],
+                decodeDeficitTicks: 0,
+                preferH264Rescue: false,
                 lastFramesReceived: 0,
                 av1DecodeSmooth: true,
                 // The downgrade must consult the real decode capability: the
@@ -2255,6 +2347,7 @@ Object.assign(cases, {
                 updateBufferHud() {},
                 addSystemMessage(text) { sandbox.messages = (sandbox.messages || []).concat(text); },
                 switchRendition(path) { sandbox.switchedTo = path; },
+                rememberH264Rescue() { sandbox.rescueRemembered = true; },
                 // Live-edge catch-up runs before the drift branch; stubbed so
                 // this case keeps testing the ABR ladder's own state machine.
                 frameGapWindow: [],
@@ -2842,6 +2935,69 @@ Object.assign(cases, {
         assertEqual(update(3, 30, 30, 0), 2, 'full delivery sheds lag');
     },
 
+    // A software decoder that is too slow for the source resolution drops
+    // frames BEFORE the decoder, so decoded/emitted stays near 1.0 and the
+    // decode-lag state machine never fires. This detector compares arrivals
+    // with presentation and requires sustained evidence: three deficit ticks
+    // in the last five, a clean network, high picture loss, and a real arrival
+    // rate.
+    'decode-deficit-detection'() {
+        const { fn } = compileFunction('updateDecodeDeficit', {
+            DECODE_DEFICIT_WINDOW_TICKS: evaluateConst('DECODE_DEFICIT_WINDOW_TICKS'),
+            DECODE_DEFICIT_TRIGGER_TICKS: evaluateConst('DECODE_DEFICIT_TRIGGER_TICKS')
+        });
+        const sample = (over = {}) => ({
+            receivedFps: 60, presentedFps: 24, plrPct: 60, netLossPct: 0, ...over
+        });
+        const tick = (state, over) => fn(state.window, sample(over));
+
+        let state = { window: [], deficitTicks: 0, active: false };
+        state = tick(state);
+        assertEqual(state.active, false, 'one deficit tick is not sustained evidence');
+        state = tick(state);
+        assertEqual(state.active, false, 'two deficit ticks are not sustained evidence');
+        state = tick(state);
+        assertEqual(state.active, true, 'three deficit ticks in five must arm the rescue');
+        assertEqual(state.deficitTicks, 3, 'the window must count deficit ticks');
+
+        // Three clean ticks drain the deficit out of the five-tick window.
+        state = tick(state, { presentedFps: 60, plrPct: 0 });
+        state = tick(state, { presentedFps: 60, plrPct: 0 });
+        state = tick(state, { presentedFps: 60, plrPct: 0 });
+        assertEqual(state.active, false, 'recovery must disarm the detector');
+
+        // The network must be clean: decode starvation has netLossPct 0 while
+        // a lossy link can also show high picture loss.
+        let lossy = { window: [], deficitTicks: 0, active: false };
+        for (let i = 0; i < 5; i += 1) lossy = tick(lossy, { netLossPct: 2 });
+        assertEqual(lossy.active, false, 'packet loss is a network problem, not a decode rescue');
+
+        // A low arrival rate (static screen, paused publisher) is unmeasurable.
+        let idle = { window: [], deficitTicks: 0, active: false };
+        for (let i = 0; i < 5; i += 1) idle = tick(idle, { receivedFps: 10, presentedFps: 2 });
+        assertEqual(idle.active, false, 'a low frame rate must not be read as decode starvation');
+
+        // Missing counters must not become zeros: `Number(null)` is 0 and would
+        // otherwise make a missing network reading look like a clean link.
+        let unknown = { window: [], deficitTicks: 0, active: false };
+        for (let i = 0; i < 5; i += 1) unknown = tick(unknown, { netLossPct: null });
+        assertEqual(unknown.active, false, 'missing counters must not arm the rescue');
+
+        // Presentation that keeps up with arrivals is not a deficit even when
+        // picture loss is high (frames decoded but not presented is a different
+        // fault, and the freeze watchdog owns it).
+        let presented = { window: [], deficitTicks: 0, active: false };
+        for (let i = 0; i < 5; i += 1) presented = tick(presented, { presentedFps: 55 });
+        assertEqual(presented.active, false,
+            'a presentation rate close to arrivals must not trigger the 720p rescue');
+
+        // The window is bounded to five ticks.
+        let bounded = { window: [], deficitTicks: 0, active: false };
+        for (let i = 0; i < 12; i += 1) bounded = tick(bounded);
+        assertEqual(bounded.window.length, 5, 'the deficit window must stay at 5 ticks');
+        assertEqual(bounded.active, true, 'sustained deficits must stay armed');
+    },
+
     // A decoder that cannot sustain the stream must be moved onto the
     // hardware-decodable path: AV1 source -> live-h264 (H264 decodes in
     // hardware everywhere), an H264 source viewed through live-av1 -> back
@@ -2860,6 +3016,11 @@ Object.assign(cases, {
             h264Source: [
                 { name: 'live', ready: true, online: true, tracks: ['H264', 'Opus'] },
                 { name: 'live-av1', ready: true, online: true, tracks: ['AV1', 'Opus'] }
+            ],
+            h264Rescue: [
+                { name: 'live', ready: true, online: true, tracks: ['H264', 'Opus'] },
+                { name: 'live-av1', ready: true, online: true, tracks: ['AV1', 'Opus'] },
+                { name: 'live-h264', ready: true, online: true, tracks: ['H264', 'Opus'] }
             ]
         };
         const make = (overrides = {}) => {
@@ -2885,6 +3046,10 @@ Object.assign(cases, {
                 lastNetJitterMs: 10,
                 lastLossPct: 0,
                 decodeLagSec: 8,
+                decodeDeficitActive: false,
+                decodeDeficitWindow: [],
+                decodeDeficitTicks: 0,
+                preferH264Rescue: false,
                 lastFramesReceived: 0,
                 lastAppliedTargetMs: null,
                 jitterFloorEmaMs: 0,
@@ -2901,7 +3066,7 @@ Object.assign(cases, {
                 lastRenditionSwitchAt: -60000,
                 renditionPathsItems: ladder.av1Source,
                 activeStreamPath: 'live',
-                player: { paused: false },
+                player: { paused: false, videoHeight: 1080 },
                 document: { hidden: false },
                 performance: { now: () => 100000 },
                 RTCRtpReceiver: { getCapabilities: () => ({ codecs: [] }) },
@@ -2911,6 +3076,7 @@ Object.assign(cases, {
                 updateBufferHud() {},
                 addSystemMessage(text) { sandbox.messages = (sandbox.messages || []).concat(text); },
                 switchRendition(path) { sandbox.switchedTo = path; },
+                rememberH264Rescue() { sandbox.rescueRemembered = true; },
                 // Live-edge catch-up runs before the drift branch; stubbed so
                 // this case keeps testing the decode-pressure state machine.
                 frameGapWindow: [],
@@ -2995,6 +3161,81 @@ Object.assign(cases, {
         laterReady.run();
         assertEqual(laterReady.sandbox.switchedTo, undefined,
             'a viewer whose lag decayed while no target existed must not be switched when one appears later');
+
+        // Sustained presentation deficit on an H264+Opus source: decodeLagSec
+        // never moves (the jitter buffer discards frames before the decoder
+        // sees them), so the deficit window is what must arm the 720p rescue.
+        const deficit = make({
+            renditionPathsItems: ladder.h264Rescue,
+            decodeLagSec: 0,
+            decodeDeficitActive: true,
+            player: { paused: false, videoHeight: 1080 }
+        });
+        deficit.run();
+        assertEqual(deficit.sandbox.switchedTo, 'live-h264',
+            'a sustained presentation deficit on H264+Opus must switch to the 720p rescue');
+        assertEqual(deficit.sandbox.rescueRemembered, true,
+            'the rescue verdict must be persisted for subsequent loads');
+        assertEqual(deficit.sandbox.decodeDeficitActive, false,
+            'the deficit window must reset after the rescue switch');
+
+        // Already 720p or smaller: a teardown buys nothing.
+        const alreadySmall = make({
+            renditionPathsItems: ladder.h264Rescue,
+            decodeLagSec: 0,
+            decodeDeficitActive: true,
+            player: { paused: false, videoHeight: 720 }
+        });
+        alreadySmall.run();
+        assertEqual(alreadySmall.sandbox.switchedTo, undefined,
+            'a 720p source must not be torn down for a 720p rescue');
+
+        // Unknown height (first frame not landed) is not a reason to block it.
+        const unknownHeight = make({
+            renditionPathsItems: ladder.h264Rescue,
+            decodeLagSec: 0,
+            decodeDeficitActive: true,
+            player: { paused: false, videoHeight: 0 }
+        });
+        unknownHeight.run();
+        assertEqual(unknownHeight.sandbox.switchedTo, 'live-h264',
+            'an unknown source height must still allow the rescue');
+
+        // A rescue rendition that is not published yet: hold, do not tear down.
+        const noRescue = make({
+            renditionPathsItems: ladder.h264Source,
+            decodeLagSec: 0,
+            decodeDeficitActive: true,
+            player: { paused: false, videoHeight: 1080 }
+        });
+        noRescue.run();
+        assertEqual(noRescue.sandbox.switchedTo, undefined,
+            'without a published 720p rendition there is nothing to switch to');
+
+        // AV1 sources must not take the H264 rescue from this detector: the
+        // existing decode-pressure ratio owns AV1, and a 1080p H264 transcode
+        // would not decode any faster in software.
+        const av1Deficit = make({
+            renditionPathsItems: ladder.av1Source,
+            decodeLagSec: 0,
+            decodeDeficitActive: true,
+            player: { paused: false, videoHeight: 1080 }
+        });
+        av1Deficit.run();
+        assertEqual(av1Deficit.sandbox.switchedTo, undefined,
+            'the 720p rescue detector is for H264+Opus sources only');
+
+        // Cooldown is shared with ABR.
+        const rescueCooled = make({
+            renditionPathsItems: ladder.h264Rescue,
+            decodeLagSec: 0,
+            decodeDeficitActive: true,
+            lastRenditionSwitchAt: 99000,
+            player: { paused: false, videoHeight: 1080 }
+        });
+        rescueCooled.run();
+        assertEqual(rescueCooled.sandbox.switchedTo, undefined,
+            'a rescue switch within the 60s cooldown must be suppressed');
 
         // H264 source viewed through live-av1 under decode pressure -> 'live'.
         const h264Up = make({

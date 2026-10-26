@@ -41,7 +41,8 @@
  *
  * Environment (defaults match mediamtx.yml):
  *   MTX_PATH, RTSP_PORT, BRIDGE_RTMP_PORT, BRIDGE_API_BASE,
- *   BRIDGE_H264_BITRATE, BRIDGE_AV1_BITRATE, BRIDGE_AUDIO_BITRATE, BRIDGE_FFMPEG,
+ *   BRIDGE_H264_BITRATE, BRIDGE_AV1_BITRATE, BRIDGE_H264_RESCUE_BITRATE,
+ *   BRIDGE_AUDIO_BITRATE, BRIDGE_FFMPEG,
  *   BRIDGE_GPU_DECODE (=0 disables NVDEC, defaults on when the decoder exists),
  *   BRIDGE_GOP (keyframes in FRAMES; skips the frame-rate probe),
  *   BRIDGE_FFPROBE (ffprobe binary for the frame-rate probe)
@@ -59,6 +60,10 @@ const RTMP_PORT = process.env.BRIDGE_RTMP_PORT || '1935';
 const API_BASE = process.env.BRIDGE_API_BASE || 'http://127.0.0.1:8888';
 const H264_BITRATE = process.env.BRIDGE_H264_BITRATE || '6000k';
 const AV1_BITRATE = process.env.BRIDGE_AV1_BITRATE || '3000k';
+// 720p H.264 rescue for viewers whose software decoder cannot sustain the
+// source resolution. 2.5 Mbps is deliberately below the 4 Mbps studio source:
+// the point of this rendition is decode headroom, not pixel-perfect fidelity.
+const H264_RESCUE_BITRATE = process.env.BRIDGE_H264_RESCUE_BITRATE || '2500k';
 const AUDIO_BITRATE = process.env.BRIDGE_AUDIO_BITRATE || '160k';
 const BUNDLED_FFMPEG = path.join(__dirname,
     'ffmpeg_win', 'ffmpeg-n8.1-latest-win64-gpl-shared-8.1', 'bin', 'ffmpeg.exe');
@@ -639,24 +644,63 @@ function decideBridge(tracks, env = {}) {
         : upper.includes('VP9') ? 'VP9'
         : 'VP8';
     const av1Rate = env.av1Bitrate || AV1_BITRATE;
-    return {
-        sourceCodec,
-        target: 'live-av1',
-        videoArgs: buildAv1VideoArgs(env, av1Rate),
-        audioArgs,
+    let extraOutputs;
+    if (sourceCodec === 'H264' && hasOpusAudio) {
+        // H264 + Opus (the in-browser studio) gets a 720p H264 rescue
+        // rendition. Firefox software-decodes 1080p60 H264 at ~24 fps on this
+        // host while the transport is clean — measured framesReceived ~60/s,
+        // framesDecoded 10-39/s, pictureLoss 37-82%, packetsLost 0 — and no
+        // amount of jitter-buffer tuning can fix a decoder that is simply too
+        // slow. The same browser holds ~60 fps at 720p60, so the player moves
+        // a viewer here only after a sustained presentation deficit.
+        //
+        // This output re-encodes (unlike the AAC rescue below, which copies
+        // video): the whole point is fewer pixels for the decoder. The scale
+        // filter is materialized in buildFfmpegArgs() because it depends on
+        // whether NVDEC supplied CUDA frames.
+        extraOutputs = [{
+            target: 'live-h264',
+            scale: { maxWidth: 1280, maxHeight: 720 },
+            videoArgs: buildH264RescueVideoArgs(env),
+            audioArgs,
+        }];
+    } else if (sourceCodec === 'H264' && hasAudio) {
         // Audio rescue: an H264 source with non-WebRTC audio (RTMP/SRT AAC)
         // leaves every viewer of the native path without sound. One extra
         // FLV output copies the video untouched (zero extra GPU) and
         // re-encodes audio to Opus, so the player can route EVERYONE to a
         // full-quality, full-audio rendition instead of the muted native path.
-        extraOutputs: sourceCodec === 'H264' && hasAudio && !hasOpusAudio
-            ? [{
-                target: 'live-h264',
-                videoArgs: ['-c:v', 'copy'],
-                audioArgs,
-            }]
-            : undefined,
+        extraOutputs = [{
+            target: 'live-h264',
+            videoArgs: ['-c:v', 'copy'],
+            audioArgs,
+        }];
+    }
+    return {
+        sourceCodec,
+        target: 'live-av1',
+        videoArgs: buildAv1VideoArgs(env, av1Rate),
+        audioArgs,
+        extraOutputs,
     };
+}
+
+// 720p H.264 rescue encoder. Same WebRTC-safe block as the AV1-source
+// rendition (8-bit 4:2:0, no B-frames, forced IDR, passthrough timestamps) at
+// a resolution a software decoder can actually sustain.
+function buildH264RescueVideoArgs(env = {}) {
+    const rate = env.h264RescueBitrate || H264_RESCUE_BITRATE;
+    return [
+        '-c:v', 'h264_nvenc',
+        '-pix_fmt', 'yuv420p',
+        '-preset', 'p4', '-tune', 'ull',
+        '-spatial-aq', '1', '-aq-strength', '8',
+        '-b:v', rate,
+        '-maxrate', rate,
+        '-bufsize', rate,
+        '-bf', '0', '-g', env.gopFrames || assumedGopFrames(), '-forced-idr', '1',
+        '-fps_mode', 'passthrough',
+    ];
 }
 
 // Shared AV1 encoder argument block (the live-av1 rendition in both the
@@ -767,6 +811,32 @@ function probeGpuDecoder(sourceCodec) {
     return ffmpegDecoderList.includes(decoder) ? decoder : null;
 }
 
+/*
+ * Scale filter for a rendition that must be smaller than the source.
+ *
+ * This is deliberately a CPU `scale`, not `scale_cuda`, even when NVDEC is
+ * decoding. `-c:v h264_cuvid` / `av1_cuvid` (the form pickDecoderArgs emits)
+ * downloads decoded frames to system-memory nv12; keeping them on the GPU
+ * would require an explicit `-hwaccel_output_format cuda`, which this pipeline
+ * does not use. A `scale_cuda` filter would therefore fail to negotiate a
+ * format ("Impossible to convert ... nv12 -> cuda") — measured against the
+ * bundled ffmpeg 8.1 with a real h264_cuvid input. `scale` accepts the frames
+ * the pipeline actually has, and h264_nvenc uploads the result itself.
+ *
+ * `force_original_aspect_ratio=decrease` keeps portrait/square sources from
+ * being stretched, and `force_divisible_by=2` keeps the result valid for
+ * yuv420p. The bounds are `min()` expressions rather than fixed values so an
+ * already-small source is never upscaled.
+ */
+function buildScaleFilter(scale) {
+    if (!scale || !Number.isFinite(scale.maxWidth) || !Number.isFinite(scale.maxHeight)) {
+        return null;
+    }
+    const sizing = `w='min(${scale.maxWidth},iw)':h='min(${scale.maxHeight},ih)'`
+        + ':force_original_aspect_ratio=decrease:force_divisible_by=2';
+    return `scale=${sizing},format=nv12`;
+}
+
 function buildFfmpegArgs(plan, ports = {}, decodeArgs = []) {
     const rtspPort = ports.rtspPort || RTSP_PORT;
     const rtmpPort = ports.rtmpPort || RTMP_PORT;
@@ -783,16 +853,24 @@ function buildFfmpegArgs(plan, ports = {}, decodeArgs = []) {
         '-i', `rtsp://127.0.0.1:${rtspPort}/${SOURCE_PATH}`,
     ];
     // One ffmpeg invocation serves every rendition of the plan: the primary
-    // transcode plus any audio-rescue outputs. ffmpeg decodes the source
-    // once; each output gets its own stream options, so the rescue output
-    // (`-c:v copy`) costs no GPU at all.
+    // transcode plus any rescue outputs. ffmpeg decodes the source once; each
+    // output gets its own stream options, so the AAC audio rescue (`-c:v
+    // copy`) costs no extra GPU, while the 720p H.264 rescue re-encodes only
+    // its smaller output.
     const outputs = [
         { videoArgs: plan.videoArgs, audioArgs: plan.audioArgs, target: plan.target },
         ...(plan.extraOutputs || []),
     ];
     for (const out of outputs) {
+        args.push('-map', '0:v:0', '-map', '0:a:0?');
+        // Per-output filter: only the 720p rescue declares one. It must sit
+        // after the output's maps and before its encoder options, or ffmpeg
+        // attaches it to the wrong output.
+        const scaleFilter = out.scale
+            ? buildScaleFilter(out.scale)
+            : null;
+        if (scaleFilter) args.push('-vf', scaleFilter);
         args.push(
-            '-map', '0:v:0', '-map', '0:a:0?',
             ...out.videoArgs,
             ...out.audioArgs,
             // Bound the FLV muxer's interleave buffering. `0` does NOT mean
@@ -1641,7 +1719,7 @@ async function main() {
     process.exit(0);
 }
 
-module.exports = { decideBridge, buildFfmpegArgs, pickDecoderArgs, probeGopFrames, planTargets, mergeReplan, isNvdecFailure, shouldGiveUp, MAX_CONSECUTIVE_FFMPEG_FAILURES, NO_HEALTHY_RUN_LIMIT_MS, VIDEO_CODECS };
+module.exports = { decideBridge, buildFfmpegArgs, buildH264RescueVideoArgs, buildScaleFilter, pickDecoderArgs, probeGopFrames, planTargets, mergeReplan, isNvdecFailure, shouldGiveUp, MAX_CONSECUTIVE_FFMPEG_FAILURES, NO_HEALTHY_RUN_LIMIT_MS, VIDEO_CODECS };
 
 if (require.main === module) {
     main().catch((err) => {
