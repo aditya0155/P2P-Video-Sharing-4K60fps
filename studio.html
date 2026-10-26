@@ -14,7 +14,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-    <link rel="stylesheet" href="/streaming/studio.css?v=3.0.1">
+    <link rel="stylesheet" href="/streaming/studio.css?v=3.0.2">
 </head>
 <body>
     <div class="ambient-bg" aria-hidden="true">
@@ -45,7 +45,7 @@
         <!-- Standing notice. The local preview plays the raw capture, not the
              encoded stream, so it cannot prove the broadcast is healthy. The
              meters are the honest feedback; this notice explains the path and
-             the one thing the operator must do (keep the On Air window open). -->
+             the one background-encoding choice the operator has to make. -->
         <section class="studio-notice is-info" id="studio-notice" aria-labelledby="studio-notice-title">
             <div class="studio-notice-head">
                 <i class="fa-solid fa-bolt" id="studio-notice-icon" aria-hidden="true"></i>
@@ -60,8 +60,9 @@
 
             <p class="studio-notice-foot" id="studio-notice-foot">
                 Defaults match the OBS profile: 1920&times;1080, 24 fps, CBR 4 Mbps, 1 s keyframes.
-                Keep the small <b>On Air</b> window open while you broadcast &mdash; Chrome throttles
-                hidden tabs, and that window keeps the encoder at full speed when you switch away.
+                Chrome throttles a hidden studio tab. Tick <b>Keep encoding when I switch away</b>
+                before starting if you need to use other apps; it opens a small always-on-top
+                <b>On Air</b> window. Leave it off (the default) and keep this tab visible.
             </p>
         </section>
 
@@ -264,6 +265,25 @@
                         Settings are locked in when you go live. Leave ~25% of your upload free.
                     </p>
                 </div>
+
+                <div class="studio-group">
+                    <h2 class="studio-group-title"><i class="fa-solid fa-window-restore" aria-hidden="true"></i> While broadcasting</h2>
+
+                    <div class="studio-field">
+                        <label class="studio-check" for="chk-onair-window">
+                            <input type="checkbox" id="chk-onair-window" aria-describedby="onair-hint">
+                            <span class="studio-switch" aria-hidden="true"></span>
+                            <span>Keep encoding when I switch away</span>
+                        </label>
+                    </div>
+                    <p class="studio-hint" id="onair-hint">
+                        Off by default. When ticked, starting a broadcast opens a small always-on-top
+                        <b>On Air</b> window; ticking it while live opens the window immediately.
+                        Chrome throttles a hidden studio tab, and that window is the one reliable
+                        exemption. Leave it off to avoid the extra window &mdash; then keep this tab
+                        visible while you broadcast.
+                    </p>
+                </div>
             </aside>
         </main>
 
@@ -284,7 +304,7 @@
 
     <!-- The ingest client defines window.StudioIngest, which studio.js uses.
          Classic scripts execute in order, so this must stay before studio.js. -->
-    <script src="/streaming/studio_ingest_client.js?v=3.0.1"></script>
-    <script src="/streaming/studio.js?v=3.0.1"></script>
+    <script src="/streaming/studio_ingest_client.js?v=3.0.2"></script>
+    <script src="/streaming/studio.js?v=3.0.2"></script>
 </body>
 </html>

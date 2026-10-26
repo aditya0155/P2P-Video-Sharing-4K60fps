@@ -2743,12 +2743,31 @@ class StudioPageChecks(_SiteUnderTest):
         self.assertGreater(start, 0, "the Start handler was not found")
         self.assertGreater(stop, start, "the Start handler is not bounded")
         click = self.studio_js[start:stop]
-        self.assertLess(click.index("const pipPromise = openOnAirWindow();"),
-                        click.index("await requestMicrophone();"),
-                        "Document PiP must be requested before the first await")
+        self.assertLess(
+            click.index("const pipPromise = wantsOnAir ? openOnAirWindow() : Promise.resolve(null);"),
+            click.index("await requestMicrophone();"),
+            "Document PiP must be requested before the first await")
+        self.assertIn("const wantsOnAir = Boolean(onAirCheckbox && onAirCheckbox.checked);", click,
+                      "the On Air window must be opt-in, not opened unconditionally")
         self.assertIn("documentPictureInPicture", self.studio_js)
         self.assertIn("Keep this tab visible", self.studio_js)
         self.assertIn("active.stop({ keepalive: true })", self.studio_js)
+
+    def test_studio_on_air_window_is_opt_in_and_default_off(self):
+        """An always-on-top window that appears on every Start is worse than the
+        throttling it prevents for an operator who keeps the studio tab
+        visible. It must be a per-broadcast choice, default off."""
+        tag = re.search(r'<input[^>]*id="chk-onair-window"[^>]*>', self.studio_html)
+        self.assertIsNotNone(tag, "the On Air opt-in checkbox was not found")
+        self.assertNotIn("checked", tag.group(0),
+                         "the On Air window must be off by default")
+        self.assertIn('id="onair-hint"', self.studio_html)
+        self.assertIn("Off by default", self.studio_html)
+        self.assertIn("Keep encoding when I switch away", self.studio_html)
+        # Closing the window must clear the choice, or the next Start silently
+        # reopens the thing the operator just dismissed.
+        self.assertIn("if (onAirCheckbox) onAirCheckbox.checked = false;", self.studio_js)
+        self.assertIn("backgroundThrottleWarned", self.studio_js)
 
     def test_studio_locks_encoder_settings_for_the_broadcast(self):
         self.assertIn("setEncoderControlsLocked(true);", self.studio_js)
@@ -2852,9 +2871,9 @@ class StudioPageChecks(_SiteUnderTest):
         versions = set(re.findall(
             r"/streaming/(?:studio\.css|studio\.js|studio_ingest_client\.js)\?v=([^\"']+)",
             self.studio_html))
-        self.assertEqual(versions, {"3.0.1"},
+        self.assertEqual(versions, {"3.0.2"},
                          "studio assets must share one cache version, got {}".format(versions))
-        self.assertIn('href="/streaming/studio?v=3.0.1"', self.html)
+        self.assertIn('href="/streaming/studio?v=3.0.2"', self.html)
         self.assertIn("addModule(`${WORKLET_URL}?v=3`)", self.client_js)
 
     def test_studio_does_not_change_the_obs_pipeline(self):

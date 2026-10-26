@@ -66,8 +66,9 @@ document.addEventListener('DOMContentLoaded', () => {
             + 'to a local relay that publishes to the same <code>live</code> path OBS uses. No second '
             + 'encode and no WebRTC ceiling. It runs <b>only on the host laptop</b>.',
         foot: 'Defaults match the OBS profile: 1920&times;1080, 24 fps, CBR 4 Mbps, 1 s keyframes. '
-            + 'Keep the small <b>On Air</b> window open while you broadcast &mdash; Chrome throttles '
-            + 'hidden tabs, and that window keeps the encoder at full speed when you switch away.',
+            + 'Chrome throttles a hidden studio tab. Tick <b>Keep encoding when I switch away</b> '
+            + 'before starting if you need to use other apps; it opens a small always-on-top '
+            + '<b>On Air</b> window. Leave it off (the default) and keep this tab visible.',
         icon: 'fa-bolt',
         kind: 'info'
     };
@@ -119,6 +120,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const cbrCheckbox = document.getElementById('chk-cbr');
     const contentHintSelect = document.getElementById('sel-content-hint');
     const encoderHint = document.getElementById('encoder-hint');
+    const onAirCheckbox = document.getElementById('chk-onair-window');
 
     const noticeEl = document.getElementById('studio-notice');
     const noticeTitle = document.getElementById('studio-notice-title');
@@ -189,6 +191,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let pipTime = null;
     let pipStopBtn = null;
     let pipWarned = false;
+    // One warning per broadcast when the operator backgrounds the tab without
+    // the On Air window. Repeating it on every Alt-Tab would be noise.
+    let backgroundThrottleWarned = false;
 
     // ==========================================================================
     // Small UI helpers
@@ -571,9 +576,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // On Air window (Document Picture-in-Picture)
     // ==========================================================================
     // requestWindow() must be called synchronously from a user gesture, so the
-    // Start handler calls openOnAirWindow() before its first await. The window
-    // is small, always-on-top, and carries a Stop button so the broadcaster
-    // can end the stream without finding the studio tab again.
+    // Start handler calls openOnAirWindow() before its first await — but only
+    // when the operator ticked the opt-in. The window is small, always-on-top,
+    // and carries a Stop button so the broadcaster can end the stream without
+    // finding the studio tab again.
 
     function openOnAirWindow() {
         if (!('documentPictureInPicture' in window)) return Promise.resolve(null);
@@ -725,6 +731,10 @@ document.addEventListener('DOMContentLoaded', () => {
             pipFps = null;
             pipTime = null;
             pipStopBtn = null;
+            // Closing the window is an explicit "I do not want it" — the
+            // checkbox must reflect reality or the next Start silently
+            // reopens the thing the operator just dismissed.
+            if (onAirCheckbox) onAirCheckbox.checked = false;
             if (isPublishing && !pipWarned) {
                 pipWarned = true;
                 showToast('The On Air window was closed. Keep this tab visible — Chrome throttles hidden tabs.', 'warning');
@@ -1016,7 +1026,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Broadcast start / stop
     // ==========================================================================
 
-    async function startPublishing(pipPromise) {
+    async function startPublishing(pipPromise, wantsOnAir) {
         if (hostAllowed === false) {
             throw new Error('Browser broadcasting only works on the host machine. Open the studio on the laptop that runs the stream.');
         }
@@ -1136,7 +1146,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const pipNote = pip
             ? ''
-            : ' Keep this tab visible — the On Air window could not open, and Chrome throttles hidden tabs.';
+            : (wantsOnAir
+                ? ' Keep this tab visible — the On Air window could not open, and Chrome throttles hidden tabs.'
+                : ' Keep this tab visible while you broadcast — background encoding is off.');
 
         let audioNote;
         let kind = 'info';
@@ -1467,6 +1479,35 @@ document.addEventListener('DOMContentLoaded', () => {
                 applyGainValues();
             });
         }
+
+        if (onAirCheckbox) {
+            // A change event is a user gesture, so the PiP can be opened (or
+            // closed) mid-broadcast. Before Start the choice is only stored;
+            // the Start handler opens the window in its own click gesture.
+            onAirCheckbox.addEventListener('change', () => {
+                if (!isPublishing) return;
+                if (onAirCheckbox.checked) {
+                    openOnAirWindow().then((win) => {
+                        if (!win) {
+                            onAirCheckbox.checked = false;
+                            showToast('The On Air window could not open in this browser. Keep this tab visible while broadcasting.', 'warning');
+                            return;
+                        }
+                        // The operator can stop or untick while the window is
+                        // being built. closeOnAirWindow() clears the handle
+                        // first, so the pagehide warning does not fire twice.
+                        if (!isPublishing || !onAirCheckbox.checked) {
+                            closeOnAirWindow();
+                            return;
+                        }
+                        updateOnAirWindow(sourceInfoText ? sourceInfoText.textContent : 'Screen');
+                    });
+                } else {
+                    closeOnAirWindow();
+                    showToast('On Air window closed. Keep this tab visible — Chrome throttles hidden tabs.', 'info');
+                }
+            });
+        }
     }
 
     function initTransport() {
@@ -1494,10 +1535,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 // Document PiP must be requested in the click's gesture, before
                 // the first await (the mic prompt and the session POST both
-                // come later). This call is synchronous; the promise resolves
-                // once the window's document exists.
+                // come later). It is opt-in: opening an always-on-top window
+                // unasked is worse than the throttling it prevents for an
+                // operator who keeps this tab visible.
                 pipWarned = false;
-                const pipPromise = openOnAirWindow();
+                backgroundThrottleWarned = false;
+                const wantsOnAir = Boolean(onAirCheckbox && onAirCheckbox.checked);
+                const pipPromise = wantsOnAir ? openOnAirWindow() : Promise.resolve(null);
 
                 isStarting = true;
                 refreshTransport('Starting the encoder…');
@@ -1509,7 +1553,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (!hasSource()) {
                         throw new Error('The screen capture ended before the broadcast started.');
                     }
-                    await startPublishing(pipPromise);
+                    await startPublishing(pipPromise, wantsOnAir);
                 } catch (err) {
                     console.error('[Studio] Failed to start broadcasting:', err);
                     const active = publisher;
@@ -1607,10 +1651,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
     document.addEventListener('visibilitychange', () => {
         if (!isPublishing) return;
+        const onAirOpen = Boolean(onAirWindow && !onAirWindow.closed);
         if (document.hidden) {
-            console.log('[Studio] Tab backgrounded; the On Air window keeps the encoder running.');
+            console.log(onAirOpen
+                ? '[Studio] Tab backgrounded; the On Air window keeps the encoder running.'
+                : '[Studio] Tab backgrounded without an On Air window; Chrome will throttle the encoder.');
         } else {
             updateStats();
+            if (!onAirOpen && !backgroundThrottleWarned) {
+                backgroundThrottleWarned = true;
+                showToast('Chrome throttled the encoder while this tab was hidden. Tick “Keep encoding when I switch away” before your next broadcast to avoid dropped frames.', 'warning');
+            }
         }
     });
 

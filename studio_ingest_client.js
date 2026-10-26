@@ -25,9 +25,10 @@
    at single-digit rates, regardless of whether the encoder is fast. There is
    no page-level opt-out. The one reliable exemption is a Document
    Picture-in-Picture window: while one is open the opener stays on a normal
-   scheduling cadence even when its tab is hidden. The studio opens a small
-   always-on-top "On Air" window for exactly that reason; if it is unavailable,
-   the broadcast still works but only while the studio tab is visible.
+   scheduling cadence even when its tab is hidden. The studio can open a small
+   always-on-top "On Air" window for exactly that reason, but it is opt-in
+   because the window itself is intrusive; without it the broadcast still works,
+   only while the studio tab is visible.
 
    Wire format (must match studio_ingest.js)
    -----------------------------------------

@@ -37,9 +37,13 @@ to a bundled ffmpeg, which copies the video (no second encode), encodes the
 mixed system + microphone audio to Opus, and publishes RTSP to the same `live`
 path OBS uses. Defaults match the OBS profile: 1920x1080, 24 fps, CBR 4 Mbps,
 1 s keyframes. The local preview is the raw capture, so watch the FPS and
-dropped-frame meters, not the preview. Keep the small **On Air** window open
-while broadcasting: Chrome throttles hidden tabs, and that window keeps the
-encoder at full speed when you switch away.
+dropped-frame meters, not the preview. Background encoding is **opt-in**: tick
+**Keep encoding when I switch away** before starting, and the studio opens a
+small always-on-top **On Air** window. Chrome throttles a hidden studio tab, and
+that Document Picture-in-Picture window is the one reliable exemption — it keeps
+the encoder at full speed while you use other apps. Leave it off (the default)
+and no extra window opens; keep the studio tab visible instead, because a hidden
+tab drops the encoder to a few frames per second.
 
 24 fps is the default because it matches the OBS profile; the frame-rate menu
 also offers 60, 30 and 15. Changing it re-applies the resolution cap in the same
