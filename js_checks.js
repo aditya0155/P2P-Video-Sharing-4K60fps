@@ -1885,6 +1885,16 @@ Object.assign(cases, {
         assertEqual(fn(100, 0), 100, 'nothing decoded is 100% PLR');
         assertEqual(fn(-10, 0), null, 'negative received is undefined');
     },
+    // A covered window is not `document.hidden`, but Chrome throttles its
+    // presentation/decode. The stats loop must not turn that span into a
+    // quality verdict; the first tick after the return only re-baselines.
+    'viewer-measurement-window-gating'() {
+        const { fn } = compileFunction('viewerMeasurementValid', {});
+        assertEqual(fn(true, false), true, 'an active, fresh window is measurable');
+        assertEqual(fn(false, false), false, 'an inactive window is not measurable');
+        assertEqual(fn(true, true), false, 'the first tick after a return only re-baselines');
+        assertEqual(fn(false, true), false, 'inactive and rebasing is not measurable');
+    },
     // The watchdog used to test `decodedDelta === 0`, which is blind to a
     // partially-wedged decoder (the worst viewer experience there is: a 60fps
     // stream decoding at 2fps) and can false-fire on a sub-poll sampling
@@ -2135,6 +2145,18 @@ Object.assign(cases, {
         assertEqual(hidden.sandbox.switchedTo, undefined, 'hidden tab must not trigger a rejoin');
         assertEqual(hidden.sandbox.reapplied, undefined, 'hidden tab must not touch playout targets');
         assertEqual(hidden.sandbox.messages, undefined, 'hidden tab must not post notices');
+
+        // A covered window keeps visibilityState 'visible', but Chrome
+        // throttles its presentation. document.hasFocus() is the signal; the
+        // supervisor must not act on the throttled delay.
+        const unfocused = make(false, {
+            document: { hidden: false, hasFocus: () => false }
+        });
+        unfocused.run();
+        assertEqual(unfocused.sandbox.switchedTo, undefined,
+            'an unfocused viewer must not trigger a rejoin');
+        assertEqual(unfocused.sandbox.reapplied, undefined,
+            'an unfocused viewer must not touch playout targets');
 
         // A 5s delay past the 2.6s cap reconnects at the live edge.
         const visible = make(false);

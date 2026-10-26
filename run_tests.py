@@ -962,6 +962,13 @@ class JsLogicChecks(unittest.TestCase):
         framesReceived and framesDecoded were both already being read."""
         run_js_check(self, "picture-loss-ratio")
 
+    def test_viewer_measurement_is_gated_on_focus_and_rebase(self):
+        """A covered window stays visibilityState 'visible' while Chrome
+        throttles its presentation and decode, so its counters describe the
+        throttle. Only an active viewer with a fresh baseline may drive a
+        quality verdict."""
+        run_js_check(self, "viewer-measurement-window-gating")
+
     def test_freeze_watchdog_judges_decode_progress_as_a_rate(self):
         """`decodedDelta === 0` was blind to a partially-wedged decoder and
         could false-fire on a sampling artefact."""
@@ -4379,6 +4386,20 @@ class StreamingHardeningChecks(unittest.TestCase):
         self.assertIn("iceRoute: lastRouteText", self.app)
         self.assertIn("recovery: lastRecoveryCounts", self.app)
         self.assertIn("pliCount", self.app, "PLI recovery counters missing")
+
+    def test_diagnostic_report_distinguishes_occlusion_from_picture_loss(self):
+        # A covered viewer window stays visibilityState 'visible'; Chrome
+        # throttles its presentation/decode. The report must say the window is
+        # unfocused and that measurement is suspended, rather than presenting
+        # the throttle as 3 fps / 95% picture loss.
+        self.assertIn("function viewerIsActive()", self.app)
+        self.assertIn("pageFocused:", self.app)
+        self.assertIn("visibilityState:", self.app)
+        self.assertIn("measurementSuspended:", self.app)
+        self.assertIn("lastFrameAgeMs:", self.app)
+        self.assertIn("window.addEventListener('blur'", self.app)
+        self.assertIn("window.addEventListener('focus'", self.app)
+        self.assertIn("presentationRebasePending", self.app)
 
     def test_chat_dedupe_memory_is_capped(self):
         self.assertIn("seenMessageIds.size > 500", self.app,

@@ -47,7 +47,9 @@ also offers 60, 30 and 15. Changing it re-applies the resolution cap in the same
 lone `frameRate` makes the capture fall back to the monitor's native size (a
 3840x2160 desktop), and the extra downscale on every frame is what used to pin
 the studio near 20 fps. With the cap kept, 1080p60 holds 60 fps with an empty
-encoder queue and zero relay drops on this laptop.
+encoder queue and zero relay drops on this laptop. A viewer open on the same
+machine shares its GPU with the encoder, so judge the publisher's FPS and drop
+meters with that contention in mind.
 
 The older WHIP page at `http://127.0.0.1:3000/broadcast` still ships, but it is
 not linked from the player. It offers codec (H.264 / AV1 / VP9 / VP8),
@@ -878,3 +880,9 @@ The widen is written to a **dedicated `unevenFloorMs`**, not to `accommodationTa
 Two release paths, both necessary. It steps down 100 ms per 5 even ticks (~100 s to unwind 600 ms), so a one-off stall is not permanent. And the manual latency-mode handler clears it outright, because it enters the target through `Math.max` and would otherwise make `ultra` (80 ms) and `balanced` (180 ms) **permanently unreachable** for the rest of the session — the button would update its label and the HUD, `reapplyBufferTargets()` would write 600 ms to both receivers, and the viewer's explicit choice would be silently discarded. An explicit human choice has to actually win; that is the entire point of the button. — a detector that can fire repeatedly is just another oscillator, and this file has already been bitten by that shape twice. The window slides, so a link that settles stops reading as uneven, and the state is reset on a new session and on tab hide (a hidden tab suspends presentation, so its gaps describe the suspension, not the link).
 
 `frameGapCv`, `frameGapMeanMs`, `unevenWidenApplied`, `statsTicksSkipped`, `catchUpRate`, `catchUpProvenUseless`, `recoveryCount` and `snapshotMisses` are all in the diagnostic export, so a "not smooth but nothing is wrong" report can now be settled with a number instead of a guess.
+
+### Viewer focus and occlusion are part of the measurement
+
+Chrome throttles decode and presentation for a viewer window that is covered or backgrounded, but occlusion does **not** fire `visibilitychange`: `document.visibilityState` can stay `visible` while the picture is starved. The RTP counters keep advancing at the throttled rate, so a report of **3 fps / 95 % picture loss** from a covered window describes Chrome's scheduler, not the link — the publisher in that state was still holding 60 fps with zero drops.
+
+The diagnostic export therefore carries a `viewer` block — `pageFocused`, `visibilityState`, `measurementSuspended`, `inactiveForMs`, `lastFrameAgeMs`, `statsWindowMs` — and only a focused viewer with a fresh baseline may drive a quality verdict. While the viewer is inactive, presentation FPS, picture-loss ratio, the drop window, decode-pressure, the accommodation and the spec-freeze bounds are withheld as `unavailable` rather than reported, and the first active tick re-baselines all of them. The focused presentation-stall watchdog is the only path allowed to act, through the existing staged `triggerFreezeRecovery()`, because a confirmed stall in a focused window is real and the same numbers from a covered one are not.

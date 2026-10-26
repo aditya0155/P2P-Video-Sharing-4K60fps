@@ -357,6 +357,20 @@ document.addEventListener('DOMContentLoaded', () => {
     let presentedFpsValid = false;      // True only while lastPresentedFps is a FRESH sample
     let lastPresentedFramesAtTick = 0;  // presentedFrames baseline at the previous stats tick
     let lastPresentedTickAt = 0;        // Wall clock of the previous stats tick (the fps denominator)
+    // --- Viewer activity (focus / occlusion) --------------------------------
+    // Chrome throttles decode and presentation for a viewer window that is
+    // covered or backgrounded, but window occlusion does NOT fire
+    // visibilitychange: document.visibilityState stays 'visible'. The RTP
+    // counters keep advancing at the throttled rate, so a stats window that
+    // spans an occlusion looks exactly like a decode fault (3 fps, 95% PLR)
+    // while the network is clean. `document.hasFocus()` is the only signal
+    // available for the covered-window case; blur/focus track the transitions
+    // and the stats loop re-baselines on return.
+    let viewerActive = !document.hidden
+        && (typeof document.hasFocus !== 'function' || document.hasFocus());
+    let viewerInactiveSince = viewerActive ? 0 : performance.now();
+    let presentationRebasePending = false;
+    let lastStatsWindowMs = 0;          // Duration of the last stats measurement window
     let lastRouteText = '--';           // Selected ICE route: direct / relay (TURN)
     let lastRecoveryCounts = null;      // { pli, nack } session totals for diagnostics
     let noMediaRejoinCount = 0;         // Connected-but-no-video rejoin attempts this session
@@ -402,6 +416,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // so the watchdog needs a bound that does not move with the fault.
     let stallDetectMs = null;
     let frozenSince = 0;                  // When freeze was first detected (0 = not frozen)
+    // Presentation-only stall: a focused window with RTP still arriving but no
+    // frame reaching the compositor. Chrome's occlusion throttle can leave the
+    // renderer in exactly this state after the window returns, and the
+    // decoder-rate test cannot see it because framesDecoded keeps advancing.
+    let focusedStallSince = 0;            // When a focused viewer stopped presenting (0 = healthy)
+    const FOCUSED_STALL_MS = 2000;        // No presented frame for this long = suspicious
+    const FOCUSED_STALL_CONFIRM_MS = 1500; // Persist across one more 1500ms watchdog poll
     let isRecovering = false;             // Guard to prevent recovery storms
     let recoveryCount = 0;                // How many auto-recoveries we've done this session
     let healthyPlaybackSeconds = 0;      // Consecutive healthy playback seconds (resets recovery counter)
@@ -1924,6 +1945,93 @@ document.addEventListener('DOMContentLoaded', () => {
         unevenStreakTicks = 0;
         unevenReleaseTicks = 0;
     }
+
+    // True while this page is both visible and focused. A covered window is NOT
+    // hidden according to the Page Visibility API, so document.hidden alone
+    // misses the dominant viewer-side throttle. `document.hasFocus()` is the
+    // only browser signal for "another window is on top of this one"; a viewer
+    // that is visible but unfocused is treated as inactive too, because its
+    // presentation and decode counters are no longer trustworthy evidence
+    // about the stream.
+    function viewerIsActive() {
+        if (document.hidden) return false;
+        return typeof document.hasFocus !== 'function' || document.hasFocus();
+    }
+
+    // A stats window may drive quality/presentation measurements only while the
+    // viewer is active and the window is fresh. (Pure — unit-tested in
+    // js_checks.js `viewer-measurement-window-gating`.)
+    function viewerMeasurementValid(activeNow, rebasePending) {
+        return activeNow === true && rebasePending !== true;
+    }
+
+    // Re-arm rVFC after an inactive span. The callback is one-shot and normally
+    // re-registers itself, but a renderer that stopped presenting during
+    // occlusion can leave the pending callback stranded.
+    function rearmVideoFrameCallback() {
+        if (!player || !isConnected
+            || !('requestVideoFrameCallback' in HTMLVideoElement.prototype)) return;
+        if (freezeWatchdogId && 'cancelVideoFrameCallback' in HTMLVideoElement.prototype) {
+            try { player.cancelVideoFrameCallback(freezeWatchdogId); } catch (e) { /* already fired */ }
+        }
+        freezeWatchdogId = null;
+        ensureVideoFrameCallback();
+    }
+
+    // The viewer window lost focus / was covered. Keep the stats loop running
+    // (the network picture is still real) but stop treating the throttled
+    // presentation/decode deltas as stream quality. The first tick after the
+    // return re-baselines every presentation counter instead of averaging the
+    // inactive span, which is what produced "3 fps / 95% picture loss" reports
+    // from a viewer whose window was merely behind the studio window.
+    function noteViewerInactive() {
+        if (!viewerActive) return false;
+        viewerActive = false;
+        viewerInactiveSince = performance.now();
+        resetPresentationEvenness();
+        lastFrameGapMs = 0;
+        lastMediaTimeSec = null;
+        lastFramePresentAt = 0;
+        lastPresentedFps = null;
+        presentedFpsValid = false;
+        lastPresentedFramesAtTick = lastPresentedFrames;
+        lastPresentedTickAt = 0;
+        // The stats loop stops entirely on a hidden tab, so this is the only
+        // place that can clear the last active window's reading. Without it the
+        // report keeps showing the throttle artefact (e.g. 3 fps) beside
+        // measurementSuspended: true.
+        currentFrameRate = null;
+        lastPlrPct = null;
+        specFreezeMs = null;
+        stallDetectMs = null;
+        frozenSince = 0;
+        focusedStallSince = 0;
+        presentationRebasePending = true;
+        return true;
+    }
+
+    function noteViewerActive() {
+        if (!viewerIsActive() || viewerActive) return false;
+        viewerActive = true;
+        viewerInactiveSince = 0;
+        resetPresentationEvenness();
+        lastFrameGapMs = 0;
+        lastMediaTimeSec = null;
+        lastFramePresentAt = 0;
+        lastPresentedFps = null;
+        presentedFpsValid = false;
+        lastPresentedFramesAtTick = lastPresentedFrames;
+        lastPresentedTickAt = 0;
+        lastPlrPct = null;
+        frozenSince = 0;
+        focusedStallSince = 0;
+        presentationRebasePending = true;
+        dropTickPending = true;
+        // Do not let the occlusion gap itself count as a presentation stall.
+        lastFrameTime = performance.now();
+        rearmVideoFrameCallback();
+        return true;
+    }
     // Return playbackRate to its resting value. A session that ends while
     // catching up would otherwise leave the NEXT session running fast, and the
     // viewer would be watching a subtly sped-up stream with no way to tell why.
@@ -1957,6 +2065,12 @@ document.addEventListener('DOMContentLoaded', () => {
         // Supervision resumes the moment the tab becomes visible again — the
         // freeze watchdog applies the same rule.
         if (document.hidden) return;
+        // A covered window is not hidden by the Page Visibility API, but Chrome
+        // throttles its presentation. The measured delay and evenness are then
+        // artefacts of the throttle, not the link, so the controller must not
+        // act on them. Checked through the document object (rather than a
+        // module binding) so the extracted-function tests keep working.
+        if (typeof document.hasFocus === 'function' && !document.hasFocus()) return;
         // A viewer who paused is not a viewer under stress. RTP keeps arriving
         // while paused, so loss and jitter keep looking "stressed" forever and
         // the controllers that can rebuild the session start acting on it —
@@ -3668,21 +3782,35 @@ document.addEventListener('DOMContentLoaded', () => {
             resetLiveEdgeCatchUp();
             // Same reason for the evenness estimate: a hidden tab suspends
             // presentation, so its frame gaps describe the suspension, not the link.
-            if (typeof resetPresentationEvenness === 'function') resetPresentationEvenness();
+            noteViewerInactive();
         } else {
             console.log("[App] Tab foregrounded. Resuming polling/telemetry...");
-            lastFrameTime = performance.now();
-            frozenSince = 0;
+            const viewerReactivated = noteViewerActive();
             if (isConnected) {
                 beginStatsLoop();
                 startRenditionPathsPoll();
                 startAudioMeter();
                 ensureVideoFrameCallback();
-                maybeRejoinOnReturn();
+                if (viewerReactivated) maybeRejoinOnReturn();
             } else {
                 pollStreamStatus();
             }
         }
+    });
+
+    // Window occlusion is NOT a visibility change. When another window covers
+    // the viewer, Chrome throttles decode/presentation while visibilityState
+    // stays 'visible', so the stats loop would otherwise report the throttle as
+    // a stream fault. Treat blur like a hidden tab for MEASUREMENT purposes
+    // (the loop keeps running, so the network picture stays live) and
+    // re-baseline every presentation counter on focus. The focus handler also
+    // re-arms rVFC and hands a stale/behind session to the rejoin check.
+    window.addEventListener('blur', () => {
+        if (!document.hidden) noteViewerInactive();
+    });
+    window.addEventListener('focus', () => {
+        if (document.hidden) return;
+        if (noteViewerActive() && isConnected) maybeRejoinOnReturn();
     });
 
     // True when this browser can decode AV1 inside WebRTC. Uses the REAL
@@ -4120,6 +4248,7 @@ document.addEventListener('DOMContentLoaded', () => {
         lastFramesDiscarded = 0;
         decodeLagSec = 0;
         lastStatsTime = performance.now();
+        lastStatsWindowMs = 0;
 
         // Fresh session → fresh supervision baselines (measurements from a
         // previous connection must never influence the new one).
@@ -4265,6 +4394,11 @@ document.addEventListener('DOMContentLoaded', () => {
         // the whole hidden period) and never count toward Eco Mode.
         dropWindow = [];
         dropTickPending = true;
+        // Presentation/decode counters are NOT averaged across a hidden or
+        // occluded span: Chrome throttles them there, so the first tick after
+        // the loop (re)starts must establish fresh baselines instead of
+        // publishing a quality reading that describes the throttle.
+        presentationRebasePending = true;
         statsInterval = setInterval(async () => {
             // Capture the connection this tick is FOR. The interval callback is
             // async and setInterval does not wait for it, so a teardown can land
@@ -4339,6 +4473,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 measureAudioStats(audioStats);
 
+                // A covered window (or a hidden tab) presents and decodes at
+                // Chrome's throttle rate, not the stream's. Do not turn that
+                // span into a quality verdict: keep the cumulative baselines
+                // advancing, but skip the per-window measurements for the
+                // first tick after the viewer returns.
+                const viewerActiveNow = viewerIsActive();
+                const rebaseViewerThisTick = presentationRebasePending;
+                const measurementValid = viewerMeasurementValid(
+                    viewerActiveNow, rebaseViewerThisTick);
+
                 if (player) {
                     const playState = player.paused ? "Paused" : "Playing";
                     // Presentation rate from rVFC's compositor counter: a high
@@ -4346,21 +4490,32 @@ document.addEventListener('DOMContentLoaded', () => {
                     // GPU/compositor starvation on the viewer side.
                     const nowTick = performance.now();
                     let stateText = `RS:${player.readyState}`;
-                    if (lastPresentedFrames > 0 && lastPresentedTickAt > 0) {
-                        const presentedDt = (nowTick - lastPresentedTickAt) / 1000;
-                        if (presentedDt > 0.5) {
-                            lastPresentedFps = Math.max(0,
-                                (lastPresentedFrames - lastPresentedFramesAtTick) / presentedDt);
-                            // Only a sample actually taken THIS tick may drive the
-                            // header. The `else` below leaves the previous value
-                            // in place, so without this flag a latched reading
-                            // would keep being reported as current.
-                            presentedFpsValid = true;
-                            stateText = `${lastPresentedFps.toFixed(1)} fps rendered`;
+                    if (viewerActiveNow) {
+                        if (lastPresentedFrames > 0 && lastPresentedTickAt > 0) {
+                            const presentedDt = (nowTick - lastPresentedTickAt) / 1000;
+                            if (presentedDt > 0.5) {
+                                lastPresentedFps = Math.max(0,
+                                    (lastPresentedFrames - lastPresentedFramesAtTick) / presentedDt);
+                                // Only a sample actually taken THIS tick may drive the
+                                // header. The `else` below leaves the previous value
+                                // in place, so without this flag a latched reading
+                                // would keep being reported as current.
+                                presentedFpsValid = true;
+                                stateText = `${lastPresentedFps.toFixed(1)} fps rendered`;
+                            }
                         }
+                        lastPresentedFramesAtTick = lastPresentedFrames;
+                        lastPresentedTickAt = nowTick;
+                    } else {
+                        // A covered/backgrounded window presents at Chrome's
+                        // throttle rate. Publishing that as the render rate is
+                        // the "3 fps" diagnostic artefact; mark it unavailable
+                        // and re-baseline on return.
+                        lastPresentedFps = null;
+                        presentedFpsValid = false;
+                        lastPresentedFramesAtTick = lastPresentedFrames;
+                        lastPresentedTickAt = 0;
                     }
-                    lastPresentedFramesAtTick = lastPresentedFrames;
-                    lastPresentedTickAt = nowTick;
                     if (hudVideoState) hudVideoState.innerText = `${playState} · ${stateText}`;
                     if (hudResolution) hudResolution.innerText = player.videoWidth > 0 ? `${player.videoWidth}x${player.videoHeight}` : "--";
                 }
@@ -4486,7 +4641,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     // AND at least one decoded frame), so this state would sit
                     // black forever. Rejoin the session, capped so a genuinely
                     // broken broadcast cannot rejoin in an unbounded loop.
-                    if (decoded === 0 && performance.now() - connectionStartTime > 10000) {
+                    if (viewerActiveNow && decoded === 0 && performance.now() - connectionStartTime > 10000) {
                         noMediaRejoinCount += 1;
                         if (noMediaRejoinCount <= 3) {
                             console.warn('[FreezeGuard] No video frame decoded 10s after connecting — rejoining the session.');
@@ -4518,7 +4673,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     // that can be compared across sessions and against a target.
                     const dReceived = received - lastFramesReceived;
                     const dDecoded = decoded - lastFramesDecodedCount;
-                    if (dReceived > 0) lastPlrPct = pictureLossRatioPct(dReceived, dDecoded);
+                    if (measurementValid && dReceived > 0) {
+                        lastPlrPct = pictureLossRatioPct(dReceived, dDecoded);
+                    }
                     // Rolling 3-tick window replaces the old strictly-consecutive
                     // counter (>=3 drops on 3 back-to-back ticks), which never
                     // fired for keyframe-periodic bursts — drops once per GOP
@@ -4555,7 +4712,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         // whose decoder was never under any pressure at all.
                         // The window is still pruned on a catch-up tick (below)
                         // so entries age out at the normal rate.
-                        if (catchUpRate <= 1) {
+                        if (viewerActiveNow && catchUpRate <= 1) {
                             dropWindow.push(Math.max(0, droppedDelta));
                         }
                         if (dropWindow.length > 3) dropWindow.shift();
@@ -4779,6 +4936,11 @@ document.addEventListener('DOMContentLoaded', () => {
                         // session. Re-baseline instead of acting.
                         if (rebaseThisTick) {
                             accommodationCalmTicks = 0;
+                        } else if (!measurementValid) {
+                            // A covered window's drop and late-frame evidence
+                            // describe Chrome's throttle, not the link: do not
+                            // let it raise the accommodation.
+                            accommodationCalmTicks = 0;
                         } else {
                             // `lateFrameEvidence` counts frames that physically
                             // arrived but never left the jitter buffer. That is a
@@ -4823,6 +4985,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     let currentMbps = 0;
 
                     const timeDiffSec = (now - lastStatsTime) / 1000;
+                    if (timeDiffSec > 0) lastStatsWindowMs = Math.round(timeDiffSec * 1000);
                     const decodedDiff = decoded - lastFramesDecodedCount;
                     const measuredFps = timeDiffSec > 0 && decodedDiff >= 0 ? decodedDiff / timeDiffSec : null;
                     const reportedFps = Number.isFinite(videoStats.framesPerSecond) ? videoStats.framesPerSecond : null;
@@ -4842,7 +5005,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     // paused viewer. An explicit validity flag lets a genuinely
                     // fresh sample win and a stale or absent one fall back to the
                     // decode-derived number, which is the lesser evil.
-                    currentFrameRate = presentedFpsValid ? lastPresentedFps : (reportedFps ?? measuredFps);
+                    currentFrameRate = measurementValid
+                        ? (presentedFpsValid ? lastPresentedFps : (reportedFps ?? measuredFps))
+                        : null;
                     // The spec's freeze bound moves with the frame rate, so it
                     // has to be derived from the rate actually in force rather
                     // than from a constant that is only correct at one rate. In
@@ -4854,7 +5019,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     // which is worse than the freeze, so a short freeze should
                     // widen the buffer rather than tear the session down.
                     const rateForFreeze = reportedFps ?? measuredFps;
-                    if (Number.isFinite(rateForFreeze) && rateForFreeze > 0) {
+                    if (viewerActiveNow && Number.isFinite(rateForFreeze) && rateForFreeze > 0) {
                         specFreezeMs = specFreezeThresholdMs(1000 / rateForFreeze);
                         // The bound the WATCHDOG acts on is derived from the
                         // peak-hold, not from the live reading. Sourcing it from
@@ -4942,7 +5107,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     // re-created the false teardown on precisely the first tick of
                     // every session. An unmeasurable window DECAYS instead, which is
                     // the same treatment every other unmeasurable window gets.
-                    if (timeDiffSec > 0.5 && emittedKnown && emittedDelta >= 15) {
+                    if (measurementValid && timeDiffSec > 0.5 && emittedKnown && emittedDelta >= 15) {
                         decodeLagSec = updateDecodeLag(
                             decodeLagSec, decodedDiff, emittedDelta, discardedDelta);
                     } else if (timeDiffSec > 0.5) {
@@ -4959,6 +5124,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     lastBytesReceived = bytes;
                     lastFramesDecodedCount = decoded;
                     lastStatsTime = now;
+                    // The first active tick after an inactive span only
+                    // re-baselined; the next one is a real measurement.
+                    if (viewerActiveNow) presentationRebasePending = false;
 
                     // Push into rolling bitrate history and draw sparkline
                     bitrateHistory.shift();
@@ -5040,6 +5208,21 @@ document.addEventListener('DOMContentLoaded', () => {
                     currentTime: player.currentTime,
                     resolution: `${player.videoWidth}x${player.videoHeight}`
                 },
+                // Why a report can show a low frame rate with a clean network:
+                // a covered window is still visibilityState 'visible', but
+                // Chrome throttles its presentation/decode. Without this block
+                // the throttle is indistinguishable from a stream fault.
+                viewer: {
+                    pageFocused: typeof document.hasFocus === 'function'
+                        ? document.hasFocus() : 'unavailable',
+                    visibilityState: document.visibilityState,
+                    measurementSuspended: !viewerIsActive(),
+                    inactiveForMs: viewerInactiveSince > 0
+                        ? Math.round(performance.now() - viewerInactiveSince) : 0,
+                    lastFrameAgeMs: lastFrameTime > 0
+                        ? Math.round(performance.now() - lastFrameTime) : 'unavailable',
+                    statsWindowMs: lastStatsWindowMs > 0 ? lastStatsWindowMs : 'unavailable'
+                },
                 latencyMode: currentLatencyMode,
                 // Playout target: requested vs actually granted. The gap is the
                 // single most useful number in this report when a viewer says
@@ -5075,6 +5258,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     // instead of a number with no context.
                     specFreezeThresholdMs: specFreezeMs === null ? 'unavailable' : Math.round(specFreezeMs),
                     lastFrameGapMs: lastFrameGapMs > 0 ? Math.round(lastFrameGapMs) : 'unavailable',
+                    lastFrameAgeMs: lastFrameTime > 0
+                        ? Math.round(performance.now() - lastFrameTime) : 'unavailable',
                     lastFrameGapExceedsSpecFreeze: (specFreezeMs !== null && lastFrameGapMs > specFreezeMs) ? true : false,
                     frameRate: currentFrameRate === null ? 'unavailable' : Number(currentFrameRate.toFixed(2)),
                     presentedFps: lastPresentedFps === null ? 'unavailable' : Number(lastPresentedFps.toFixed(2)),
@@ -5157,7 +5342,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 // the element is spending buffer surplus, which is the visible
                 // hitch-then-jump — but it is a presented-rate measure, and
                 // presentedFrames alongside it is what separates the two causes.
-                if (metadata && Number.isFinite(metadata.mediaTime)) {
+                // A covered/backgrounded window presents at Chrome's throttle
+                // rate, so its inter-frame gaps and media clock describe the
+                // throttle, not the stream. Keep the presentedFrames counter
+                // (it is a cumulative count) but do not measure cadence while
+                // inactive; noteViewerActive() establishes a fresh baseline.
+                if (viewerIsActive() && metadata && Number.isFinite(metadata.mediaTime)) {
                     if (lastMediaTimeSec !== null) {
                         const wallSec = (now - lastFramePresentAt) / 1000;
                         const mediaDelta = metadata.mediaTime - lastMediaTimeSec;
@@ -5199,6 +5389,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function startFreezeWatchdog() {
         console.log("[FreezeGuard] Starting freeze watchdog...");
         frozenSince = 0;
+        focusedStallSince = 0;
         isRecovering = false;
         lastDecodedFrames = 0;
         lastBytesCount = 0;
@@ -5215,7 +5406,10 @@ document.addEventListener('DOMContentLoaded', () => {
         freezeCheckInterval = setInterval(() => {
             // Skip all freeze detection while the user deliberately paused playback:
             // frames stop presenting and decode can suspend, which would read as a false stall.
-            if (!isConnected || isRecovering || !peerConnection || player.paused || document.hidden) return;
+            // A covered window is not `document.hidden`, but Chrome throttles
+            // its presentation the same way; recovery must not run against it.
+            if (!isConnected || isRecovering || !peerConnection || player.paused
+                || document.hidden || !viewerIsActive()) return;
 
             const now = performance.now();
             const frameStaleness = now - lastFrameTime;
@@ -5351,13 +5545,46 @@ document.addEventListener('DOMContentLoaded', () => {
                     frozenSince = 0;
                 }
             }
+
+            // Presentation-only stall. The decoder-rate test above requires
+            // `framesDecoded` to fall behind, so it cannot see a renderer that
+            // is still decoding but no longer presenting — the state a covered
+            // viewer can be left in after Chrome throttles it. RTP is still
+            // arriving (bytesDelta > 0), the page is focused, and nothing has
+            // reached the compositor for two seconds. Confirm across one more
+            // poll before spending the 2-4s recovery, then rebuild the
+            // pipeline through the same bounded staged path.
+            if (!isRecovering) {
+                const presentationStalled = viewerIsActive()
+                    && player.readyState >= 2
+                    && bytesDelta > 0
+                    && frameStaleness > FOCUSED_STALL_MS;
+                if (presentationStalled) {
+                    if (focusedStallSince === 0) {
+                        focusedStallSince = now;
+                        console.warn(`[FreezeGuard] Focused viewer has presented no frame for `
+                            + `${Math.round(frameStaleness)}ms (bytes still flowing) — watching for a stall.`);
+                    } else {
+                        const stalledForMs = now - focusedStallSince;
+                        if (stalledForMs >= FOCUSED_STALL_CONFIRM_MS) {
+                            focusedStallSince = 0;
+                            console.error(`[FreezeGuard] Presentation stalled for `
+                                + `${Math.round(stalledForMs + frameStaleness)}ms — triggering staged recovery...`);
+                            triggerFreezeRecovery('presentation_stall');
+                        }
+                    }
+                } else {
+                    focusedStallSince = 0;
+                }
+            }
         }, 1500);
 
         player.onwaiting = () => {
             console.warn("[FreezeGuard] player.onwaiting fired (buffering).");
             if (stallTimeout) clearTimeout(stallTimeout);
             stallTimeout = setTimeout(() => {
-                if (isConnected && !isRecovering && !player.paused && player.readyState < 3 && !document.hidden) {
+                if (isConnected && !isRecovering && !player.paused && player.readyState < 3
+                    && !document.hidden && viewerIsActive()) {
                     console.error("[FreezeGuard] Player stuck in waiting/buffering for 4s. Triggering recovery.");
                     triggerFreezeRecovery('player_stalled');
                 }
@@ -5402,6 +5629,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         snapshotMisses = 0;
         frozenSince = 0;
+        focusedStallSince = 0;
     }
 
     // Stage 1/2 success must be judged on PRESENTATION, not on the element's
