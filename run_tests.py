@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,8 @@ JS_CHECKS_PATH = ROOT / "js_checks.js"
 BRIDGE_PATH = ROOT / "codec_bridge.js"
 LAUNCHER_PATH = ROOT / "start_host.ps1"
 MEDIAMTX_PATH = ROOT / "mediamtx_win" / "mediamtx.exe"
+BUNDLED_FFMPEG = (ROOT / "ffmpeg_win" / "ffmpeg-n8.1-latest-win64-gpl-shared-8.1"
+                  / "bin" / "ffmpeg.exe")
 # The browser broadcaster ("Rydius Studio"). Separate files from the player so
 # the player's own load path and its tests are untouched by this feature.
 BROADCAST_HTML_PATH = ROOT / "broadcast.html"
@@ -2875,6 +2878,49 @@ class StudioPageChecks(_SiteUnderTest):
         self.assertIn("killFfmpeg(previous, 'SIGKILL')", self.ingest_js)
         self.assertIn("function finalizeSession(session)", self.ingest_js)
         self.assertIn("FAILED_SESSION_TTL_MS", self.ingest_js)
+        self.assertIn("function hasActiveSession()", self.ingest_js)
+        self.assertIn("hasActiveSession,", self.ingest_js)
+
+    def test_studio_refuses_to_start_against_another_publisher(self):
+        """Starting into a live OBS session is a fight, not a takeover.
+
+        `overridePublisher: yes` makes the newest publisher win, so the two
+        processes kick each other until the studio's ffmpeg dies with an RTSP
+        broken pipe. The page must disable Start before that can happen, and
+        re-probe at the last moment because the page may have been open for a
+        while.
+        """
+        self.assertIn("let otherPublisherLive = false;", self.studio_js)
+        self.assertIn("otherPublisherLive = live && !isPublishing;", self.studio_js)
+        self.assertIn("!otherPublisherLive", self.studio_js)
+        self.assertIn("if (otherPublisherLive) {", self.studio_js)
+        self.assertIn(
+            "Another publisher is live. Stop OBS (or whatever is publishing)",
+            self.studio_js)
+        self.assertIn("PUBLISHER_PROBE_INTERVAL_MS", self.studio_js)
+
+        # The last-moment probe must be inside startPublishing(), not only in
+        # the click handler: microphone permission and the session POST both
+        # await, and a publisher can appear during either.
+        start = self.studio_js.find("async function startPublishing(")
+        stop = self.studio_js.find("async function handlePublisherError(", start)
+        self.assertGreater(start, 0, "startPublishing was not found")
+        self.assertGreater(stop, start, "startPublishing is not bounded")
+        body = self.studio_js[start:stop]
+        self.assertIn("if (await isAlreadyPublishing()) {", body)
+        self.assertIn("otherPublisherLive = false;", body)
+
+        # Server-side duplicate of the guard, for a stale page or a second tab.
+        self.assertIn("livePathHasForeignPublisher", self.server)
+        self.assertIn("studioIngest.hasActiveSession()", self.server)
+        self.assertIn(
+            "Stop OBS (or whatever is publishing), then start again.",
+            self.server)
+
+        # The relay's raw broken-pipe error must be translated, not shown.
+        self.assertIn("function describeRelayFailure(message)", self.client_js)
+        self.assertIn("Broken pipe", self.client_js)
+        self.assertIn("describeRelayFailure(status.error)", self.client_js)
 
     def test_studio_static_allowlist_covers_the_new_assets(self):
         for marker in ("['/studio', 'studio.html']",
@@ -2889,9 +2935,9 @@ class StudioPageChecks(_SiteUnderTest):
         versions = set(re.findall(
             r"/streaming/(?:studio\.css|studio\.js|studio_ingest_client\.js)\?v=([^\"']+)",
             self.studio_html))
-        self.assertEqual(versions, {"3.0.3"},
+        self.assertEqual(versions, {"3.0.4"},
                          "studio assets must share one cache version, got {}".format(versions))
-        self.assertIn('href="/streaming/studio?v=3.0.3"', self.html)
+        self.assertIn('href="/streaming/studio?v=3.0.4"', self.html)
         self.assertIn("addModule(`${WORKLET_URL}?v=3`)", self.client_js)
 
     def test_studio_does_not_change_the_obs_pipeline(self):
@@ -2946,6 +2992,12 @@ class StudioIngestClientChecks(unittest.TestCase):
     def test_backpressure_sacrifices_video_first(self):
         run_js_check(self, "studio-ingest-backpressure-sacrifices-video-first")
 
+    def test_relay_failure_explains_a_takeover(self):
+        run_js_check(self, "studio-ingest-relay-failure-explains-a-takeover")
+
+    def test_start_failure_unwraps_json_and_takeover(self):
+        run_js_check(self, "studio-ingest-start-failure-unwraps-json-and-takeover")
+
     def test_batches_whole_frames_only(self):
         run_js_check(self, "studio-ingest-batches-whole-frames-only")
 
@@ -2953,10 +3005,67 @@ class StudioIngestClientChecks(unittest.TestCase):
         run_js_check(self, "studio-worklet-s16le-is-interleaved-and-clamped")
 
 
+class _HoldingTcpServer:
+    """A TCP listener that accepts connections and never answers.
+
+    ffmpeg's RTSP muxer connects to its output before it reads the first
+    frame. Holding the socket open keeps a relay session in `starting` (and
+    therefore active) without booting a real MediaMTX for the test.
+    """
+
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(("127.0.0.1", 0))
+        self.socket.listen(8)
+        self.port = self.socket.getsockname()[1]
+        self.connections = []
+        self.stopped = False
+        Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while not self.stopped:
+            try:
+                connection, _ = self.socket.accept()
+            except OSError:
+                return
+            self.connections.append(connection)
+
+    def stop(self):
+        self.stopped = True
+        try:
+            self.socket.close()
+        except OSError:
+            pass
+        for connection in self.connections:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+
 class StudioIngestRouteChecks(_SiteUnderTest):
     """The host-only HTTP surface the browser uses to start and feed a session."""
 
     MISSING_FFMPEG = "studio-test-no-ffmpeg.exe"
+
+    SESSION_BODY = json.dumps({
+        "width": 1920, "height": 1080, "fps": 24,
+        "bitrate": 4000000, "audio": False,
+    }).encode("utf-8")
+
+    # A MediaMTX control API that says the studio's path already has a
+    # publisher. Starting into it is a fight, not a deliberate takeover.
+    FOREIGN_PUBLISHER_API = {
+        ("GET", "/v3/paths/list"): lambda stub: (
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps({
+                "itemCount": 1,
+                "items": [{"name": "live", "ready": True, "online": True}],
+            }).encode("utf-8"),
+        ),
+    }
 
     def setUp(self):
         super().setUp()
@@ -3010,6 +3119,72 @@ class StudioIngestRouteChecks(_SiteUnderTest):
         payload = json.loads(body.decode("utf-8"))
         self.assertIn("ffmpeg was not found", payload["error"])
         self.assertRegex(payload["id"], r"^[a-f0-9]{16}$")
+
+    def test_session_refuses_to_fight_a_foreign_publisher(self):
+        self.start_site(
+            api_routes=self.FOREIGN_PUBLISHER_API,
+            extra_env={"STUDIO_FFMPEG": str(ROOT / self.MISSING_FFMPEG)})
+        status, headers, body = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body=self.SESSION_BODY, headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 409, body.decode("utf-8"))
+        self.assertIn("json", headers.get("Content-Type", ""))
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIn("Another publisher", payload["error"])
+        self.assertIn("Stop OBS", payload["error"])
+        self.assertEqual(self.api.requests[-1]["path"], "/v3/paths/list",
+                         "the guard must ask MediaMTX before spawning anything")
+        self.assertNotIn("id", payload,
+                         "a refused start must not create a relay session")
+
+    def test_session_may_replace_the_relays_own_publisher(self):
+        if not BUNDLED_FFMPEG.is_file():
+            self.skipTest("the bundled ffmpeg is not in this checkout")
+        rtsp = _HoldingTcpServer()
+        self._stubs.append(rtsp)
+        state = {"ready": False}
+
+        def live_paths(stub):
+            return (
+                200,
+                {"Content-Type": "application/json"},
+                json.dumps({
+                    "itemCount": 1,
+                    "items": [{"name": "live", "ready": state["ready"],
+                               "online": state["ready"]}],
+                }).encode("utf-8"),
+            )
+
+        self.start_site(
+            api_routes={("GET", "/v3/paths/list"): live_paths},
+            extra_env={
+                "STUDIO_FFMPEG": str(BUNDLED_FFMPEG),
+                "STUDIO_RTSP_URL": f"rtsp://127.0.0.1:{rtsp.port}/live",
+            })
+        headers = {"Content-Type": "application/json"}
+
+        first_status, _, first_body = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body=self.SESSION_BODY, headers=headers)
+        self.assertEqual(first_status, 201, first_body.decode("utf-8"))
+        first = json.loads(first_body.decode("utf-8"))
+
+        # The path is now "ready" because of our own ffmpeg. A second start
+        # must replace that session instead of being refused as foreign.
+        state["ready"] = True
+        second_status, _, second_body = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body=self.SESSION_BODY, headers=headers)
+        self.assertEqual(second_status, 201, second_body.decode("utf-8"))
+        second = json.loads(second_body.decode("utf-8"))
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(self.api.requests[-1]["path"], "/v3/paths/list",
+                         "the replacement must still consult the control API")
+
+        # Do not leave an ffmpeg behind when the test ends.
+        http_request(
+            self.port, "DELETE",
+            f"/stream-api/studio/session/{second['id']}?token={second['token']}")
 
     def test_capabilities_reports_broadcast_access_and_host(self):
         status, headers, body = http_request(
@@ -3590,6 +3765,211 @@ class MediaMTXControlApiContractChecks(unittest.TestCase):
             stop_process(process)
             config_path.unlink(missing_ok=True)
 
+class StudioPublisherConflictChecks(unittest.TestCase):
+    """A foreign publisher on `live` must not become a takeover fight.
+
+    Production `mediamtx.yml` sets ``overridePublisher: yes``. When OBS
+    reconnects while the studio is live, MediaMTX closes the studio's RTSP
+    session, and the studio's ffmpeg dies with the exact broken-pipe error an
+    operator reported. This boots a real MediaMTX and drives the real relay:
+    the session must fail with that error, a new start must be refused with a
+    409 while the foreign publisher owns the path, and the guard must let a
+    start through once the path is free.
+    """
+
+    def test_rtmp_takeover_is_a_clear_failure_and_a_refused_start(self):
+        if not MEDIAMTX_PATH.is_file():
+            self.skipTest("MediaMTX binary is not installed")
+        if not BUNDLED_FFMPEG.is_file():
+            self.skipTest("the bundled ffmpeg is not in this checkout")
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required to host the site")
+
+        api = find_free_port()
+        rtsp = find_free_port()
+        rtmp = find_free_port()
+        server_port = find_free_port()
+        unused_webrtc = find_free_port()
+        config = (
+            "logLevel: warn\n"
+            "logDestinations: [stdout]\n"
+            "api: yes\n"
+            "apiAddress: 127.0.0.1:{api}\n"
+            "rtsp: yes\n"
+            "rtspAddress: 127.0.0.1:{rtsp}\n"
+            "rtspTransports: [tcp]\n"
+            "rtmp: yes\n"
+            "rtmpAddress: 127.0.0.1:{rtmp}\n"
+            "hls: no\n"
+            "srt: no\n"
+            "moq: no\n"
+            "webrtc: no\n"
+            "paths:\n"
+            "  live:\n"
+            "    overridePublisher: yes\n"
+        ).format(api=api, rtsp=rtsp, rtmp=rtmp)
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".yml", delete=False, encoding="ascii") as handle:
+            handle.write(config)
+            config_path = Path(handle.name)
+
+        mtx = server = dummy = None
+        try:
+            mtx = subprocess.Popen(
+                [str(MEDIAMTX_PATH), str(config_path)], cwd=str(ROOT),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._wait_for(
+                lambda: self._live_state(api) is not None, 15,
+                "MediaMTX control API never answered")
+
+            env = os.environ.copy()
+            for key in ("PORT", "MEDIAMTX_PORT", "MEDIAMTX_API_PORT"):
+                env.pop(key, None)
+            env.update({
+                "PORT": str(server_port),
+                "MEDIAMTX_PORT": str(unused_webrtc),
+                "MEDIAMTX_API_PORT": str(api),
+                "STUDIO_RTSP_URL": f"rtsp://127.0.0.1:{rtsp}/live",
+                "STUDIO_FFMPEG": str(BUNDLED_FFMPEG),
+            })
+            server = subprocess.Popen(
+                [node, str(SERVER_PATH)], cwd=str(ROOT), env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            wait_until_ready(self, server, f"http://127.0.0.1:{server_port}")
+
+            status, session = self._post_session(server_port)
+            self.assertEqual(status, 201, session)
+
+            # ffmpeg only announces on RTSP after its first frame. Feed a
+            # real Annex B second so the studio is the path's publisher
+            # before the takeover, exactly as it is during a broadcast.
+            encoded = subprocess.run(
+                [str(BUNDLED_FFMPEG), "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc=size=320x180:rate=24", "-t", "1",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                 "-g", "24", "-f", "h264", "-"],
+                cwd=str(ROOT), capture_output=True, timeout=60,
+            )
+            self.assertEqual(encoded.returncode, 0,
+                             encoded.stderr.decode("utf-8", "replace"))
+            self.assertTrue(encoded.stdout, "ffmpeg produced no H.264 data")
+            self._ingest(server_port, session, encoded.stdout, 1)
+
+            self._wait_for(
+                lambda: ((self._live_state(api) or {}).get("source") or {}).get("type")
+                == "rtspSession", 15,
+                "the studio never became the publisher on 'live'")
+
+            # OBS publishes RTMP. The newest publisher wins.
+            dummy = subprocess.Popen(
+                [str(BUNDLED_FFMPEG), "-hide_banner", "-loglevel", "error", "-re",
+                 "-f", "lavfi", "-i", "testsrc=size=320x180:rate=24",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                 "-g", "24", "-f", "flv", f"rtmp://127.0.0.1:{rtmp}/live"],
+                cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._wait_for(
+                lambda: ((self._live_state(api) or {}).get("source") or {}).get("type")
+                == "rtmpConn", 15,
+                "the dummy publisher never took over 'live'")
+
+            # The next write is what breaks: MediaMTX closed the studio's
+            # RTSP session when the RTMP publisher arrived.
+            self._ingest(server_port, session, encoded.stdout, 2_000_000)
+            failure = self._wait_for(
+                lambda: self._session_status(server_port, session)
+                if self._session_status(server_port, session).get("state") == "failed"
+                else None,
+                15, "the studio session did not report the broken pipe")
+            self.assertIn("Broken pipe", failure.get("error", ""),
+                          "the relay must report the real muxer error: {}".format(failure))
+
+            # With the foreign publisher still live, a new start is refused
+            # before an ffmpeg can be spawned into the fight.
+            status, refused = self._post_session(server_port)
+            self.assertEqual(status, 409, refused)
+            self.assertIn("Another publisher", refused.get("error", ""))
+            self.assertIn("Stop OBS", refused.get("error", ""))
+
+            # Stopping OBS must unblock the operator without a page reload:
+            # the guard consults the live path again and lets the start
+            # through once nothing owns it.
+            dummy.terminate()
+            try:
+                dummy.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                dummy.kill()
+                dummy.wait(timeout=5)
+            dummy = None
+            self._wait_for(
+                lambda: not ((self._live_state(api) or {}).get("ready")),
+                15, "the foreign publisher never released 'live'")
+            status, restarted = self._post_session(server_port)
+            self.assertEqual(status, 201, restarted)
+            http_request(
+                server_port, "DELETE",
+                f"/stream-api/studio/session/{restarted['id']}"
+                f"?token={restarted['token']}")
+        finally:
+            if dummy is not None:
+                dummy.terminate()
+                try:
+                    dummy.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    dummy.kill()
+            stop_process(server)
+            stop_process(mtx)
+            config_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _wait_for(predicate, timeout, message):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.2)
+        raise AssertionError(message)
+
+    @staticmethod
+    def _live_state(api):
+        try:
+            with urlopen(
+                    f"http://127.0.0.1:{api}/v3/paths/list", timeout=2) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (URLError, OSError, ValueError):
+            return None
+        return next(
+            (item for item in payload.get("items", []) if item.get("name") == "live"),
+            None)
+
+    @staticmethod
+    def _post_session(port):
+        body = json.dumps({
+            "width": 640, "height": 360, "fps": 24,
+            "bitrate": 1000000, "audio": False,
+        }).encode("utf-8")
+        status, _, payload = http_request(
+            port, "POST", "/stream-api/studio/session",
+            body=body, headers={"Content-Type": "application/json"})
+        return status, json.loads(payload.decode("utf-8"))
+
+    @staticmethod
+    def _ingest(port, session, payload, pts_us):
+        header = struct.pack(">BIQ", 1, len(payload), pts_us)
+        status, _, body = http_request(
+            port, "POST", session["ingestUrl"], body=header + payload,
+            headers={"Content-Type": "application/octet-stream"})
+        if status != 200:
+            raise AssertionError("ingest failed: {} {}".format(
+                status, body.decode("utf-8", "replace")))
+
+    @staticmethod
+    def _session_status(port, session):
+        status, _, body = http_request(port, "GET", session["statusUrl"])
+        if status != 200:
+            return {"state": "gone", "error": "HTTP {}".format(status)}
+        return json.loads(body.decode("utf-8"))
+
 class ReceiverLagFixChecks(unittest.TestCase):
     """Guards for the receiver-side lag fixes, each one verified live.
 
@@ -3796,21 +4176,25 @@ class ReceiverLagFixChecks(unittest.TestCase):
         self.assertRegex(app, r"live \$\{Math\.round\(avgPlayoutDelayMs\)\}",
                          "HUD buffer item must print the measured live delay when it diverges")
 
-    def test_latency_mode_defaults_to_cinema_and_persists(self):
+    def test_latency_mode_defaults_to_smooth_and_persists(self):
         # 'balanced' (180ms) as the default kept every fresh viewer's jitter
         # buffer oscillating around the fixed point on bursty arrivals —
         # overshoot drained back at ~150ms/s of catch-up ("a few ms fast"),
         # under-run held a frame ("a few ms slow") — the exact micro-stutter
-        # receivers reported with 0% loss. For a movie broadcast latency is
-        # welcome, so 'cinema' (1s) is the default; a manual choice must
-        # survive reloads.
+        # receivers reported with 0% loss. 'cinema' (1s) removed that by
+        # sitting above the whole arrival distribution, but it cost a full
+        # second of lag on every healthy link. 'smooth' (350ms) is now the
+        # default: the end-to-end 60fps run measured ~335ms playout with zero
+        # relay drops and zero resyncs, 648ms below Cinema's ~982ms, while the
+        # adaptive supervisor still raises the target when the link needs it.
+        # A manual choice must survive reloads.
         app = read_text(APP_PATH)
         html = read_text(HTML_PATH)
-        self.assertIn("let currentLatencyMode = 'cinema';", app,
-                      "cinema (1s) must be the default playout target")
+        self.assertIn("let currentLatencyMode = 'smooth';", app,
+                      "smooth (350ms) must be the default playout target")
         self.assertIn("rydius_latency_mode", app,
                       "the latency choice must persist across visits")
-        self.assertIn('title="Latency Buffer: Cinema (1s)"', html,
+        self.assertIn('title="Latency Buffer: Anti-Stutter (350ms)"', html,
                       "the latency button must boot in the default mode's state")
 
     def test_stats_loop_resume_keeps_measurement_baselines(self):
@@ -4122,12 +4506,12 @@ class ReceiverLagFixChecks(unittest.TestCase):
         run_js_check(self, "catchup-self-verification-ignores-a-refilling-buffer")
 
     def test_receiver_anti_drop_hardening_is_present(self):
-        # Latency is explicitly traded for smoothness in this project: the
-        # playout floor grows with measured jitter (late frames left
-        # under-buffered are what a viewer sees as "frame drops"), drift
-        # limits are per-mode, ABR switches stressed viewers onto the
-        # low-bitrate rendition, and the HUD distinguishes decoded frames
-        # from actually rendered frames.
+        # Latency and smoothness are balanced rather than one being sacrificed:
+        # the default is Smooth (350ms), the playout floor grows with measured
+        # jitter (late frames left under-buffered are what a viewer sees as
+        # "frame drops"), drift limits are per-mode, ABR switches stressed
+        # viewers onto the low-bitrate rendition, and the HUD distinguishes
+        # decoded frames from actually rendered frames.
         app = read_text(APP_PATH)
         self.assertIn("function jitterBufferFloorMs(", app, "jitter-proportional floor missing")
         self.assertIn("jitterFloorEmaMs = jitterBufferFloorMs(",
@@ -5405,9 +5789,9 @@ class ViewerSmoothnessRegressionChecks(unittest.TestCase):
         sat at ~933ms while targeted video sat at ~271ms — a ~660ms constant
         lip-sync offset). The element keeps video presentation on the audio
         clock, so ANY difference between the two targets is lip-sync error, not
-        a contained setting: the old AUDIO_PLAYOUT_CAP_MS=400 turned the 1s
-        Cinema default into a permanent 600ms audio-early offset for every
-        fresh viewer, and skewed accommodated sessions (video 2200 / audio 400)
+        a contained setting: the old AUDIO_PLAYOUT_CAP_MS=400 turned a 1s
+        Cinema selection into a permanent 600ms audio-early offset for that
+        viewer, and skewed accommodated sessions (video 2200 / audio 400)
         by 1.8s. A raise is silent buffering in NetEQ and every lower is
         already step-limited to 50ms/tick, so identical writes keep the two
         surfaces in lockstep under either reading of the spec's

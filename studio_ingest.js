@@ -936,9 +936,20 @@ function createStudioIngest(options = {}) {
         }
     }
 
+    // True while this relay still owns a session that is starting, live or
+    // winding down. A failed/ended session does not count: its publisher is
+    // gone, so a new start must not be mistaken for a takeover of our own.
+    function hasActiveSession() {
+        const session = sessions.get(activeId);
+        return Boolean(session
+            && session.state !== 'failed'
+            && session.state !== 'ended');
+    }
+
     return {
         handle,
         closeAll,
+        hasActiveSession,
         getSession(id) {
             return sessions.get(id) || null;
         },

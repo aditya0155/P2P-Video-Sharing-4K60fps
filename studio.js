@@ -50,6 +50,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const ACCESS_CHECK_TIMEOUT_MS = 4000;
     const PATH_PROBE_TIMEOUT_MS = 5000;
+    const PUBLISHER_PROBE_INTERVAL_MS = 4000;
     const STATS_INTERVAL_MS = 1000;
 
     // Requested as `ideal`, never `exact`: a display track cannot be forced to
@@ -182,6 +183,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // null = still checking, true = broadcasting allowed, false = unavailable
     // or unknown. Start stays disabled until this is true.
     let canBroadcast = null;
+    // True when MediaMTX reports a publisher already on `live` that is not one
+    // of our own sessions. Starting then is a takeover fight with OBS, so the
+    // page blocks it and explains how to proceed instead of letting ffmpeg die.
+    let otherPublisherLive = false;
 
     let audioIsSilent = false;
     let audioTapFailed = false;
@@ -285,7 +290,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function canStartNow() {
-        return !unsupported && canBroadcast === true && hasSource() && !isPublishing && !isStarting;
+        return !unsupported && canBroadcast === true && !otherPublisherLive
+            && hasSource() && !isPublishing && !isStarting;
     }
 
     function transportNoteText() {
@@ -294,6 +300,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (canBroadcast === false) return 'Broadcasting is unavailable on this server.';
         if (isPublishing) return 'Live. Encoder settings are fixed until you stop.';
         if (isStarting) return 'Starting the encoder…';
+        if (otherPublisherLive) return 'Another publisher is live. Stop OBS (or whatever is publishing) to broadcast from here.';
         if (!hasSource()) return 'Choose a source to unlock broadcasting.';
         return 'Ready. Press start when you are.';
     }
@@ -389,15 +396,33 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (!canBroadcast) return;
 
-        // Advisory only: the relay overrides an existing publisher. Learning
-        // that BEFORE starting is the difference between a deliberate takeover
-        // and an OBS stream dying without explanation.
-        isAlreadyPublishing().then((already) => {
-            if (already && !isPublishing) {
-                showToast('Something is already publishing to this stream. Starting here will replace it.', 'warning');
-                refreshTransport('Another publisher is live — starting will replace it.');
-            }
-        });
+        // The relay lets the newest publisher win. Starting against a live
+        // OBS session is therefore a fight: the studio kicks OBS, OBS
+        // reconnects and kicks the studio, and the relay's ffmpeg dies with an
+        // RTSP broken pipe. Find it BEFORE Start is enabled, not after the
+        // broadcast has already collapsed.
+        const already = await isAlreadyPublishing();
+        if (already && !isPublishing) {
+            showToast('Another publisher is live. Stop OBS (or whatever is publishing) to broadcast from here.', 'warning');
+        }
+        refreshTransport();
+        startPublisherWatch();
+    }
+
+    // The path can become free (or busy) while the page sits idle. Without
+    // this, a blocked Start would stay disabled until the operator reloaded
+    // the page even after OBS was stopped.
+    let publisherWatchTimer = null;
+
+    function startPublisherWatch() {
+        if (publisherWatchTimer) return;
+        publisherWatchTimer = setInterval(() => {
+            if (canBroadcast !== true || isPublishing || isStarting) return;
+            const wasLive = otherPublisherLive;
+            isAlreadyPublishing().then(() => {
+                if (otherPublisherLive !== wasLive) refreshTransport();
+            });
+        }, PUBLISHER_PROBE_INTERVAL_MS);
     }
 
     async function isAlreadyPublishing() {
@@ -406,14 +431,27 @@ document.addEventListener('DOMContentLoaded', () => {
                 cache: 'no-store',
                 signal: AbortSignal.timeout(PATH_PROBE_TIMEOUT_MS)
             });
-            if (!response.ok) return false;
+            if (!response.ok) {
+                otherPublisherLive = false;
+                return false;
+            }
             const data = await response.json();
             const items = Array.isArray(data.items) ? data.items : [];
             const path = items.find((entry) => entry && entry.name === STREAM_PATH);
-            if (!path) return false;
-            return Boolean(path.ready || path.online);
+            if (!path) {
+                otherPublisherLive = false;
+                return false;
+            }
+            const live = Boolean(path.ready || path.online);
+            // While this page is broadcasting the path is ready because of
+            // us, so only a publisher we did not start is a reason to block.
+            otherPublisherLive = live && !isPublishing;
+            return live;
         } catch (err) {
-            // The probe is advisory. A failure must not block the broadcast.
+            // The probe is advisory. A failure must not block the broadcast:
+            // the server repeats the check and also fails open when its own
+            // control-API call fails.
+            otherPublisherLive = false;
             console.warn('[Studio] Could not check for an existing publisher:', err);
             return false;
         }
@@ -885,9 +923,9 @@ document.addEventListener('DOMContentLoaded', () => {
         refreshTransport('Ready. Press start when you are.');
 
         if (await isAlreadyPublishing()) {
-            showToast('Something is already publishing to this stream. Going live here will replace it.', 'warning');
-            refreshTransport('Another publisher is live — starting will replace it.');
+            showToast('Another publisher is live. Stop OBS (or whatever is publishing) to broadcast from here.', 'warning');
         }
+        refreshTransport();
     }
 
     // Turns a getDisplayMedia rejection into something actionable. Each name
@@ -1044,6 +1082,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!window.StudioIngest || typeof window.StudioIngest.createPublisher !== 'function') {
             throw new Error('The ingest client did not load. Reload the page.');
         }
+        // Re-probe at the last moment: the page may have been open for a
+        // while, and a publisher can appear between load and click. The
+        // server repeats this check; failing here avoids starting an encoder
+        // that would only die with an RTSP broken pipe.
+        if (await isAlreadyPublishing()) {
+            throw new Error('Another publisher is live. Stop OBS (or whatever is publishing) to broadcast from here.');
+        }
 
         const dims = resolveDimensions();
         const fps = Number(framerateSelect ? framerateSelect.value : 24) || 24;
@@ -1134,6 +1179,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         isPublishing = true;
+        otherPublisherLive = false;
         setBusy(false);
         setStatus('live', 'Live');
         setEncoderControlsLocked(true);
@@ -1540,6 +1586,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
                 if (!hasSource()) {
                     showToast('Choose a screen, window or tab first.', 'warning');
+                    return;
+                }
+                if (otherPublisherLive) {
+                    // The button is disabled in this state, but the flag can
+                    // flip between the probe and the click. Re-check in the
+                    // background so a stopped OBS unblocks Start without a
+                    // reload.
+                    showToast('Another publisher is live. Stop OBS (or whatever is publishing) to broadcast from here.', 'warning');
+                    isAlreadyPublishing().then(() => refreshTransport());
                     return;
                 }
 

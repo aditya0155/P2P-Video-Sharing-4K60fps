@@ -13,6 +13,10 @@ studio broadcast, joins the real viewer, and verifies:
   * the relay drops no video and never re-synchronises
   * the studio's Dropped meter stays at zero (browser, encoder queue and relay)
   * the viewer receives and decodes ~60 fps at the native 1080p size
+  * the player boots in the Smooth (350ms) default and the measured playout
+    stays near 350ms — a regression back to a 1s default fails here
+  * switching to Cinema raises the measured playout by >=300ms while still
+    decoding 60 fps with zero relay drops, proving the mode control works
   * a viewer that joins as soon as the stream appears is NOT rescued to 720p,
     and no rescue verdict is persisted for later visits
 
@@ -78,6 +82,20 @@ def free_port(used):
 def http_json(url, timeout=4):
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return json.loads(response.read())
+
+
+def windowed_stats_delay(now_total, now_count, old_total, old_count):
+    """Per-window average from cumulative WebRTC jitter-buffer counters.
+
+    Same formula as app.js windowedPlayoutDelayMs: dividing the session-long
+    total by the session-long count hides a fresh slip behind the live edge.
+    """
+    if None in (now_total, now_count, old_total, old_count):
+        return None
+    emitted = now_count - old_count
+    if old_count <= 0 or emitted <= 0 or now_total < old_total:
+        return None
+    return round(((now_total - old_total) / emitted) * 1000, 1)
 
 
 def wait_http(url, timeout, label):
@@ -606,7 +624,11 @@ def main():
                                 framesDropped: entry.framesDropped,
                                 packetsLost: entry.packetsLost,
                                 pliCount: entry.pliCount,
-                                decoderImplementation: entry.decoderImplementation
+                                decoderImplementation: entry.decoderImplementation,
+                                jitterBufferDelay: entry.jitterBufferDelay,
+                                jitterBufferEmittedCount: entry.jitterBufferEmittedCount,
+                                jitterBufferTargetDelay: entry.jitterBufferTargetDelay,
+                                jitterBufferMinimumDelay: entry.jitterBufferMinimumDelay
                             };
                         }
                     });
@@ -657,6 +679,16 @@ def main():
                         (now_stats["framesDecoded"] - old_stats["framesDecoded"]) / seconds, 1)
                     row["rvfcFps"] = round(
                         (row["viewer"]["rvfc"] - previous["viewer"]["rvfc"]) / seconds, 1)
+                    row["playoutMs"] = windowed_stats_delay(
+                        now_stats.get("jitterBufferDelay"),
+                        now_stats.get("jitterBufferEmittedCount"),
+                        old_stats.get("jitterBufferDelay"),
+                        old_stats.get("jitterBufferEmittedCount"))
+                    row["targetMs"] = windowed_stats_delay(
+                        now_stats.get("jitterBufferTargetDelay"),
+                        now_stats.get("jitterBufferEmittedCount"),
+                        old_stats.get("jitterBufferTargetDelay"),
+                        old_stats.get("jitterBufferEmittedCount"))
                 else:
                     # A rendition switch tears the peer connection down and
                     # resets its counters; a delta across it is meaningless.
@@ -668,6 +700,7 @@ def main():
             previous = row
             print(f"[e2e] {row['at']:5.1f}s meter={row['meterFps']:>3} "
                   f"relay={row.get('relayFps')} rx={row.get('rxFps')} dec={row.get('decFps')} "
+                  f"playout={row.get('playoutMs')} target={row.get('targetMs')} "
                   f"dropped={row['relay']['droppedVideo']} meterDrop={row['meterDropped']} "
                   f"resyncs={row['relay']['resyncs']} "
                   f"{row['viewer'].get('width')}x{row['viewer'].get('height')}")
@@ -692,10 +725,18 @@ def main():
             if str(row.get("meterDropped") or "").strip().isdigit()
         ]
         rescue = viewer.evaluate("localStorage.getItem('rydius_h264_rescue')")
+        playouts = [row["playoutMs"] for row in steady if row.get("playoutMs") is not None]
+        targets = [row["targetMs"] for row in steady if row.get("targetMs") is not None]
+        avg_playout = sum(playouts) / len(playouts) if playouts else None
+        avg_target = sum(targets) / len(targets) if targets else None
 
         print(f"[e2e] steady: rx={avg_rx:.1f} dec={avg_dec:.1f} minDec={min_dec:.1f} "
               f"dropped={dropped} resyncs={resyncs} size={widths}x{heights} "
               f"meterDrop={max(meter_drops, default=None)} rescue={rescue!r}")
+        print(f"[e2e] latency: playout avg={avg_playout} "
+              f"min={min(playouts) if playouts else None} "
+              f"max={max(playouts) if playouts else None} "
+              f"target avg={avg_target}")
 
         problems = []
         if dropped != 0:
@@ -716,6 +757,117 @@ def main():
             problems.append(f"viewer decoded only {avg_dec:.1f} fps")
         if widths != {1920} or heights != {1080}:
             problems.append(f"viewer played {widths}x{heights}, not the native 1920x1080")
+
+        # The buffer mode must change the measured playout delay, not just the
+        # HUD label. The first window above measured the DEFAULT, so pin its
+        # absolute latency: a regression back to a 1s default fails here even
+        # if the mode button still works. Then switch to Cinema and prove the
+        # control really changes the delay while still decoding 60 fps.
+        default_mode = viewer.evaluate(
+            "document.getElementById('latency-mode-btn').title")
+        print(f"[e2e] default latency mode: {default_mode}")
+        if "Anti-Stutter" not in (default_mode or ""):
+            problems.append(
+                f"the player did not boot in the Smooth default: {default_mode!r}")
+
+        if avg_playout is None:
+            problems.append("the viewer never reported a playout delay")
+        else:
+            if avg_playout > 500:
+                problems.append(
+                    "the default latency mode buffered "
+                    f"{avg_playout:.0f}ms; the default must stay near 350ms")
+
+            viewer.evaluate(
+                "document.getElementById('latency-mode-btn').click()")
+            time.sleep(0.15)
+            cinema_mode = viewer.evaluate(
+                "document.getElementById('latency-mode-btn').title")
+            print(f"[e2e] latency mode -> {cinema_mode}; settling")
+            if "Cinema" not in (cinema_mode or ""):
+                problems.append(
+                    f"the mode button did not reach Cinema: {cinema_mode!r}")
+            time.sleep(8)
+
+            cinema_rows = []
+            cinema_prev = None
+            cinema_started = time.time()
+            while time.time() - cinema_started < 12:
+                relay = relay_status()
+                sample = viewer_sample()
+                row = {
+                    "at": round(time.time() - cinema_started, 2),
+                    "relay": relay,
+                    "viewer": sample,
+                }
+                if cinema_prev:
+                    seconds = row["at"] - cinema_prev["at"]
+                    now_stats = row["viewer"].get("stats") or {}
+                    old_stats = cinema_prev["viewer"].get("stats") or {}
+                    same_peer = (
+                        row["viewer"].get("pcId")
+                        == cinema_prev["viewer"].get("pcId"))
+                    if (seconds > 0 and same_peer and now_stats and old_stats
+                            and now_stats["framesReceived"]
+                            >= old_stats["framesReceived"]):
+                        row["rxFps"] = round(
+                            (now_stats["framesReceived"]
+                             - old_stats["framesReceived"]) / seconds, 1)
+                        row["decFps"] = round(
+                            (now_stats["framesDecoded"]
+                             - old_stats["framesDecoded"]) / seconds, 1)
+                        row["playoutMs"] = windowed_stats_delay(
+                            now_stats.get("jitterBufferDelay"),
+                            now_stats.get("jitterBufferEmittedCount"),
+                            old_stats.get("jitterBufferDelay"),
+                            old_stats.get("jitterBufferEmittedCount"))
+                        row["targetMs"] = windowed_stats_delay(
+                            now_stats.get("jitterBufferTargetDelay"),
+                            now_stats.get("jitterBufferEmittedCount"),
+                            old_stats.get("jitterBufferTargetDelay"),
+                            old_stats.get("jitterBufferEmittedCount"))
+                cinema_rows.append(row)
+                cinema_prev = row
+                print(f"[e2e] cinema {row['at']:5.1f}s rx={row.get('rxFps')} "
+                      f"dec={row.get('decFps')} playout={row.get('playoutMs')} "
+                      f"target={row.get('targetMs')} "
+                      f"dropped={row['relay'].get('droppedVideo')} "
+                      f"resyncs={row['relay'].get('resyncs')}")
+                time.sleep(1)
+
+            cinema = [row for row in cinema_rows
+                      if row["at"] >= 4 and row.get("playoutMs") is not None]
+            if len(cinema) < 5:
+                problems.append("the Cinema latency window produced too few samples")
+            else:
+                cinema_playout = (
+                    sum(row["playoutMs"] for row in cinema) / len(cinema))
+                cinema_dec = sum(row["decFps"] for row in cinema) / len(cinema)
+                cinema_dropped = (
+                    (cinema[-1]["relay"].get("droppedVideo") or 0)
+                    - (cinema[0]["relay"].get("droppedVideo") or 0))
+                cinema_resyncs = (
+                    (cinema[-1]["relay"].get("resyncs") or 0)
+                    - (cinema[0]["relay"].get("resyncs") or 0))
+                print(f"[e2e] cinema: playout avg={cinema_playout:.1f} "
+                      f"dec={cinema_dec:.1f} dropped={cinema_dropped} "
+                      f"resyncs={cinema_resyncs} "
+                      f"(default playout was {avg_playout:.1f})")
+                if cinema_playout - avg_playout < 300:
+                    problems.append(
+                        "Cinema did not raise the measured playout delay: "
+                        f"default {avg_playout:.0f}ms vs cinema "
+                        f"{cinema_playout:.0f}ms")
+                if cinema_dec < 55:
+                    problems.append(
+                        f"Cinema decoded only {cinema_dec:.1f} fps at 60 fps")
+                if cinema_dropped != 0:
+                    problems.append(
+                        f"Cinema dropped {cinema_dropped} relay frames")
+                if cinema_resyncs != 0:
+                    problems.append(
+                        f"Cinema re-synchronised {cinema_resyncs} times")
+
         if problems:
             raise RuntimeError("; ".join(problems))
 

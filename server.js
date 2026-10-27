@@ -1318,6 +1318,42 @@ function studioRequestAllowed(req) {
         || req.headers['forwarded']);
 }
 
+// Is something already publishing to the studio's `live` path?
+//
+// MediaMTX sets overridePublisher on `live`, so the newest publisher wins.
+// Starting the studio against a live OBS session is therefore a fight: the
+// studio kicks OBS, OBS auto-reconnects and kicks the studio, and the studio's
+// ffmpeg dies with an RTSP "Broken pipe" that looks like a random failure to
+// the operator. The relay deliberately replaces its OWN previous session, so
+// only a publisher with no active relay session behind it is foreign.
+//
+// Best effort: an unreachable control API returns null and the start proceeds.
+// The relay's own start will report the real failure; a transient API hiccup
+// must not lock the operator out of broadcasting.
+async function livePathHasForeignPublisher() {
+    try {
+        const response = await fetch(
+            `http://127.0.0.1:${MEDIAMTX_API_PORT}/v3/paths/list`,
+            { signal: AbortSignal.timeout(2000) }
+        );
+        if (!response.ok) return null;
+        const data = await response.json();
+        const items = Array.isArray(data && data.items) ? data.items : [];
+        const live = items.find((item) => item && item.name === 'live');
+        return Boolean(live && (live.ready === true || live.online === true));
+    } catch (_) {
+        return null;
+    }
+}
+
+function writeStudioNotFound(res) {
+    res.writeHead(404, setCorsHeaders({
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': CACHE_CONTROL
+    }));
+    res.end('404 Not Found');
+}
+
 const STUDIO_SESSION_WINDOW_MS = 10000;
 const STUDIO_SESSION_MAX_STARTS = 3;
 const studioSessionStarts = new Map();
@@ -1462,15 +1498,38 @@ const server = http.createServer((req, res) => {
                 res.end(body);
                 return;
             }
+            // Starting a broadcast is the one studio route that can collide
+            // with another publisher. Check the path first, but let a start
+            // that replaces our OWN active session through: the relay owns
+            // that publisher and replaces it deliberately.
+            if (requestUrl.pathname === '/stream-api/studio/session'
+                && req.method === 'POST') {
+                livePathHasForeignPublisher().then((publishing) => {
+                    if (publishing === true && !studioIngest.hasActiveSession()) {
+                        const body = JSON.stringify({
+                            error: 'Another publisher is live on the stream path. '
+                                + 'Stop OBS (or whatever is publishing), then start again.'
+                        });
+                        res.writeHead(409, setCorsHeaders({
+                            'Content-Type': 'application/json; charset=utf-8',
+                            'Cache-Control': CACHE_CONTROL,
+                            'Content-Length': Buffer.byteLength(body)
+                        }));
+                        res.end(body);
+                        return;
+                    }
+                    if (!studioIngest.handle(req, res, requestUrl)) writeStudioNotFound(res);
+                }).catch((err) => {
+                    console.error('[StudioIngest] session guard failed:', err);
+                    if (!res.headersSent) writeStudioNotFound(res);
+                });
+                return;
+            }
             if (studioIngest.handle(req, res, requestUrl)) return;
             // A path under /stream-api/studio/ that the relay does not know.
             // Without this the request would fall through with no response and
             // hang until the browser's own timeout.
-            res.writeHead(404, setCorsHeaders({
-                'Content-Type': 'text/plain; charset=utf-8',
-                'Cache-Control': CACHE_CONTROL
-            }));
-            res.end('404 Not Found');
+            writeStudioNotFound(res);
             return;
         }
         if (requestUrl.pathname === '/stream-api/turn') {

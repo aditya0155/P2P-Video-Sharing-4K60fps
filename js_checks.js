@@ -5736,6 +5736,38 @@ Object.assign(cases, {
             'a closed queue must end the pump instead of waiting forever');
     },
 
+    'studio-ingest-relay-failure-explains-a-takeover'() {
+        const pure = studioIngestPure();
+        const takeover = 'ffmpeg exited (4294967264): [out#0/rtsp @ 0000017f4cc35340] '
+            + 'Error muxing a packet | [out#0/rtsp @ 0000017f4cc35340] Task finished '
+            + 'with error code: -32 (Broken pipe) | [out#0/rtsp @ 0000017f4cc35340] '
+            + 'Terminating thread with return code -32 (Broken pipe)';
+        const message = pure.describeRelayFailure(takeover);
+        assert(message.includes('Another publisher took over'),
+            'a broken RTSP pipe must be reported as a publisher takeover');
+        assert(message.includes('Stop OBS'),
+            'the takeover message must say what to stop');
+
+        assertEqual(pure.describeRelayFailure('The host relay closed the broadcast.'),
+            'The host relay closed the broadcast.',
+            'an unrelated relay failure must pass through unchanged');
+        assertEqual(pure.describeRelayFailure(''),
+            'The host relay reported a failure.',
+            'an empty failure must still produce a message');
+    },
+
+    'studio-ingest-start-failure-unwraps-json-and-takeover'() {
+        const pure = studioIngestPure();
+        assertEqual(
+            pure.describeStartFailure(409, '{"error":"Another publisher is live on the stream path."}'),
+            'Another publisher is live on the stream path.',
+            'a JSON error body must not be shown with its braces');
+        const takeover = pure.describeStartFailure(500,
+            '{"error":"ffmpeg exited (-32): Error muxing a packet (Broken pipe)."}');
+        assert(takeover.includes('Another publisher took over'),
+            'a 500 carrying broken-pipe stderr must explain the takeover');
+    },
+
     'studio-worklet-s16le-is-interleaved-and-clamped'() {
         const { instance, posted } = compileWorklet(4, 2, 's16le');
         instance.process([[

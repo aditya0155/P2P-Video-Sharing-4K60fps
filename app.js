@@ -247,23 +247,27 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Latency & Jitter Buffer Modes: 'ultra' (80ms), 'balanced' (180ms),
     // 'smooth' (350ms), 'cinema' (1000ms).
-    // 'cinema' is the default for a reason this project finally accepted: for
-    // a movie broadcast, latency is explicitly welcome and playout EVENNESS is
-    // the product. A thin base target makes the jitter buffer oscillate around
-    // the fixed point instead of sitting above it: bursty arrivals overshoot
-    // (measured live: a 180ms target drifting to 1.2s) and Chrome drains the
-    // overshoot back at ~150ms/s of catch-up — an inaudible ~1% speed-up that
-    // reads as "a few milliseconds fast" — while a gap in arrivals under-runs
-    // the thin buffer and holds a frame — "a few milliseconds slow". Zero
-    // packet loss, zero drops in the stats, and still not smooth, because the
-    // clock itself is breathing. A 1s starting buffer sits decisively above
-    // the whole arrival-delay distribution (the jitter floor caps at 600ms,
-    // IDR-GOP bursts measure ~1.4x bitrate in 100ms windows), so the buffer
-    // neither under-runs nor needs catch-up drain, and both failure modes
-    // disappear together. The other modes remain one click away; a manual
-    // choice still persists. The drift limits sit ~1s above each mode: past
-    // that the session itself is stale and rejoins at the live edge.
-    let currentLatencyMode = 'cinema';
+    // 'smooth' is the default: it is the lowest target that still sits above
+    // the jitter floor's normal range, and it was measured end to end at 60fps
+    // with zero relay drops, zero resyncs and ~335ms playout — 648ms less than
+    // Cinema's ~982ms. Cinema exists because a THIN base target makes the
+    // buffer oscillate around the fixed point instead of sitting above it:
+    // bursty arrivals overshoot (measured live: a 180ms target drifting to
+    // 1.2s) and Chrome drains the overshoot back at ~150ms/s of catch-up — an
+    // inaudible ~1% speed-up that reads as "a few milliseconds fast" — while a
+    // gap in arrivals under-runs the thin buffer and holds a frame — "a few
+    // milliseconds slow". Zero packet loss, zero drops in the stats, and still
+    // not smooth, because the clock itself is breathing. A 1s starting buffer
+    // sits decisively above the whole arrival-delay distribution, so neither
+    // failure mode can happen; the cost is a full second of lag on every
+    // healthy link. The adaptive supervisor below is the better trade: start
+    // at 350ms, raise to the 350ms stress floor, the measured jitter floor and
+    // the accommodation ceiling only when the link actually needs it, and
+    // leave Cinema one click away for an operator who values evenness over
+    // latency. A manual choice still persists. The drift limits sit ~1s above
+    // each mode: past that the session itself is stale and rejoins at the live
+    // edge.
+    let currentLatencyMode = 'smooth';
     const LATENCY_MODES = {
         ultra: { label: 'Ultra-Low (80ms)', ms: 80, s: 0.08, icon: 'fa-bolt', driftLimitMs: 900 },
         balanced: { label: 'Balanced (180ms)', ms: 180, s: 0.18, icon: 'fa-gauge-high', driftLimitMs: 1000 },
@@ -1646,9 +1650,11 @@ document.addEventListener('DOMContentLoaded', () => {
     //   - a dwell, so two applied changes are never closer together than
     //     BUFFER_TARGET_DWELL_MS — EXCEPT a genuine emergency raise while
     //     frames are actually being dropped, which stays instant because a
-    //     bigger buffer is always the safe direction. Latency is explicitly
-    //     not a concern in this project, so the dwell is spent entirely on
-    //     never re-pacing the decoder for a cosmetic change.
+    //     bigger buffer is always the safe direction. The dwell costs at most
+    //     a few seconds of a slightly-too-low target; that is a far smaller
+    //     harm than re-pacing the decoder for a cosmetic change. Latency is
+    //     now a first-class concern (the default is Smooth, not Cinema), and
+    //     this gate is what keeps a low default from churning.
     const BUFFER_TARGET_BAND_MS = 50;
     const BUFFER_TARGET_DWELL_MS = 3000;
     const BUFFER_TARGET_EMERGENCY_DWELL_MS = 1200;
@@ -1692,8 +1698,8 @@ document.addEventListener('DOMContentLoaded', () => {
         // two targets is lip-sync error, not a contained setting: a
         // 400ms-audio / 1000ms-video pair would show every frame 600ms after
         // its samples play. The old AUDIO_PLAYOUT_CAP_MS=400 protected ears in
-        // the 180ms era; with Cinema (1000ms) as the default it *created* a
-        // 600ms offset for every fresh viewer, and it skewed every
+        // the 180ms era; once Cinema (1000ms) could be selected it *created* a
+        // 600ms offset for that viewer, and it skewed every
         // accommodated session (video 2200 / audio 400) by 1.8s under the
         // per-receiver depths Chrome actually implements. One synchronized
         // playout surface therefore gets one number, always. A raise is silent

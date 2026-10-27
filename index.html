@@ -30,7 +30,7 @@
     <!-- Custom CSS -->
     <!-- Bumped past both parents (2.25.1 and 2.25.0): this merge changes style.css
          AND app.js, so a viewer holding either parent's cached copy must refetch. -->
-<link rel="stylesheet" href="/streaming/style.css?v=2.28.0">
+<link rel="stylesheet" href="/streaming/style.css?v=2.28.1">
 </head>
 <body>
     <!-- Ambient Background -->
@@ -61,7 +61,7 @@
                 <!-- Real link keeps the broadcaster reachable by keyboard and
                      supports opening it in a separate tab. -->
                 <a class="perf-toggle-btn studio-launch-btn" id="studio-launch-btn"
-                   href="/streaming/studio?v=3.0.3" target="_blank" rel="noopener"
+                   href="/streaming/studio?v=3.0.4" target="_blank" rel="noopener"
                    title="Broadcast a screen, window or tab from this browser (opens in a new tab)"
                    aria-label="Open the broadcast studio in a new tab">
                     <i class="fa-solid fa-tower-broadcast"></i>
@@ -238,8 +238,8 @@
                             </div>
                             <div class="controls-right">
                                 <!-- Adaptive Latency Mode Switcher (JS syncs icon/title to the loaded mode) -->
-                                <button class="control-btn" id="latency-mode-btn" title="Latency Buffer: Cinema (1s)" aria-label="Change latency buffer">
-                                    <i class="fa-solid fa-film"></i>
+                                <button class="control-btn" id="latency-mode-btn" title="Latency Buffer: Anti-Stutter (350ms)" aria-label="Change latency buffer">
+                                    <i class="fa-solid fa-shield-halved"></i>
                                 </button>
 
                                 <!-- Picture in Picture -->
@@ -363,7 +363,7 @@
                             </div>
                             <p class="info-description">Select ingest protocol for OBS Studio setup:</p>
                             <ul class="obs-instructions active">
-                                <li><span class="obs-key">No OBS?</span><span class="obs-val">Use the built-in <a class="studio-inline-link" id="studio-inline-link" href="/streaming/studio?v=3.0.3">browser broadcaster</a>. It encodes hardware H.264 in the browser and publishes the same <code>live</code> path, with screen/window/tab capture and system audio + mic mixing. Use it on the host or from a remote browser through the same tunnel. OBS keeps working exactly as before - pick whichever you prefer.</span></li>
+                                <li><span class="obs-key">No OBS?</span><span class="obs-val">Use the built-in <a class="studio-inline-link" id="studio-inline-link" href="/streaming/studio?v=3.0.4">browser broadcaster</a>. It encodes hardware H.264 in the browser and publishes the same <code>live</code> path, with screen/window/tab capture and system audio + mic mixing. Use it on the host or from a remote browser through the same tunnel. OBS keeps working exactly as before - pick whichever you prefer.</span></li>
                             </ul>
                             <div class="ingest-selector">
                                 <button class="ingest-tab active" id="ingest-tab-whip">RTMP (this laptop)</button>
@@ -422,6 +422,6 @@
     </div>
 
     <!-- Custom JavaScript -->
-<script src="/streaming/app.js?v=2.28.0"></script>
+<script src="/streaming/app.js?v=2.28.1"></script>
 </body>
 </html>

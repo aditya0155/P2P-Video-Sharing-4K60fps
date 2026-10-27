@@ -209,8 +209,35 @@
         return 'accept';
     }
 
+    // The session's error carries raw ffmpeg stderr. "Broken pipe" on the
+    // RTSP muxer is what MediaMTX produces when another publisher overrides
+    // the path: the relay was kicked, not the network. Say that instead of
+    // making the operator decode ffmpeg's exit code.
+    function describeRelayFailure(message) {
+        const text = String(message == null ? '' : message).trim();
+        if (!text) return 'The host relay reported a failure.';
+        if (/Broken pipe|Error muxing a packet|error code: -32\b/i.test(text)) {
+            return 'Another publisher took over the stream path. '
+                + 'Stop OBS (or whatever is publishing), then start again.';
+        }
+        return text;
+    }
+
+    // Error bodies are JSON on the wire but plain text from older routes.
+    function detailText(detail) {
+        const raw = (detail || '').trim();
+        if (!raw) return '';
+        try {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed.error === 'string' && parsed.error.trim()) {
+                return parsed.error.trim();
+            }
+        } catch (err) { /* not JSON */ }
+        return raw;
+    }
+
     function describeStartFailure(status, detail) {
-        const body = (detail || '').trim();
+        const body = detailText(detail);
         switch (status) {
             case 403:
                 return body || 'Browser broadcasting only works on the host machine.';
@@ -221,7 +248,9 @@
             case 413:
                 return 'The session request was too large. Reload the page and try again.';
             case 500:
-                return body || 'The relay could not start ffmpeg on the host.';
+                return body
+                    ? describeRelayFailure(body)
+                    : 'The relay could not start ffmpeg on the host.';
             default:
                 return body
                     ? `The relay refused the broadcast (${status}): ${body}`
@@ -596,7 +625,7 @@
                     let detail = text;
                     try { detail = JSON.parse(text).error || text; } catch (err) { /* plain text */ }
                     if (!this.running || this.stopping) return;
-                    this._fail(describeStartFailure(response.status, detail));
+                    this._fail(describeRelayFailure(describeStartFailure(response.status, detail)));
                     return;
                 }
             }
@@ -688,7 +717,7 @@
                 this.serverDropped = status.droppedVideo || 0;
                 this.emit('status', status);
                 if (status.state === 'failed') {
-                    this._fail(status.error || 'The host relay reported a failure.');
+                    this._fail(describeRelayFailure(status.error));
                 } else if (status.state === 'ended' || status.state === 'stopping') {
                     this._fail('The host relay closed the broadcast.');
                 }
@@ -972,7 +1001,10 @@
             frameMessage,
             videoFrameMessage,
             backpressureDecision,
-            createChunkQueue
+            createChunkQueue,
+            describeStartFailure,
+            describeRelayFailure,
+            detailText
         }
     };
 })(window);
