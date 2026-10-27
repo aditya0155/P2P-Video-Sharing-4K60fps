@@ -2248,7 +2248,12 @@ document.addEventListener('DOMContentLoaded', () => {
             const sourceIsAv1 = sourceTracks.some((t) => typeof t === 'string' && t.toUpperCase() === 'AV1');
             const sourceIsH264 = sourceTracks.some((t) => typeof t === 'string' && t.toUpperCase() === 'H264');
             const sourceHasOpus = sourceTracks.some((t) => typeof t === 'string' && t.toUpperCase() === 'OPUS');
-            const rendReady = renditionPathsItems.some((item) => item && item.name === 'live-av1'
+            // A studio source (H264 + Opus) publishes only the 720p H264
+            // rescue; it is the low rung for BOTH a slow decoder and a weak
+            // link. Other H264 sources use the bridge's 3000k AV1 rendition.
+            const studioH264 = sourceIsH264 && sourceHasOpus;
+            const downgradeTarget = studioH264 ? 'live-h264' : 'live-av1';
+            const rendReady = renditionPathsItems.some((item) => item && item.name === downgradeTarget
                 && (item.ready === true || item.online === true));
             // 'live-h264' is included because an audio-rescue viewer sits on it
             // (full source bitrate, no sound on the native path) — a weak link
@@ -2259,7 +2264,7 @@ document.addEventListener('DOMContentLoaded', () => {
             // AV1 rendition on network stress would hand the same slow decoder
             // a larger picture. It stays put; the buffer supervisor still
             // handles the link.
-            const onH264RescuePath = sourceIsH264 && sourceHasOpus
+            const onH264RescuePath = studioH264
                 && activeStreamPath === 'live-h264';
             const onFullBitratePath = activeStreamPath === 'live'
                 || (activeStreamPath === 'live-h264' && !onH264RescuePath);
@@ -2269,13 +2274,16 @@ document.addEventListener('DOMContentLoaded', () => {
             // viewers keep the full-bitrate path; buffer accommodation and the
             // stress floor still protect them from the rough link.
             if (abrBadSec >= 8 && onFullBitratePath && !sourceIsAv1 && rendReady
-                && browserSupportsAv1() && av1DecodeSmooth !== false) {
+                && (studioH264 || (browserSupportsAv1() && av1DecodeSmooth !== false))) {
                 // Record WHY this viewer is leaving full quality, so the
                 // decode-pressure loop below knows not to walk them back up it.
                 abrDowngradedForLink = true;
-                switchRendition('live-av1',
-                    'Your connection is struggling with the full-quality stream — '
-                    + 'switched to the lighter rendition to stop frame drops.');
+                const message = studioH264
+                    ? 'Your connection is struggling with the full-quality stream — '
+                        + 'switched to the 720p rendition to stop frame drops.'
+                    : 'Your connection is struggling with the full-quality stream — '
+                        + 'switched to the lighter rendition to stop frame drops.';
+                switchRendition(downgradeTarget, message);
                 return;
             }
             // The accumulator is deliberately kept live even in the ambiguous
@@ -2292,8 +2300,10 @@ document.addEventListener('DOMContentLoaded', () => {
             // completed window — so loss is the axis worth gating on.
             const lossAllowsUpgrade = lastLossPct === null
                 || lastLossPct < ABR_LOSS_CALM_PCT;
+            const onDowngradedRendition = activeStreamPath === 'live-av1'
+                || (activeStreamPath === 'live-h264' && abrDowngradedForLink);
             if (abrCalmSec >= 20 && lossAllowsUpgrade
-                && activeStreamPath === 'live-av1'
+                && onDowngradedRendition
                 && ladderSource && (ladderSource.ready === true || ladderSource.online === true)
                 && !sourceIsAv1) {
                 // The upgrade target is whatever the path matrix wants when the
@@ -2309,7 +2319,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     browserSupportsH265(),
                     preferH264Rescue
                 );
-                if (upgradeTarget && upgradeTarget !== 'live-av1') {
+                if (upgradeTarget && upgradeTarget !== activeStreamPath) {
                     // Back at full quality on a link that has held calm for 20s,
                     // so the decode-pressure guard must stand down again.
                     abrDowngradedForLink = false;
@@ -2325,8 +2335,8 @@ document.addEventListener('DOMContentLoaded', () => {
         // buffer discards frames before the decoder sees them, so
         // decoded/emitted stays near 1.0 while the viewer gets a slideshow.
         // This branch acts on received-vs-presented instead, and only for the
-        // H264 + Opus source that publishes the 720p rendition. A viewer
-        // already at or below 720p has nothing to gain from a teardown.
+        // H264 source that publishes the 720p rendition. A viewer already at
+        // or below 720p has nothing to gain from a teardown.
         if (decodeDeficitActive && now - lastRenditionSwitchAt > 60000 && !isConnecting
             && Array.isArray(renditionPathsItems)) {
             const rescueSource = renditionPathsItems.find((item) => item && item.name === 'live');
@@ -2337,6 +2347,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 .map((t) => t.toUpperCase());
             const rescueIsH264 = rescueUpper.includes('H264');
             const rescueHasOpus = rescueUpper.includes('OPUS');
+            // Every non-video track MediaMTX reports is audio ('Opus',
+            // 'MPEG-4 Audio', ...), mirroring codec_bridge.js's rule.
+            const rescueHasAudio = rescueUpper.some((t) => t
+                && !['AV1', 'H264', 'H265', 'HEVC', 'VP8', 'VP9'].includes(t));
             const rescueReady = renditionPathsItems.some((item) => item && item.name === 'live-h264'
                 && (item.ready === true || item.online === true));
             // 0 means the first frame has not landed yet (unknown); do not let
@@ -2344,7 +2358,13 @@ document.addEventListener('DOMContentLoaded', () => {
             const sourceHeight = player && Number.isFinite(player.videoHeight)
                 ? player.videoHeight : 0;
             const sourceTooLarge = sourceHeight === 0 || sourceHeight > 720;
-            if (rescueIsH264 && rescueHasOpus && rescueReady && sourceTooLarge
+            // live-h264 is the 720p rescue for a studio source (H264 + Opus)
+            // and for a video-only H264 source. For an H264 + AAC source it
+            // is the full-resolution audio-rescue copy, so switching there
+            // would hand the same slow decoder the same picture.
+            const rescueIsSmallerRendition = rescueIsH264
+                && (rescueHasOpus || !rescueHasAudio);
+            if (rescueIsSmallerRendition && rescueReady && sourceTooLarge
                 && activeStreamPath === 'live') {
                 rememberH264Rescue();
                 decodeDeficitWindow = [];
@@ -4188,20 +4208,34 @@ document.addEventListener('DOMContentLoaded', () => {
         // audio-rescue branch, where the native path genuinely is muted.
         //
         // Bandwidth adaptation is what the ABR supervisor is for: it moves a
-        // viewer onto 'live-av1' after 8 sustained stressed seconds
-        // (`abrBadSec >= 8`) and back after 20 calm ones. A viewer on a link
-        // that cannot carry the source now degrades on evidence, and a viewer on
-        // a healthy link keeps full quality. `preferTranscode` is still honoured
-        // for callers that explicitly want the cheap rung.
+        // viewer onto the low-bitrate rendition after 8 sustained stressed
+        // seconds (`abrBadSec >= 8`) and back after 20 calm ones. For a studio
+        // (H264 + Opus) source that rendition is the 720p live-h264 rescue;
+        // every other source uses live-av1. A viewer on a healthy link keeps
+        // full quality. `preferTranscode` is still honoured for callers that
+        // explicitly want the cheap rung.
         //
         // A decode-rescued viewer is the exception: the native path is exactly
         // what its decoder could not sustain, so it starts (and ABR-upgrades)
         // on the bridge's 720p H.264 rescue. Only H264 sources publish that
         // rendition, and the AAC audio-rescue branch above already returned.
-        if (sourceIsH264 && h264Rescue && ready('live-h264')) {
+        //
+        // The bridge publishes live-h264 as the ONLY rendition for an H264
+        // source that carries Opus audio (the studio) or no audio at all —
+        // publishing live-av1 alongside it starved the studio relay at 60 fps
+        // (see codec_bridge.js). Those sources therefore have no live-av1
+        // rung: their low-bitrate rung is the 720p rescue, both for a
+        // decode-rescued viewer and for the ABR downgrade below.
+        const rescueOnlyH264 = sourceIsH264 && (hasOpusAudio || !hasAudio);
+        if (rescueOnlyH264 && h264Rescue && ready('live-h264')) {
             return 'live-h264';
         }
         if (preference === 'preferTranscode') {
+            if (rescueOnlyH264 && ready('live-h264')) {
+                return 'live-h264';
+            }
+            // A bridge from before this plan (rolling restart) may still
+            // publish live-av1; it remains a usable low rung until replaced.
             return (av1Capable && av1Smooth !== false && ready('live-av1')) ? 'live-av1' : 'live';
         }
         return 'live';

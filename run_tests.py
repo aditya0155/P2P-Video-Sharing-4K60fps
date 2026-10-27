@@ -4327,29 +4327,34 @@ class StreamingHardeningChecks(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_bridge_publishes_a_720p_h264_decode_rescue(self):
-        """H264 + Opus sources get a smaller H264 rendition.
+        """H264 + Opus sources get a smaller H264 rendition — and nothing else.
 
         Firefox software-decodes 1080p60 H264 at ~24 fps on this host while
         framesReceived stays ~60/s and packetsLost is 0 -- a decoder that is
         simply too slow, which no buffer setting can fix. The bridge must
         publish a 720p H264 rendition (re-encoded, unlike the AAC audio rescue
         which copies video) so the player can move such a viewer down.
+
+        It must NOT also publish live-av1: encoding both outputs in one ffmpeg
+        cannot sustain 60 fps here. MediaMTX logged "reader is too slow", the
+        studio relay backpressured and dropped ~18 frames every 300 ms, and
+        viewers got ~30-35 fps while the studio meter still read 60.
         """
         node = shutil.which("node")
         self.assertIsNotNone(node, "Node.js is required to exercise the bridge plan")
         script = (
             "const b=require('./codec_bridge.js');"
             "const p=b.decideBridge(['H264','Opus'],{gopFrames:'30'});"
-            "if(!p.extraOutputs||p.extraOutputs.length!==1) throw new Error('missing 720p rescue output');"
-            "const r=p.extraOutputs[0];"
-            "if(r.target!=='live-h264') throw new Error('wrong rescue target');"
-            "if(r.videoArgs.join(' ')==='-c:v copy') throw new Error('the decode rescue must re-encode');"
-            "if(r.videoArgs[r.videoArgs.indexOf('-c:v')+1]!=='h264_nvenc') throw new Error('rescue must encode H264');"
-            "if(r.videoArgs[r.videoArgs.indexOf('-b:v')+1]!=='2500k') throw new Error('rescue bitrate wrong');"
-            "if(r.videoArgs[r.videoArgs.indexOf('-bf')+1]!=='0') throw new Error('rescue must not use B-frames');"
-            "if(r.scale.maxWidth!==1280||r.scale.maxHeight!==720) throw new Error('rescue must be 720p');"
-            "if(b.planTargets(p).join(',')!=='live-av1,live-h264') throw new Error('planTargets wrong');"
+            "if(p.target!=='live-h264') throw new Error('wrong primary target');"
+            "if(p.extraOutputs&&p.extraOutputs.length) throw new Error('the studio must not publish extra outputs');"
+            "if(p.videoArgs.join(' ')==='-c:v copy') throw new Error('the decode rescue must re-encode');"
+            "if(p.videoArgs[p.videoArgs.indexOf('-c:v')+1]!=='h264_nvenc') throw new Error('rescue must encode H264');"
+            "if(p.videoArgs[p.videoArgs.indexOf('-b:v')+1]!=='2500k') throw new Error('rescue bitrate wrong');"
+            "if(p.videoArgs[p.videoArgs.indexOf('-bf')+1]!=='0') throw new Error('rescue must not use B-frames');"
+            "if(p.scale.maxWidth!==1280||p.scale.maxHeight!==720) throw new Error('rescue must be 720p');"
+            "if(b.planTargets(p).join(',')!=='live-h264') throw new Error('planTargets wrong');"
             "const sw=b.buildFfmpegArgs(p);"
+            "if(sw.join(' ').includes('live-av1')) throw new Error('studio bridge must not publish live-av1');"
             "const vf=sw.indexOf('-vf');"
             "if(vf===-1||!sw[vf+1].startsWith('scale=')) throw new Error('software decode needs the CPU scale filter');"
             "if(!sw[vf+1].includes('min(1280,iw)')||!sw[vf+1].includes('min(720,ih)')) "
@@ -4359,6 +4364,9 @@ class StreamingHardeningChecks(unittest.TestCase):
             "const gvf=gpu.indexOf('-vf');"
             "if(gvf===-1||!gpu[gvf+1].startsWith('scale=')) "
             "throw new Error('cuvid frames are system-memory nv12, so the rescue must use CPU scale');"
+            "const silent=b.decideBridge(['H264']);"
+            "if(b.planTargets(silent).join(',')!=='live-h264') "
+            "throw new Error('video-only H264 must publish only the 720p rescue');"
             "const aac=b.decideBridge(['MPEG-4 Audio','H264']);"
             "if(aac.extraOutputs[0].videoArgs.join(' ')!=='-c:v copy') "
             "throw new Error('the AAC audio rescue must keep copying video');"
@@ -4762,6 +4770,44 @@ class EndToEndBridgeChecks(unittest.TestCase):
             0,
             "E2E bridge check failed: " + result.stdout[-4000:] + " " + result.stderr[-2000:],
         )
+
+
+class StudioSixtyFpsEndToEndChecks(unittest.TestCase):
+    """Opt-in END-TO-END check with a REAL screen capture.
+
+    Boots an isolated MediaMTX + server.js, launches a headed Chrome,
+    captures the actual desktop through getDisplayMedia, broadcasts at
+    60 fps, and joins the real viewer. It fails if the bridge publishes
+    live-av1 alongside live-h264, if the relay drops/resyncs, or if the
+    viewer receives/decodes less than ~60 fps. This is the regression that
+    shipped as "the studio meter says 60 but viewers get 30-35".
+
+    Runs only when STUDIO_E2E=1; it opens a browser window and takes ~60s.
+    """
+
+    def test_studio_60fps_with_real_screen_capture(self):
+        if os.environ.get("STUDIO_E2E") != "1":
+            self.skipTest("opt-in: set STUDIO_E2E=1 to run the real screen-capture check")
+        script = ROOT / "e2e_studio_60fps.py"
+        self.assertTrue(script.is_file(), "e2e_studio_60fps.py missing")
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for the E2E check")
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode == 2:
+            self.skipTest(result.stdout.strip() or "E2E prerequisites are missing")
+        self.assertEqual(
+            result.returncode,
+            0,
+            "E2E studio 60 fps check failed: "
+            + result.stdout[-5000:] + " " + result.stderr[-2000:],
+        )
+
 
 class ViewerSmoothnessRegressionChecks(unittest.TestCase):
     """Regression guards for the viewer-smoothness audit.

@@ -747,28 +747,30 @@ Object.assign(cases, {
             'Opus source audio must be copied, not re-encoded');
 
         const h264Plan = bridge.decideBridge(['H264', 'Opus']);
-        assertEqual(h264Plan.target, 'live-av1', 'H264 source gets the AV1 rendition');
-        assert(h264Plan.videoArgs.includes('av1_nvenc'), 'rendition must use the GPU AV1 encoder');
-        assert(h264Plan.videoArgs.includes('-bf'), 'WebRTC-safe streams declare a B-frame policy');
+        // H264 + Opus is the in-browser studio. Its bridge publishes ONE
+        // rendition: the 720p H264 rescue. Publishing live-av1 alongside it
+        // starved the relay at 60 fps (MediaMTX "reader is too slow", the
+        // studio relay re-anchoring every ~300ms), so the AV1 rung is gone.
+        assertEqual(h264Plan.target, 'live-h264',
+            'an H264+Opus source publishes the 720p rescue as its only rendition');
+        assert(h264Plan.videoArgs.includes('h264_nvenc'), 'the rescue must use the GPU H264 encoder');
+        assert(!h264Plan.videoArgs.includes('av1_nvenc'),
+            'the studio must not encode a second 1080p AV1 output');
         assertEqual(h264Plan.videoArgs[h264Plan.videoArgs.indexOf('-bf') + 1], '0',
             'B-frames break WebRTC decoders (README rule)');
-
-        // H264 + Opus (the in-browser studio) also publishes a 720p H264
-        // rescue: Firefox software-decodes 1080p60 at ~24 fps while the
-        // transport is clean, and no buffer setting can fix a slow decoder.
-        assertEqual(bridge.planTargets(h264Plan).join(','), 'live-av1,live-h264',
-            'an H264+Opus source must publish the AV1 rendition and the 720p H264 rescue');
-        const rescue = h264Plan.extraOutputs.find((out) => out.target === 'live-h264');
-        assert(rescue, 'the 720p H264 rescue output is missing');
-        assertEqual(rescue.scale.maxWidth, 1280, 'the rescue width must be capped at 1280');
-        assertEqual(rescue.scale.maxHeight, 720, 'the rescue height must be capped at 720');
-        assertEqual(rescue.videoArgs[rescue.videoArgs.indexOf('-b:v') + 1], '2500k',
+        assertEqual(h264Plan.audioArgs, ['-c:a', 'copy'],
+            'the studio already publishes Opus, so its audio is copied');
+        assertEqual(bridge.planTargets(h264Plan).join(','), 'live-h264',
+            'the studio must not publish live-av1: both outputs together cannot sustain 60 fps');
+        assertEqual(h264Plan.scale.maxWidth, 1280, 'the rescue width must be capped at 1280');
+        assertEqual(h264Plan.scale.maxHeight, 720, 'the rescue height must be capped at 720');
+        assertEqual(h264Plan.videoArgs[h264Plan.videoArgs.indexOf('-b:v') + 1], '2500k',
             'the rescue must use its own bitrate, not the source or AV1 rate');
-        assertEqual(rescue.videoArgs[rescue.videoArgs.indexOf('-c:v') + 1], 'h264_nvenc',
-            'the rescue must re-encode H264 at 720p, not copy the 1080p source');
         const rescueArgs = bridge.buildFfmpegArgs(h264Plan);
+        assert(!rescueArgs.join(' ').includes('live-av1'),
+            'the studio bridge invocation must have no live-av1 output');
         const rescueFilterIdx = rescueArgs.indexOf('-vf');
-        assert(rescueFilterIdx !== -1, 'the rescue output needs a scale filter');
+        assert(rescueFilterIdx !== -1, 'the primary rescue output needs a scale filter');
         assert(rescueArgs[rescueFilterIdx + 1].startsWith('scale='),
             'software decode must use the CPU scale filter');
         assert(rescueArgs[rescueFilterIdx + 1].includes('min(1280,iw)')
@@ -782,6 +784,12 @@ Object.assign(cases, {
         assert(gpuFilterIdx !== -1 && gpuRescueArgs[gpuFilterIdx + 1].startsWith('scale='),
             'cuvid delivers system-memory nv12 frames, so the rescue must use CPU scale '
             + '(scale_cuda cannot negotiate nv12 -> cuda without an explicit hwupload)');
+
+        // Video-only H264 has no audio to rescue either; it gets the same
+        // single 720p rendition rather than an AV1 rung it cannot pair with.
+        const silentPlan = bridge.decideBridge(['H264']);
+        assertEqual(bridge.planTargets(silentPlan).join(','), 'live-h264',
+            'video-only H264 must publish only the 720p rescue');
 
         const aacPlan = bridge.decideBridge(['MPEG-4 Audio', 'H264']);
         const aacArgs = aacPlan.audioArgs.join(' ');
@@ -823,8 +831,11 @@ Object.assign(cases, {
         assert(!aacArgs.includes('first_pts'),
             'the Opus rescue must not re-base audio with first_pts: it destroys the source A/V offset');
 
-        // Both encoder blocks must be bitrate-honest and frame-honest.
-        for (const [label, plan] of [['h264', av1Plan], ['av1', h264Plan]]) {
+        // Both encoder blocks must be bitrate-honest and frame-honest. The AV1
+        // block now comes from an H265 source: an H264+Opus source no longer
+        // produces an AV1 output.
+        const av1EncoderPlan = bridge.decideBridge(['H265', 'Opus']);
+        for (const [label, plan] of [['h264', av1Plan], ['av1', av1EncoderPlan]]) {
             const args = plan.videoArgs;
             const j = (flag) => args[args.indexOf(flag) + 1];
             // Adaptive quantization is OFF by default in ffmpeg's NVENC wrapper
@@ -949,7 +960,13 @@ Object.assign(cases, {
             ready('live', ['H264', 'Opus']),
             { name: 'live-av1', ready: false }
         ]);
+        // The studio bridge publishes live-h264 as its only rendition; a
+        // transitional bridge that still publishes live-av1 is handled below.
         const h264SourceRenditionReady = items([
+            ready('live', ['H264', 'Opus']),
+            ready('live-h264', ['H264', 'Opus'])
+        ]);
+        const h264LegacyBridge = items([
             ready('live', ['H264', 'Opus']),
             ready('live-av1', ['AV1', 'Opus'])
         ]);
@@ -990,10 +1007,12 @@ Object.assign(cases, {
             'non-smooth AV1 decode must stay on the hardware-decodable path');
         assertEqual(fn(h264SourceRenditionReady, true, null), 'live',
             'unknown decode quality must not move a viewer off the full-quality source');
-        assertEqual(fn(h264SourceRenditionReady, true, true, 'preferTranscode'), 'live-av1',
-            'ABR downgrade forces the low-bitrate rendition');
-        assertEqual(fn(h264SourceRenditionReady, true, false, 'preferTranscode'), 'live',
-            'ABR never overrides the decode-quality guard');
+        assertEqual(fn(h264SourceRenditionReady, true, true, 'preferTranscode'), 'live-h264',
+            'the ABR downgrade for a studio source takes the 720p H264 rescue');
+        assertEqual(fn(h264SourceRenditionReady, true, false, 'preferTranscode'), 'live-h264',
+            'the H264 rescue is decodable even where AV1 is not, so it is still the low rung');
+        assertEqual(fn(h264LegacyBridge, true, true, 'preferTranscode'), 'live-av1',
+            'a transitional bridge that still publishes live-av1 can still serve the studio low rung');
         assertEqual(fn(h264SourceRenditionReady, true, true, 'preferNonTranscode'), 'live',
             'ABR upgrade returns to the source');
         assertEqual(fn(h264Source, true, false), 'live',
@@ -1086,6 +1105,8 @@ Object.assign(cases, {
             'the rescue preference must beat the low-bitrate AV1 rung');
         assertEqual(fn(h264Opus, true, true, 'auto', true, false), 'live',
             'a viewer with no rescue verdict keeps full quality');
+        assertEqual(fn(h264Opus, true, true, 'preferTranscode', true, false), 'live-h264',
+            'the ABR downgrade for a studio source takes the 720p rescue, not a removed AV1 rung');
 
         // AAC sources use live-h264 as a full-resolution audio-rescue copy;
         // the 720p preference must not reroute an AV1-smooth viewer there.
@@ -2276,8 +2297,16 @@ Object.assign(cases, {
     // guards: 60s switch cooldown, H264 sources only, rendition readiness.
     'abr-switching-state-machine'() {
         const ladder = {
+            // Studio (H264 + Opus): the bridge's only rendition is the 720p
+            // H264 rescue. live-av1 is no longer published.
             h264Source: [
                 { name: 'live', ready: true, online: true, tracks: ['H264', 'Opus'] },
+                { name: 'live-h264', ready: true, online: true, tracks: ['H264', 'Opus'] }
+            ],
+            // RTMP/SRT H264 + AAC: live-h264 is a full-quality audio-rescue
+            // copy, so the low-bandwidth rung is live-av1.
+            h264AacSource: [
+                { name: 'live', ready: true, online: true, tracks: ['H264', 'MPEG-4 Audio'] },
                 { name: 'live-av1', ready: true, online: true, tracks: ['AV1', 'Opus'] }
             ],
             av1Source: [
@@ -2364,13 +2393,20 @@ Object.assign(cases, {
         // 8 stressed seconds on the source with a ready rendition -> downgrade.
         const down = make({ abrBadSec: 7, lastLossPct: 8 });
         down.run();
-        assertEqual(down.sandbox.switchedTo, 'live-av1',
-            'sustained stress on the full-bitrate path must downgrade to live-av1');
+        assertEqual(down.sandbox.switchedTo, 'live-h264',
+            'sustained stress on a studio source must downgrade to the 720p H264 rescue');
+        assertEqual(down.sandbox.abrDowngradedForLink, true,
+            'the ABR downgrade must be recorded so decode pressure does not undo it');
 
-        // A browser WITHOUT AV1 decode must never be downgraded onto the AV1
+        // A browser WITHOUT AV1 decode must never be downgraded onto an AV1
         // rendition — an undecodable session is strictly worse than the
-        // stutter it is escaping. Buffer accommodation still protects it.
-        const legacy = make({ abrBadSec: 7, lastLossPct: 8, browserSupportsAv1() { return false; } });
+        // stutter it is escaping. (Studio sources use the H264 rescue, which
+        // every browser decodes; the guard is exercised on an AAC source.)
+        const legacy = make({
+            abrBadSec: 7, lastLossPct: 8,
+            renditionPathsItems: ladder.h264AacSource,
+            browserSupportsAv1() { return false; }
+        });
         legacy.run();
         assertEqual(legacy.sandbox.switchedTo, undefined,
             'a browser without AV1 decode must keep its decodable full-bitrate path under stress');
@@ -2380,11 +2416,27 @@ Object.assign(cases, {
             abrCalmSec: 19,
             lastLossPct: 0,
             lastNetJitterMs: 10,
-            activeStreamPath: 'live-av1'
+            activeStreamPath: 'live-h264',
+            abrDowngradedForLink: true
         });
         up.run();
         assertEqual(up.sandbox.switchedTo, 'live',
             'sustained calm on the rendition must upgrade back to the source');
+
+        // A decode-rescued viewer (not an ABR downgrade) is on the 720p
+        // rendition on purpose; calm link conditions must not walk it back to
+        // the resolution its decoder already failed to sustain.
+        const decodeRescued = make({
+            abrCalmSec: 19,
+            lastLossPct: 0,
+            lastNetJitterMs: 10,
+            activeStreamPath: 'live-h264',
+            abrDowngradedForLink: false,
+            preferH264Rescue: true
+        });
+        decodeRescued.run();
+        assertEqual(decodeRescued.sandbox.switchedTo, undefined,
+            'ABR must not upgrade a decode-rescued viewer off the 720p rendition');
 
         // Cooldown: a recent switch suppresses both directions.
         const cooled = make({ abrBadSec: 7, lastLossPct: 8, lastRenditionSwitchAt: 99000 });
@@ -2449,7 +2501,8 @@ Object.assign(cases, {
         // never do this.
         let ambig = make({
             lastNetJitterMs: 100, lastLossPct: 0, abrCalmSec: 0, abrBadSec: 0,
-            renditionPathsItems: ladder.h264Source, activeStreamPath: 'live-av1',
+            renditionPathsItems: ladder.h264Source, activeStreamPath: 'live-h264',
+            abrDowngradedForLink: true,
             lastRenditionSwitchAt: -60000
         });
         let ticks = 0;

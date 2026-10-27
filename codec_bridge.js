@@ -8,8 +8,12 @@
  * codec rendition so every browser can play, while AV1-capable viewers get a
  * bandwidth-saving rendition:
  *
- *   source AV1  -> live-h264 (h264_nvenc, default 6000k) for legacy browsers
- *   source H264 -> live-av1  (av1_nvenc,  default 3000k) for AV1 browsers
+ *   source AV1       -> live-h264 (h264_nvenc, default 6000k) for legacy browsers
+ *   source H265/VP9  -> live-av1  (av1_nvenc,  default 3000k) for AV1 browsers
+ *   source H264+Opus -> live-h264 (720p H264 rescue, 2500k) — the studio; a
+ *                       second AV1 output in the same ffmpeg cannot hold 60 fps
+ *                       here, and the relay backpressures when it falls behind
+ *   source H264+AAC  -> live-av1 + live-h264 (video copy + Opus audio rescue)
  *
  * Audio rescue: MediaMTX cannot hand the AAC audio of an RTMP/SRT source to
  * WebRTC readers, so the native path plays video-only. Whenever the source
@@ -645,26 +649,33 @@ function decideBridge(tracks, env = {}) {
         : 'VP8';
     const av1Rate = env.av1Bitrate || AV1_BITRATE;
     let extraOutputs;
-    if (sourceCodec === 'H264' && hasOpusAudio) {
-        // H264 + Opus (the in-browser studio) gets a 720p H264 rescue
-        // rendition. Firefox software-decodes 1080p60 H264 at ~24 fps on this
-        // host while the transport is clean — measured framesReceived ~60/s,
-        // framesDecoded 10-39/s, pictureLoss 37-82%, packetsLost 0 — and no
-        // amount of jitter-buffer tuning can fix a decoder that is simply too
-        // slow. The same browser holds ~60 fps at 720p60, so the player moves
-        // a viewer here only after a sustained presentation deficit.
+    if (sourceCodec === 'H264' && (hasOpusAudio || !hasAudio)) {
+        // H264 + Opus (the in-browser studio) and video-only H264 get ONE
+        // rendition: the 720p H264 rescue. Do NOT also publish live-av1 here.
+        //
+        // The native path is the studio's 1080p H264 + Opus, and app.js
+        // prefers it for every viewer; the AV1 rendition was only the ABR
+        // rung. Encoding BOTH 1080p AV1 and 720p H264 in one ffmpeg could not
+        // sustain 60 fps on this host: MediaMTX logged "reader is too slow"
+        // for the bridge, the studio relay's RTSP write backpressured, and
+        // studio_ingest's live-edge resync dropped ~18 frames every 300 ms.
+        // The studio meter still read 60 while the viewer got ~30-35 fps.
+        // Either output alone keeps up at 60 fps; the pair does not. The 720p
+        // rescue is the one studio viewers can actually use (ABR now targets
+        // it too), so it is the one we keep.
         //
         // This output re-encodes (unlike the AAC rescue below, which copies
         // video): the whole point is fewer pixels for the decoder. The scale
-        // filter is materialized in buildFfmpegArgs() because it depends on
-        // whether NVDEC supplied CUDA frames.
-        extraOutputs = [{
+        // filter is materialized in buildFfmpegArgs().
+        return {
+            sourceCodec,
             target: 'live-h264',
             scale: { maxWidth: 1280, maxHeight: 720 },
             videoArgs: buildH264RescueVideoArgs(env),
             audioArgs,
-        }];
-    } else if (sourceCodec === 'H264' && hasAudio) {
+        };
+    }
+    if (sourceCodec === 'H264' && hasAudio) {
         // Audio rescue: an H264 source with non-WebRTC audio (RTMP/SRT AAC)
         // leaves every viewer of the native path without sound. One extra
         // FLV output copies the video untouched (zero extra GPU) and
@@ -858,7 +869,14 @@ function buildFfmpegArgs(plan, ports = {}, decodeArgs = []) {
     // copy`) costs no extra GPU, while the 720p H.264 rescue re-encodes only
     // its smaller output.
     const outputs = [
-        { videoArgs: plan.videoArgs, audioArgs: plan.audioArgs, target: plan.target },
+        {
+            videoArgs: plan.videoArgs,
+            audioArgs: plan.audioArgs,
+            target: plan.target,
+            // A primary rendition can be the scaled rescue itself (the studio
+            // H264+Opus plan publishes live-h264 as its only output).
+            scale: plan.scale,
+        },
         ...(plan.extraOutputs || []),
     ];
     for (const out of outputs) {
