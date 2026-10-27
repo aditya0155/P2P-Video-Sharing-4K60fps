@@ -167,10 +167,40 @@ document.addEventListener('DOMContentLoaded', () => {
     // A viewer whose software decoder cannot sustain the source resolution is
     // moved to the bridge's 720p live-h264 rendition. Persist that verdict so a
     // reload does not spend the first seconds stuttering on 1080p again.
+    //
+    // The first version stored the bare string '1' with no timestamp. A single
+    // bad join — most often a viewer that arrived during the encoder's first
+    // seconds, while presentation was still warming up — then pinned that
+    // browser to 720p forever, even after the decoder and the source were fine.
+    // Version 2 stores when the verdict was reached and expires it, and the
+    // old value is treated as stale so every existing viewer gets one clean
+    // retest. The startup grace below is what stops a new false verdict.
     const H264_RESCUE_STORAGE_KEY = 'rydius_h264_rescue';
+    const H264_RESCUE_TTL_MS = 24 * 60 * 60 * 1000;
+    function parseH264RescuePreference(raw, now, ttlMs) {
+        if (typeof raw !== 'string' || raw === '') return false;
+        // Pre-TTL format: no timestamp, so it cannot be aged out.
+        if (raw === '1') return false;
+        let data;
+        try {
+            data = JSON.parse(raw);
+        } catch (e) {
+            return false;
+        }
+        if (!data || data.v !== 2 || !Number.isFinite(data.at)) return false;
+        if (!Number.isFinite(now) || !Number.isFinite(ttlMs)) return false;
+        const age = now - data.at;
+        return age >= 0 && age <= ttlMs;
+    }
     let preferH264Rescue = false;
     try {
-        preferH264Rescue = localStorage.getItem(H264_RESCUE_STORAGE_KEY) === '1';
+        const storedRescue = localStorage.getItem(H264_RESCUE_STORAGE_KEY);
+        preferH264Rescue = parseH264RescuePreference(storedRescue, Date.now(), H264_RESCUE_TTL_MS);
+        // Remove a stale or malformed verdict instead of leaving it to be
+        // re-read on every load. The in-memory false above already applies.
+        if (storedRescue !== null && !preferH264Rescue) {
+            localStorage.removeItem(H264_RESCUE_STORAGE_KEY);
+        }
     } catch (e) { /* storage unavailable: default to full quality */ }
     let isConnected = false;
     let isConnecting = false;
@@ -190,6 +220,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // near 1.0. This window compares frames RECEIVED with frames PRESENTED.
     const DECODE_DEFICIT_WINDOW_TICKS = 5;
     const DECODE_DEFICIT_TRIGGER_TICKS = 3;
+    // A viewer that joins while the studio encoder is still ramping receives
+    // frames faster than it can present them, which looks exactly like a
+    // decoder that is too slow. Measured live: an early join produced three
+    // deficit ticks before the encoder settled and persisted a 720p verdict
+    // for every later visit. The rescue must wait out that ramp.
+    const DECODE_DEFICIT_STARTUP_GRACE_MS = 15000;
+    const DECODE_DEFICIT_COOLDOWN_MS = 60000;
     let decodeDeficitWindow = [];       // 1 = deficit tick, 0 = clean tick
     let decodeDeficitActive = false;
     let decodeDeficitTicks = 0;
@@ -1394,6 +1431,29 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
+    // Pure: may the presentation-deficit branch move this viewer to 720p?
+    //
+    // Two gates, for two different false positives:
+    //
+    //   * startup grace - the first seconds of a connection include the
+    //     studio encoder's ramp. A viewer that joins there sees low presented
+    //     FPS through no fault of its decoder, and the old code acted on it
+    //     immediately (lastRenditionSwitchAt starts at -60s, so the cooldown
+    //     had already expired before the page even loaded). Waiting the ramp
+    //     out is what keeps a healthy viewer on 1080p.
+    //   * switch cooldown - a rendition change tears the peer connection down
+    //     and starts a fresh, still-warming decoder. Rescuing again before it
+    //     has settled would turn one switch into a loop.
+    function decodeDeficitRescueAllowed(now, connectedAt, lastSwitchAt) {
+        if (!Number.isFinite(now) || !Number.isFinite(connectedAt)
+            || !Number.isFinite(lastSwitchAt)) {
+            return false;
+        }
+        if (connectedAt <= 0) return false;
+        return now - connectedAt >= DECODE_DEFICIT_STARTUP_GRACE_MS
+            && now - lastSwitchAt > DECODE_DEFICIT_COOLDOWN_MS;
+    }
+
     // Base playout/jitter-buffer target before accommodation: what the user
     // selected plus what the measured network needs right now.
     function baseBufferTargetMs() {
@@ -2337,8 +2397,9 @@ document.addEventListener('DOMContentLoaded', () => {
         // This branch acts on received-vs-presented instead, and only for the
         // H264 source that publishes the 720p rendition. A viewer already at
         // or below 720p has nothing to gain from a teardown.
-        if (decodeDeficitActive && now - lastRenditionSwitchAt > 60000 && !isConnecting
-            && Array.isArray(renditionPathsItems)) {
+        if (decodeDeficitActive
+            && decodeDeficitRescueAllowed(now, connectionStartTime, lastRenditionSwitchAt)
+            && !isConnecting && Array.isArray(renditionPathsItems)) {
             const rescueSource = renditionPathsItems.find((item) => item && item.name === 'live');
             const rescueTracks = rescueSource && Array.isArray(rescueSource.tracks)
                 ? rescueSource.tracks : [];
@@ -4080,7 +4141,10 @@ document.addEventListener('DOMContentLoaded', () => {
     function rememberH264Rescue() {
         preferH264Rescue = true;
         try {
-            localStorage.setItem(H264_RESCUE_STORAGE_KEY, '1');
+            localStorage.setItem(H264_RESCUE_STORAGE_KEY, JSON.stringify({
+                v: 2,
+                at: Date.now()
+            }));
         } catch (e) { /* storage unavailable: the in-memory verdict still applies */ }
     }
 

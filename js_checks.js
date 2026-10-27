@@ -1133,6 +1133,84 @@ Object.assign(cases, {
             'an AV1 source must not be routed to the H264 rescue by an H264 verdict');
     },
 
+    // The first persisted rescue format was the bare string '1' with no
+    // timestamp. One bad join then pinned that browser to 720p forever. A
+    // versioned verdict must expire, and the old format must be discarded so
+    // every existing viewer gets one clean retest.
+    'h264-rescue-verdict-expires'() {
+        const { fn } = compileFunction('parseH264RescuePreference', {
+            console: quietConsole()
+        });
+        const now = 1700000000000;
+        const ttl = evaluateConst('H264_RESCUE_TTL_MS');
+        assertEqual(ttl, 24 * 60 * 60 * 1000, 'the rescue verdict lives for 24 hours');
+        const stored = (ageMs, version) => JSON.stringify({
+            v: version === undefined ? 2 : version,
+            at: now - ageMs
+        });
+
+        assertEqual(fn(null, now, ttl), false, 'no verdict means full quality');
+        assertEqual(fn('', now, ttl), false, 'empty storage means full quality');
+        assertEqual(fn('1', now, ttl), false,
+            'the pre-TTL verdict has no age and must be discarded');
+        assertEqual(fn('{not json', now, ttl), false,
+            'malformed storage must not pin 720p');
+        assertEqual(fn(stored(1000), now, ttl), true,
+            'a fresh verdict applies');
+        assertEqual(fn(stored(ttl), now, ttl), true,
+            'a verdict exactly at the TTL boundary still applies');
+        assertEqual(fn(stored(ttl + 1), now, ttl), false,
+            'an expired verdict must not pin 720p');
+        assertEqual(fn(stored(1000, 1), now, ttl), false,
+            'an unknown verdict version is not trusted');
+        assertEqual(fn(stored(-1000), now, ttl), false,
+            'a verdict from the future is not trusted');
+        assertEqual(fn(stored(1000), NaN, ttl), false,
+            'an unknown clock must fail closed');
+        assertEqual(fn(stored(1000), now, NaN), false,
+            'an unknown TTL must fail closed');
+    },
+
+    // A viewer that joins during the studio encoder's ramp sees low presented
+    // FPS before the encoder settles. That is not a slow decoder, and acting
+    // on it persisted a 720p verdict for every later visit.
+    'decode-deficit-rescue-waits-out-the-startup-ramp'() {
+        const grace = evaluateConst('DECODE_DEFICIT_STARTUP_GRACE_MS');
+        const cooldown = evaluateConst('DECODE_DEFICIT_COOLDOWN_MS');
+        const { fn } = compileFunction('decodeDeficitRescueAllowed', {
+            console: quietConsole(),
+            DECODE_DEFICIT_STARTUP_GRACE_MS: grace,
+            DECODE_DEFICIT_COOLDOWN_MS: cooldown
+        });
+
+        assertEqual(grace, 15000, 'the encoder ramp gets a 15 s grace');
+        assertEqual(cooldown, 60000, 'rendition switches keep the 60 s cooldown');
+
+        const connectedAt = 90000;
+        assertEqual(fn(connectedAt + 1000, connectedAt, -60000), false,
+            'a viewer one second into the connection must not be rescued');
+        assertEqual(fn(connectedAt + grace - 1, connectedAt, -60000), false,
+            'one millisecond before the grace ends is still too early');
+        assertEqual(fn(connectedAt + grace, connectedAt, -60000), true,
+            'after the grace, with no recent switch, the rescue may act');
+        assertEqual(fn(connectedAt + grace, 0, -60000), false,
+            'a connection that has not started cannot be rescued');
+        assertEqual(fn(connectedAt + grace, connectedAt, connectedAt + 5000), false,
+            'a switch inside the cooldown must not be followed by another');
+        assertEqual(fn(connectedAt + grace + cooldown, connectedAt,
+            connectedAt + grace), false,
+            'the cooldown boundary is strict');
+        assertEqual(fn(connectedAt + grace + cooldown + 1, connectedAt,
+            connectedAt + grace), true,
+            'once the cooldown has elapsed the rescue may act again');
+        assertEqual(fn(NaN, connectedAt, -60000), false,
+            'an unknown clock must fail closed');
+        assertEqual(fn(connectedAt + grace, NaN, -60000), false,
+            'an unknown connection start must fail closed');
+        assertEqual(fn(connectedAt + grace, connectedAt, NaN), false,
+            'an unknown switch time must fail closed');
+    },
+
     // AV1 source + browser without AV1 + bridge not ready: the poll must keep
     // the connecting state and retry instead of painting a false offline.
     'poll-waits-for-compatible-rendition'() {
@@ -3116,6 +3194,16 @@ Object.assign(cases, {
                 abrDowngradedForLink: false,
                 // Live-edge catch-up state, read by the drop-window gate.
                 catchUpRate: 1,
+                // The presentation-deficit rescue is gated on the connection's
+                // age and the shared switch cooldown. Connected 20s ago, so
+                // the startup grace has elapsed for every case that is not
+                // specifically about the grace.
+                connectionStartTime: 80000,
+                decodeDeficitRescueAllowed: compileFunction('decodeDeficitRescueAllowed', {
+                    console: quietConsole(),
+                    DECODE_DEFICIT_STARTUP_GRACE_MS: evaluateConst('DECODE_DEFICIT_STARTUP_GRACE_MS'),
+                    DECODE_DEFICIT_COOLDOWN_MS: evaluateConst('DECODE_DEFICIT_COOLDOWN_MS')
+                }).fn,
                 lastRenditionSwitchAt: -60000,
                 renditionPathsItems: ladder.av1Source,
                 activeStreamPath: 'live',
@@ -3231,6 +3319,22 @@ Object.assign(cases, {
             'the rescue verdict must be persisted for subsequent loads');
         assertEqual(deficit.sandbox.decodeDeficitActive, false,
             'the deficit window must reset after the rescue switch');
+
+        // A viewer that just connected is still inside the startup grace: the
+        // studio encoder's ramp looks exactly like a slow decoder, and acting
+        // on it pinned that browser to 720p for every later visit.
+        const warming = make({
+            renditionPathsItems: ladder.h264Rescue,
+            decodeLagSec: 0,
+            decodeDeficitActive: true,
+            connectionStartTime: 95000,
+            player: { paused: false, videoHeight: 1080 }
+        });
+        warming.run();
+        assertEqual(warming.sandbox.switchedTo, undefined,
+            'a viewer inside the 15s startup grace must not be rescued');
+        assertEqual(warming.sandbox.rescueRemembered, undefined,
+            'a startup-ramp reading must not persist a rescue verdict');
 
         // Already 720p or smaller: a teardown buys nothing.
         const alreadySmall = make({

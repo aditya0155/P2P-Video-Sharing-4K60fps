@@ -392,6 +392,10 @@
             this.audioBytes = 0;
             this.droppedVideo = 0;
             this.droppedAudio = 0;
+            // Frames the tick loop skipped because the encoder's own queue was
+            // still full. They never reach _enqueue(), so droppedVideo cannot
+            // see them, yet they are just as visible to a viewer.
+            this.encoderSkipped = 0;
             this.serverDropped = 0;
             this.audioOpen = false;
             this.lastStatus = null;
@@ -511,6 +515,9 @@
                 // The encoder is behind. Skipping a frame here does not break
                 // the bitstream (nothing was encoded), it just drops a slot.
                 // The credit is kept so the next free tick encodes immediately.
+                // Count it: this is the drop a viewer sees when the encoder
+                // cannot keep up, and it is otherwise invisible to the studio.
+                this.encoderSkipped += 1;
                 return;
             }
             if (!this._drawSource()) return;
@@ -936,6 +943,7 @@
                 keyframes: this.keyframes,
                 droppedVideo: this.droppedVideo,
                 droppedAudio: this.droppedAudio,
+                encoderSkipped: this.encoderSkipped,
                 serverDropped: this.serverDropped,
                 queuedBytes: this.queue.bytes,
                 queuedChunks: this.queue.length,

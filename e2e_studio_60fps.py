@@ -11,7 +11,10 @@ studio broadcast, joins the real viewer, and verifies:
     starved the relay at 60 fps: MediaMTX logged "reader is too slow", the
     relay dropped ~18 frames every 300ms, and viewers got ~30-35 fps)
   * the relay drops no video and never re-synchronises
+  * the studio's Dropped meter stays at zero (browser, encoder queue and relay)
   * the viewer receives and decodes ~60 fps at the native 1080p size
+  * a viewer that joins as soon as the stream appears is NOT rescued to 720p,
+    and no rescue verdict is persisted for later visits
 
 Why headed Chrome: headless Chrome throttles presentation after ~20s and
 the media pipeline collapses, which looks exactly like the bug this test
@@ -439,6 +442,11 @@ def main():
         viewer = Page(target_ws(debug_port, viewer_target["targetId"]))
         viewer.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
         viewer.send("Page.addScriptToEvaluateOnNewDocument", {"source": VIEWER_INJECT})
+        # A previous run's rescue verdict would pin this viewer to 720p before
+        # the test could see whether the new grace period works.
+        viewer.send("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "try{localStorage.removeItem('rydius_h264_rescue')}catch(e){}"
+        })
         try:
             window = browser.send("Browser.getWindowForTarget", {"targetId": viewer_target["targetId"]})
             browser.send("Browser.setWindowBounds", {
@@ -447,6 +455,13 @@ def main():
             })
         except Exception as err:
             print(f"[e2e] WARN: could not place the viewer window: {err}")
+
+        # Load the viewer before the broadcast starts. Its page load repaints
+        # the captured desktop, and doing that after capture begins showed up
+        # as a burst of encoder-queue skips that had nothing to do with the
+        # broadcast. The page polls until the stream is live, so it is ready to
+        # join the moment the encoder publishes.
+        viewer.navigate(viewer_url)
 
         # Keep the screen changing at 60 Hz for the whole broadcast.
         studio.evaluate(ANIMATOR_JS)
@@ -529,48 +544,18 @@ def main():
                 "is the 60 fps regression this test exists to catch"
             )
 
-        # Wait for the encoder and relay to hold 60 fps before the viewer
-        # joins. The screen-capture/encoder path needs a few seconds to warm
-        # up; a viewer that joins during the ramp legitimately triggers the
-        # app's 720p decode rescue, which would test the rescue instead of the
-        # healthy 60 fps path this check is about.
-        def studio_meter():
-            raw = studio.evaluate(
-                "(document.getElementById('meter-fps') || {}).textContent || ''"
-            )
-            try:
-                return float(raw)
-            except (TypeError, ValueError):
-                return 0.0
-
-        print("[e2e] waiting for a steady 60 fps source before joining the viewer")
-        deadline = time.time() + 30
-        previous = None
-        steady_seconds = 0
-        last = None
-        while time.time() < deadline:
-            relay = relay_status()
-            meter = studio_meter()
-            now = time.time()
-            if previous and relay.get("videoFrames") is not None:
-                rate = (relay["videoFrames"] - previous[0]) / (now - previous[1])
-                last = (meter, rate)
-                if meter >= 55 and rate >= 55:
-                    steady_seconds += 1
-                    if steady_seconds >= 3:
-                        print(f"[e2e] source steady: meter={meter} relay={rate:.1f} fps")
-                        break
-                else:
-                    steady_seconds = 0
-            previous = (relay.get("videoFrames"), now)
-            time.sleep(1)
-        else:
-            raise RuntimeError(
-                f"the studio/relay never held 60 fps before the viewer joined: {last}"
-            )
-
-        # Join the real viewer now that the source is steady.
-        viewer.navigate(viewer_url)
+        # Join the moment the stream appears, without waiting for the relay to
+        # settle. This is deliberate: a viewer that arrives in the first
+        # seconds used to look like a slow decoder, get rescued to 720p, and
+        # persist that verdict for every later visit. The healthy path must
+        # keep it on 1080p without a false rescue.
+        prejoin = studio.json_eval("""JSON.stringify({
+            meter: (document.getElementById('meter-fps') || {}).textContent || '',
+            dropped: (document.getElementById('meter-dropped') || {}).textContent || ''
+        })""")
+        print(f"[e2e] pre-join: meter={prejoin.get('meter')} "
+              f"dropped={prejoin.get('dropped')}")
+        print("[e2e] joining as soon as the stream appears (rescue grace)")
         viewer.send("Page.bringToFront")
 
         deadline = time.time() + 30
@@ -643,6 +628,9 @@ def main():
                 "meterFps": studio.evaluate(
                     "(document.getElementById('meter-fps') || {}).textContent || ''"
                 ),
+                "meterDropped": studio.evaluate(
+                    "(document.getElementById('meter-dropped') || {}).textContent || ''"
+                ),
                 "relay": {
                     "state": relay.get("state"),
                     "videoFrames": relay.get("videoFrames"),
@@ -680,7 +668,8 @@ def main():
             previous = row
             print(f"[e2e] {row['at']:5.1f}s meter={row['meterFps']:>3} "
                   f"relay={row.get('relayFps')} rx={row.get('rxFps')} dec={row.get('decFps')} "
-                  f"dropped={row['relay']['droppedVideo']} resyncs={row['relay']['resyncs']} "
+                  f"dropped={row['relay']['droppedVideo']} meterDrop={row['meterDropped']} "
+                  f"resyncs={row['relay']['resyncs']} "
                   f"{row['viewer'].get('width')}x{row['viewer'].get('height')}")
             time.sleep(1)
 
@@ -698,15 +687,29 @@ def main():
         min_dec = min(row["decFps"] for row in steady)
         widths = {row["viewer"].get("width") for row in steady}
         heights = {row["viewer"].get("height") for row in steady}
+        meter_drops = [
+            int(row["meterDropped"]) for row in rows
+            if str(row.get("meterDropped") or "").strip().isdigit()
+        ]
+        rescue = viewer.evaluate("localStorage.getItem('rydius_h264_rescue')")
 
         print(f"[e2e] steady: rx={avg_rx:.1f} dec={avg_dec:.1f} minDec={min_dec:.1f} "
-              f"dropped={dropped} resyncs={resyncs} size={widths}x{heights}")
+              f"dropped={dropped} resyncs={resyncs} size={widths}x{heights} "
+              f"meterDrop={max(meter_drops, default=None)} rescue={rescue!r}")
 
         problems = []
         if dropped != 0:
             problems.append(f"the relay dropped {dropped} video frames")
         if resyncs != 0:
             problems.append(f"the relay re-synchronised {resyncs} times")
+        if not meter_drops:
+            problems.append("the studio Dropped meter never reported a value")
+        elif max(meter_drops) != 0:
+            problems.append(
+                f"the studio Dropped meter reached {max(meter_drops)} "
+                "(browser, encoder queue or relay)")
+        if rescue is not None:
+            problems.append(f"a false 720p rescue was persisted: {rescue!r}")
         if avg_rx < 55:
             problems.append(f"viewer received only {avg_rx:.1f} fps")
         if avg_dec < 55:

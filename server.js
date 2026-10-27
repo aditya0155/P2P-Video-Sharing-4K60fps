@@ -1270,11 +1270,80 @@ function handleChat(req, res, requestUrl) {
 // for WebRTC (which is what pinned this laptop at ~16 fps), the page encodes
 // with WebCodecs and streams framed H.264 + PCM here; this process hands the
 // frames to a local ffmpeg that copies the video and publishes RTSP to the same
-// `live` path OBS uses. Only ever created for a request that passed
-// isDirectLocal(), because it spawns a child process.
+// `live` path OBS uses.
+//
+// Broadcasting is open to any browser that can load the studio page, including
+// one reaching this host through the tunnel. Two guards keep that from becoming
+// a general-purpose ffmpeg launcher:
+//
+//   * the request must be same-origin (or a non-browser client that sends no
+//     Origin) and must arrive either over loopback or through a proxy that adds
+//     a forwarded header. A page on another site cannot drive session creation
+//     through a visitor's browser, and DNS rebinding cannot borrow the remote
+//     allowance because it hits loopback with no proxy header.
+//   * session creation is rate-limited per client. Only one relay is live at a
+//     time (createStudioIngest replaces the previous session), so this bounds
+//     ffmpeg spawn churn, not concurrency.
+//
+// Ingest stays token-protected: the session response hands a random token to
+// the creator, and every frame batch must present it.
 const studioIngest = createStudioIngest({
     log: (line) => console.log(line)
 });
+
+function studioRequestAllowed(req) {
+    const origin = req.headers.origin;
+    if (origin === undefined) {
+        // curl, OBS-side tooling, and the tests do not send Origin. A browser
+        // cross-site fetch still announces itself here.
+        if (req.headers['sec-fetch-site'] === 'cross-site') return false;
+    } else {
+        const host = req.headers.host;
+        if (typeof host !== 'string' || !host) return false;
+        try {
+            const parsed = new URL(origin);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+            if (parsed.host.toLowerCase() !== host.toLowerCase()) return false;
+        } catch (_) {
+            return false;
+        }
+    }
+    // A direct loopback request is the host's own page or tooling.
+    if (isDirectLocal(req)) return true;
+    // A remote studio page reaches this process through the tunnel, and
+    // Cloudflare and Tailscale both add a forwarded header. A DNS-rebinding
+    // page hits loopback directly with none, so it cannot borrow this.
+    return Boolean(req.headers['cf-connecting-ip']
+        || req.headers['x-forwarded-for']
+        || req.headers['forwarded']);
+}
+
+const STUDIO_SESSION_WINDOW_MS = 10000;
+const STUDIO_SESSION_MAX_STARTS = 3;
+const studioSessionStarts = new Map();
+
+function studioSessionRateLimited(req) {
+    const client = clientIpForRateLimit(req);
+    const now = Date.now();
+    const recent = (studioSessionStarts.get(client) || [])
+        .filter((stamp) => now - stamp < STUDIO_SESSION_WINDOW_MS);
+    if (recent.length >= STUDIO_SESSION_MAX_STARTS) {
+        studioSessionStarts.set(client, recent);
+        return true;
+    }
+    recent.push(now);
+    studioSessionStarts.set(client, recent);
+    // The map is keyed by client IP. Direct clients cannot forge their address,
+    // but keep it from growing without bound on a long-lived process anyway.
+    if (studioSessionStarts.size > 1024) {
+        for (const [key, stamps] of studioSessionStarts) {
+            if (!stamps.some((stamp) => now - stamp < STUDIO_SESSION_WINDOW_MS)) {
+                studioSessionStarts.delete(key);
+            }
+        }
+    }
+    return false;
+}
 
 const server = http.createServer((req, res) => {
     // A response can legitimately error after its request handler already
@@ -1334,23 +1403,61 @@ const server = http.createServer((req, res) => {
             res.end(body);
             return;
         }
+        if (requestUrl.pathname === '/stream-api/studio/capabilities') {
+            if (req.method !== 'GET' && req.method !== 'HEAD') {
+                res.writeHead(405, setCorsHeaders({
+                    'Allow': 'GET, HEAD',
+                    'Content-Type': 'text/plain; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL
+                }));
+                res.end('405 Method Not Allowed');
+                return;
+            }
+            // The studio page asks this before enabling Start. It is public and
+            // deliberately says nothing about the checkout: `host` only tells
+            // the page whether it is running on the machine itself, which is
+            // useful for wording, not for access.
+            const body = JSON.stringify({
+                broadcast: true,
+                host: isDirectLocal(req)
+            });
+            res.writeHead(200, setCorsHeaders({
+                'Content-Type': 'application/json; charset=utf-8',
+                'Cache-Control': CACHE_CONTROL,
+                'Content-Length': Buffer.byteLength(body)
+            }));
+            res.end(body);
+            return;
+        }
         if (requestUrl.pathname === '/stream-api/studio/session'
             || requestUrl.pathname.startsWith('/stream-api/studio/')) {
-            // Not proxied, and deliberately not reachable through the tunnel:
-            // these routes spawn ffmpeg and bind named pipes on this machine.
-            // The check is the request's real socket plus the absence of any
-            // proxy header, the same rule /stream-api/host-info uses to decide
-            // "is this the host?" - so a tunneled visitor is told to broadcast
-            // from the host rather than silently controlling its processes.
-            if (!isDirectLocal(req)) {
+            // These routes spawn ffmpeg and bind named pipes on this machine,
+            // so they are open to the studio page but not to arbitrary sites:
+            // same-origin only, and session creation is rate-limited. The
+            // per-session token still protects ingest and stop.
+            if (!studioRequestAllowed(req)) {
                 const body = JSON.stringify({
-                    error: 'Browser broadcasting only works on the host machine. '
-                        + 'Open http://127.0.0.1:3000/streaming/studio on the PC that runs the stream.'
+                    error: 'Cross-site studio requests are refused. Open the studio page on this host.'
                 });
                 res.writeHead(403, setCorsHeaders({
                     'Content-Type': 'application/json; charset=utf-8',
                     'Cache-Control': CACHE_CONTROL,
                     'Content-Length': Buffer.byteLength(body)
+                }));
+                res.end(body);
+                return;
+            }
+            if (requestUrl.pathname === '/stream-api/studio/session'
+                && req.method === 'POST'
+                && studioSessionRateLimited(req)) {
+                const body = JSON.stringify({
+                    error: 'Too many broadcast starts. Wait a few seconds and try again.'
+                });
+                res.writeHead(429, setCorsHeaders({
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Cache-Control': CACHE_CONTROL,
+                    'Content-Length': Buffer.byteLength(body),
+                    'Retry-After': '10'
                 }));
                 res.end(body);
                 return;

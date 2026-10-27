@@ -9,12 +9,12 @@
          URL and must never be indexed or linkable from a crawler. -->
     <meta name="robots" content="noindex, noimageindex">
     <title>Rydius Studio — Broadcast from this browser</title>
-    <meta name="description" content="Broadcast a screen, window or tab from the host laptop with hardware H.264 and no install.">
+    <meta name="description" content="Broadcast a screen, window or tab from the host or a remote browser with hardware H.264 and no install.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Orbitron:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-    <link rel="stylesheet" href="/streaming/studio.css?v=3.0.2">
+    <link rel="stylesheet" href="/streaming/studio.css?v=3.0.3">
 </head>
 <body>
     <div class="ambient-bg" aria-hidden="true">
@@ -54,8 +54,9 @@
 
             <p class="studio-notice-body" id="studio-notice-body">
                 This page captures the screen, encodes it with the GPU, and hands the encoded frames
-                to a local relay that publishes to the same <code>live</code> path OBS uses. No second
-                encode and no WebRTC ceiling. It runs <b>only on the host laptop</b>.
+                to the relay on the machine serving this page, which publishes to the same
+                <code>live</code> path OBS uses. No second encode and no WebRTC ceiling. A remote
+                browser sends the encoded frames through the same tunnel as the stream.
             </p>
 
             <p class="studio-notice-foot" id="studio-notice-foot">
@@ -304,7 +305,7 @@
 
     <!-- The ingest client defines window.StudioIngest, which studio.js uses.
          Classic scripts execute in order, so this must stay before studio.js. -->
-    <script src="/streaming/studio_ingest_client.js?v=3.0.2"></script>
-    <script src="/streaming/studio.js?v=3.0.2"></script>
+    <script src="/streaming/studio_ingest_client.js?v=3.0.3"></script>
+    <script src="/streaming/studio.js?v=3.0.3"></script>
 </body>
 </html>

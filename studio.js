@@ -31,9 +31,12 @@
    If the browser has no Document PiP, broadcasting still works, but only while
    this tab stays visible.
 
-   This page is deliberately host-only. The relay spawns ffmpeg and binds named
-   pipes on the machine serving the page; /stream-api/host-info is what tells
-   the page whether it is on that machine.
+   Broadcasting is open to remote browsers. The relay still spawns ffmpeg and
+   binds named pipes on the machine serving the page, so the server accepts
+   studio requests only from a same-origin page, rate-limits session creation,
+   and protects the ingest stream with a per-session token.
+   /stream-api/studio/capabilities is what tells the page whether broadcasting
+   is allowed.
    ========================================================================== */
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -43,9 +46,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const STREAM_PATH = 'live';
     const MEDIAMTX_API_PATH = '/stream-api/v3/paths/list';
-    const HOST_INFO_PATH = '/stream-api/host-info';
+    const STUDIO_CAPABILITIES_PATH = '/stream-api/studio/capabilities';
 
-    const HOST_INFO_TIMEOUT_MS = 4000;
+    const ACCESS_CHECK_TIMEOUT_MS = 4000;
     const PATH_PROBE_TIMEOUT_MS = 5000;
     const STATS_INTERVAL_MS = 1000;
 
@@ -63,8 +66,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const DEFAULT_NOTICE = {
         title: 'Hardware H.264, encoded once',
         body: 'This page captures the screen, encodes it with the GPU, and hands the encoded frames '
-            + 'to a local relay that publishes to the same <code>live</code> path OBS uses. No second '
-            + 'encode and no WebRTC ceiling. It runs <b>only on the host laptop</b>.',
+            + 'to the relay on the machine serving this page, which publishes to the same '
+            + '<code>live</code> path OBS uses. No second encode and no WebRTC ceiling. A remote '
+            + 'browser sends the encoded frames through the same tunnel as the stream.',
         foot: 'Defaults match the OBS profile: 1920&times;1080, 24 fps, CBR 4 Mbps, 1 s keyframes. '
             + 'Chrome throttles a hidden studio tab. Tick <b>Keep encoding when I switch away</b> '
             + 'before starting if you need to use other apps; it opens a small always-on-top '
@@ -73,12 +77,11 @@ document.addEventListener('DOMContentLoaded', () => {
         kind: 'info'
     };
 
-    const HOST_ONLY_NOTICE = {
-        title: 'Browser broadcasting is host-only',
-        body: 'This page starts a local encoder and relay, so it only works on the laptop that runs '
-            + 'the stream. Open <code>http://127.0.0.1:3000/streaming/studio</code> on that machine.',
-        foot: 'To publish, run OBS on that laptop &mdash; its RTMP and WHIP ingest are unchanged. '
-            + 'Remote viewers should use the watch page.',
+    const UNAVAILABLE_NOTICE = {
+        title: 'Broadcasting is unavailable',
+        body: 'The server did not grant broadcast access. Reload the page, or check that the host '
+            + 'is running a version of Rydius that allows the studio.',
+        foot: 'Remote viewers can still use the watch page.',
         icon: 'fa-lock',
         kind: 'error'
     };
@@ -172,13 +175,13 @@ document.addEventListener('DOMContentLoaded', () => {
     let isStarting = false;
     let isTearingDown = false;
     // Set when this browser cannot capture or encode at all. It is separate
-    // from hostAllowed because a remote visitor should still see the
-    // host-only notice, not an unsupported-browser one.
+    // from canBroadcast because an unsupported browser should see its own
+    // notice, not the server's access verdict.
     let unsupported = false;
 
-    // null = still checking, true = host, false = remote/unknown. Start stays
-    // disabled until this is true.
-    let hostAllowed = null;
+    // null = still checking, true = broadcasting allowed, false = unavailable
+    // or unknown. Start stays disabled until this is true.
+    let canBroadcast = null;
 
     let audioIsSilent = false;
     let audioTapFailed = false;
@@ -282,13 +285,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function canStartNow() {
-        return !unsupported && hostAllowed === true && hasSource() && !isPublishing && !isStarting;
+        return !unsupported && canBroadcast === true && hasSource() && !isPublishing && !isStarting;
     }
 
     function transportNoteText() {
         if (unsupported) return 'Browser broadcasting is not supported in this browser.';
-        if (hostAllowed === null) return 'Checking host access…';
-        if (hostAllowed === false) return 'Browser broadcasting runs on the host laptop only.';
+        if (canBroadcast === null) return 'Checking broadcast access…';
+        if (canBroadcast === false) return 'Broadcasting is unavailable on this server.';
         if (isPublishing) return 'Live. Encoder settings are fixed until you stop.';
         if (isStarting) return 'Starting the encoder…';
         if (!hasSource()) return 'Choose a source to unlock broadcasting.';
@@ -307,7 +310,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (startBtn) startBtn.disabled = !canStartNow();
         if (stopBtn) stopBtn.hidden = !isPublishing;
         if (pickSourceBtn) {
-            pickSourceBtn.disabled = unsupported || hostAllowed === false || isPublishing || isStarting;
+            pickSourceBtn.disabled = unsupported || canBroadcast === false || isPublishing || isStarting;
         }
         if (transportNote) transportNote.textContent = note || transportNoteText();
     }
@@ -354,32 +357,37 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // ==========================================================================
-    // Host access
+    // Broadcast access
     // ==========================================================================
 
-    async function checkHostAccess() {
+    // The server decides who may broadcast. This probe is deliberately a
+    // capability question, not a host question: a remote page that can load
+    // the studio is allowed to broadcast, while /stream-api/host-info stays
+    // host-only because it reports the checkout path and process id.
+    async function checkBroadcastAccess() {
         try {
-            const response = await fetch(HOST_INFO_PATH, {
+            const response = await fetch(STUDIO_CAPABILITIES_PATH, {
                 cache: 'no-store',
-                signal: AbortSignal.timeout(HOST_INFO_TIMEOUT_MS)
+                signal: AbortSignal.timeout(ACCESS_CHECK_TIMEOUT_MS)
             });
-            // 403 is the deliberate answer for a tunneled/remote request.
-            hostAllowed = response.ok;
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            canBroadcast = Boolean(data && data.broadcast === true);
         } catch (err) {
-            console.warn('[Studio] Could not verify host access:', err);
-            hostAllowed = false;
+            console.warn('[Studio] Could not verify broadcast access:', err);
+            canBroadcast = false;
         }
 
-        if (hostAllowed) {
+        if (canBroadcast) {
             setNotice(DEFAULT_NOTICE);
             setStatus('idle', 'Ready');
         } else {
-            setNotice(HOST_ONLY_NOTICE);
-            setStatus('error', 'Host only');
+            setNotice(UNAVAILABLE_NOTICE);
+            setStatus('error', 'Unavailable');
         }
         refreshTransport();
 
-        if (!hostAllowed) return;
+        if (!canBroadcast) return;
 
         // Advisory only: the relay overrides an existing publisher. Learning
         // that BEFORE starting is the difference between a deliberate takeover
@@ -797,8 +805,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function pickSource() {
         if (unsupported) return;
-        if (hostAllowed === false) {
-            showToast('Browser broadcasting only works on the host laptop.', 'warning');
+        if (canBroadcast === false) {
+            showToast('Broadcasting is unavailable on this server.', 'warning');
             return;
         }
         if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
@@ -1027,8 +1035,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // ==========================================================================
 
     async function startPublishing(pipPromise, wantsOnAir) {
-        if (hostAllowed === false) {
-            throw new Error('Browser broadcasting only works on the host machine. Open the studio on the laptop that runs the stream.');
+        if (canBroadcast === false) {
+            throw new Error('Broadcasting is unavailable on this server.');
         }
         if (!hasSource()) {
             throw new Error('Choose a screen, window or tab first.');
@@ -1282,10 +1290,12 @@ document.addEventListener('DOMContentLoaded', () => {
         if (meterResolution) meterResolution.textContent = `${stats.width}×${stats.height}`;
         if (meterCodec) meterCodec.textContent = 'H.264';
 
-        const dropped = (stats.droppedVideo || 0) + (stats.serverDropped || 0);
+        const dropped = (stats.droppedVideo || 0) + (stats.serverDropped || 0)
+            + (stats.encoderSkipped || 0);
         if (meterDropped) {
             meterDropped.textContent = String(dropped);
             meterDropped.title = `${stats.droppedVideo || 0} dropped by the browser, `
+                + `${stats.encoderSkipped || 0} skipped while the encoder queue was full, `
                 + `${stats.serverDropped || 0} dropped by the relay, `
                 + `${stats.droppedAudio || 0} audio frames dropped.`;
         }
@@ -1524,8 +1534,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (startBtn) {
             startBtn.addEventListener('click', async () => {
                 if (isPublishing || isStarting) return;
-                if (hostAllowed !== true) {
-                    showToast('Browser broadcasting only works on the host laptop. Open http://127.0.0.1:3000/streaming/studio there.', 'warning');
+                if (canBroadcast !== true) {
+                    showToast('Broadcasting is unavailable on this server.', 'warning');
                     return;
                 }
                 if (!hasSource()) {
@@ -1599,10 +1609,10 @@ document.addEventListener('DOMContentLoaded', () => {
             return 'The start request timed out. Is the host server still running?';
         }
         if (/WebCodecs|VideoEncoder|OffscreenCanvas/i.test(message)) {
-            return 'This browser cannot encode H.264 with WebCodecs. Use Chrome or Edge on the host laptop.';
+            return 'This browser cannot encode H.264 with WebCodecs. Use Chrome or Edge.';
         }
-        if (/host machine|host laptop/i.test(message)) {
-            return 'Browser broadcasting only works on the host laptop. Open the studio there.';
+        if (/host machine|host laptop|host-only/i.test(message)) {
+            return 'This server still restricts broadcasting to the host laptop. Update the host and reload.';
         }
         return `Could not start broadcasting: ${message}`;
     }
@@ -1634,13 +1644,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     window.addEventListener('pageshow', () => {
         if (isPublishing || isStarting) return;
-        // pageshow fires after the async host check has often already run. Do
-        // not overwrite its verdict with a cheerful "Ready": a tunneled page
-        // would then show a Ready badge next to a disabled Start button.
+        // pageshow fires after the async access check has often already run. Do
+        // not overwrite its verdict with a cheerful "Ready": a page the server
+        // refused would then show a Ready badge next to a disabled Start button.
         if (unsupported) {
             setStatus('error', 'Unsupported');
-        } else if (hostAllowed === false) {
-            setStatus('error', 'Host only');
+        } else if (canBroadcast === false) {
+            setStatus('error', 'Unavailable');
         } else {
             setStatus('idle', 'Ready');
         }
@@ -1701,14 +1711,14 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!window.VideoEncoder || !window.VideoFrame || !window.OffscreenCanvas) {
             unsupported = true;
             setStatus('error', 'Unsupported');
-            refreshTransport('This browser cannot encode H.264 with WebCodecs. Use Chrome or Edge on the host laptop.');
-            showToast('This browser cannot encode H.264 with WebCodecs. Use Chrome or Edge on the host laptop.', 'error');
+            refreshTransport('This browser cannot encode H.264 with WebCodecs. Use Chrome or Edge.');
+            showToast('This browser cannot encode H.264 with WebCodecs. Use Chrome or Edge.', 'error');
             return;
         }
 
         setStatus('idle', 'Ready');
         refreshTransport();
-        checkHostAccess();
+        checkBroadcastAccess();
     }
 
     init();

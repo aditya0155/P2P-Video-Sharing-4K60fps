@@ -1811,7 +1811,8 @@ class PublishPlaneSecurityChecks(_SiteUnderTest):
 
     def test_studio_control_plane_rejects_cross_site_requests_before_spawning(self):
         # A cross-site POST to the session route would spawn a local ffmpeg.
-        # It must be refused by the same host check; no session is created.
+        # The same-origin check must refuse it before the relay sees it; no
+        # session is created.
         status, _, body = http_request(
             self.port, "POST", "/stream-api/studio/session",
             body="{}",
@@ -1821,7 +1822,7 @@ class PublishPlaneSecurityChecks(_SiteUnderTest):
             },
         )
         self.assertEqual(status, 403)
-        self.assertIn("host machine", body.decode("utf-8"))
+        self.assertIn("Cross-site studio requests are refused", body.decode("utf-8"))
 
     def test_checkout_path_header_is_not_published_through_the_tunnel(self):
         status, headers, _ = http_request(
@@ -2622,9 +2623,10 @@ class StudioPageChecks(_SiteUnderTest):
     """The current studio: WebCodecs H.264 -> local relay -> RTSP.
 
     These are the contracts that are expensive to discover in production: the
-    page is host-only, the ingest client loads before the controller, the
-    transport is finite batched POSTs (not a streamed body), video is copied by
-    ffmpeg, and the relay paces frames on the encoder's timeline.
+    server decides whether broadcasting is allowed, the ingest client loads
+    before the controller, the transport is finite batched POSTs (not a
+    streamed body), video is copied by ffmpeg, and the relay paces frames on
+    the encoder's timeline.
     """
 
     @classmethod
@@ -2719,22 +2721,38 @@ class StudioPageChecks(_SiteUnderTest):
                 self.assertNotIn(marker, studio_code)
                 self.assertNotIn(marker, client_code)
 
-    def test_studio_is_host_only(self):
-        self.assertIn("const HOST_INFO_PATH = '/stream-api/host-info';", self.studio_js)
-        self.assertIn("hostAllowed = response.ok;", self.studio_js)
-        self.assertIn("hostAllowed !== true", self.studio_js)
-        self.assertIn("if (!isDirectLocal(req))", self.server)
-        self.assertIn("Browser broadcasting only works on the host machine.", self.server)
+    def test_studio_asks_the_server_whether_broadcasting_is_allowed(self):
+        """The page asks a capability question, not a host question.
 
-    def test_studio_pageshow_keeps_the_host_only_verdict(self):
+        Remote broadcasting is open to a same-origin page that reaches the
+        host through the tunnel. The page must not decide that for itself from
+        /stream-api/host-info: that endpoint stays host-only because it
+        discloses the checkout path and process id.
+        """
+        self.assertIn("const STUDIO_CAPABILITIES_PATH = '/stream-api/studio/capabilities';",
+                      self.studio_js)
+        self.assertIn("const data = await response.json();", self.studio_js)
+        self.assertIn("canBroadcast = Boolean(data && data.broadcast === true);", self.studio_js)
+        self.assertIn("canBroadcast !== true", self.studio_js)
+        self.assertIn("requestUrl.pathname === '/stream-api/studio/capabilities'", self.server)
+        self.assertIn("studioRequestAllowed(req)", self.server)
+        self.assertIn("studioSessionRateLimited(req)", self.server)
+        # The ingest token is what protects the frame pipe after the gate.
+        self.assertIn("this.session.ingestUrl", self.client_js)
+        self.assertIn("Invalid or missing session token.", self.ingest_js)
+        # host-info must stay host-only.
+        self.assertIn("handleHostInfo(req, res)", self.server)
+        self.assertIn("local-only", self.server)
+
+    def test_studio_pageshow_keeps_the_access_verdict(self):
         start = self.studio_js.find("window.addEventListener('pageshow'")
         end = self.studio_js.find("document.addEventListener('visibilitychange'", start)
         self.assertGreater(start, 0, "the pageshow handler was not found")
         self.assertGreater(end, start, "the pageshow handler is not bounded")
         handler = self.studio_js[start:end]
-        self.assertIn("hostAllowed === false", handler,
-                      "pageshow must not turn a tunneled page back into 'Ready'")
-        self.assertIn("setStatus('error', 'Host only')", handler)
+        self.assertIn("canBroadcast === false", handler,
+                      "pageshow must not turn a refused page back into 'Ready'")
+        self.assertIn("setStatus('error', 'Unavailable')", handler)
         self.assertIn("unsupported", handler)
 
     def test_studio_opens_the_on_air_window_in_the_click_gesture(self):
@@ -2871,9 +2889,9 @@ class StudioPageChecks(_SiteUnderTest):
         versions = set(re.findall(
             r"/streaming/(?:studio\.css|studio\.js|studio_ingest_client\.js)\?v=([^\"']+)",
             self.studio_html))
-        self.assertEqual(versions, {"3.0.2"},
+        self.assertEqual(versions, {"3.0.3"},
                          "studio assets must share one cache version, got {}".format(versions))
-        self.assertIn('href="/streaming/studio?v=3.0.2"', self.html)
+        self.assertIn('href="/streaming/studio?v=3.0.3"', self.html)
         self.assertIn("addModule(`${WORKLET_URL}?v=3`)", self.client_js)
 
     def test_studio_does_not_change_the_obs_pipeline(self):
@@ -2993,16 +3011,122 @@ class StudioIngestRouteChecks(_SiteUnderTest):
         self.assertIn("ffmpeg was not found", payload["error"])
         self.assertRegex(payload["id"], r"^[a-f0-9]{16}$")
 
-    def test_studio_routes_reject_a_proxied_request(self):
+    def test_capabilities_reports_broadcast_access_and_host(self):
         status, headers, body = http_request(
-            self.port, "POST", "/stream-api/studio/session",
-            body=b"{}", headers={
-                "Content-Type": "application/json",
-                "X-Forwarded-For": "203.0.113.5",
-            })
-        self.assertEqual(status, 403)
+            self.port, "GET", "/stream-api/studio/capabilities")
+        self.assertEqual(status, 200)
         self.assertIn("json", headers.get("Content-Type", ""))
-        self.assertIn("host machine", body.decode("utf-8"))
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIs(payload["broadcast"], True)
+        self.assertIs(payload["host"], True,
+                      "a loopback request with a loopback Host is the host itself")
+
+        # The same-origin remote page reaches this server through the tunnel:
+        # the proxy header marks it as remote, so host must be false while
+        # broadcast stays true.
+        status, _, body = http_request(
+            self.port, "GET", "/stream-api/studio/capabilities",
+            headers={
+                "Host": "stream.example",
+                "Origin": "https://stream.example",
+                "CF-Connecting-IP": "203.0.113.5",
+            })
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertIs(payload["broadcast"], True,
+                      "a remote browser must be told broadcasting is available")
+        self.assertIs(payload["host"], False,
+                      "the remote page is not the host")
+
+    def test_remote_same_origin_session_reaches_the_relay(self):
+        # A remote studio page sends its own Origin and arrives through the
+        # tunnel. The missing ffmpeg proves the request reached the relay: a
+        # 403 would mean the same-origin gate refused it.
+        status, _, body = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body=json.dumps({
+                "width": 1920, "height": 1080, "fps": 24,
+                "bitrate": 4000000, "audio": False,
+            }).encode("utf-8"),
+            headers={
+                "Host": "stream.example",
+                "Origin": "https://stream.example",
+                "CF-Connecting-IP": "203.0.113.5",
+                "Content-Type": "application/json",
+            })
+        self.assertEqual(status, 500)
+        self.assertIn("ffmpeg was not found", body.decode("utf-8"))
+
+    def test_cross_site_and_rebinding_studio_requests_are_refused(self):
+        variants = (
+            ("cross-site-origin", {"Origin": "https://evil.example"}),
+            ("dns-rebinding-host", {"Host": "attacker.example"}),
+            ("cross-site-fetch", {"Sec-Fetch-Site": "cross-site"}),
+            # The forwarded header must not excuse a mismatched Origin.
+            ("tunnel-cross-site", {
+                "Host": "stream.example",
+                "Origin": "https://evil.example",
+                "CF-Connecting-IP": "203.0.113.5",
+            }),
+        )
+        for name, headers in variants:
+            with self.subTest(name=name):
+                request_headers = {"Content-Type": "application/json"}
+                request_headers.update(headers)
+                status, _, body = http_request(
+                    self.port, "POST", "/stream-api/studio/session",
+                    body=b"{}", headers=request_headers)
+                self.assertEqual(status, 403, f"{name} must not start a relay")
+                self.assertIn("Cross-site", body.decode("utf-8"))
+
+    def test_host_info_and_whip_stay_host_only_while_the_studio_opens(self):
+        tunnel = {
+            "Host": "stream.example",
+            "Origin": "https://stream.example",
+            "CF-Connecting-IP": "203.0.113.5",
+        }
+        status, _, body = http_request(
+            self.port, "GET", "/stream-api/studio/capabilities", headers=tunnel)
+        self.assertEqual(status, 200)
+        self.assertIs(json.loads(body.decode("utf-8"))["host"], False)
+
+        status, _, body = http_request(
+            self.port, "GET", "/stream-api/host-info", headers=tunnel)
+        self.assertEqual(status, 403,
+                         "the checkout path and pid must stay on the host")
+        self.assertIn("local-only", body.decode("utf-8"))
+
+        status, _, body = http_request(
+            self.port, "POST", "/stream-api/live/whip",
+            body=b"v=0\r\n",
+            headers={**tunnel, "Content-Type": "application/sdp"})
+        self.assertEqual(status, 403,
+                         "opening the studio must not open WHIP publishing")
+        self.assertIn("host-only", body.decode("utf-8"))
+
+    def test_studio_session_starts_are_rate_limited(self):
+        body = json.dumps({
+            "width": 1920, "height": 1080, "fps": 24,
+            "bitrate": 4000000, "audio": False,
+        }).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        statuses = []
+        for _ in range(4):
+            status, _, _ = http_request(
+                self.port, "POST", "/stream-api/studio/session",
+                body=body, headers=headers)
+            statuses.append(status)
+        self.assertEqual(statuses[:3], [500, 500, 500],
+                         "the first three starts must reach the relay")
+        self.assertEqual(statuses[3], 429,
+                         "the fourth start inside ten seconds must be refused")
+
+        status, response_headers, payload = http_request(
+            self.port, "POST", "/stream-api/studio/session",
+            body=body, headers=headers)
+        self.assertEqual(status, 429)
+        self.assertEqual(response_headers.get("Retry-After"), "10")
+        self.assertIn("Too many broadcast starts", payload.decode("utf-8"))
 
     def test_host_info_is_local_only(self):
         status, _, body = http_request(self.port, "GET", "/stream-api/host-info")
@@ -3961,6 +4085,29 @@ class ReceiverLagFixChecks(unittest.TestCase):
         full-quality audio-rescue copy) or a non-H264 source.
         """
         run_js_check(self, "h264-rescue-path-preference")
+
+    def test_h264_rescue_verdict_expires(self):
+        """The persisted 720p verdict must be versioned and time-limited.
+
+        The first format was the bare string '1'. One bad join - most often a
+        viewer that arrived during the encoder's ramp - pinned that browser to
+        720p forever. Version 2 stores when the verdict was reached, expires
+        after 24 hours, and discards the old format so every existing viewer
+        gets one clean retest.
+        """
+        run_js_check(self, "h264-rescue-verdict-expires")
+
+    def test_decode_deficit_rescue_waits_out_the_startup_ramp(self):
+        """A new connection needs a grace period before the 720p rescue.
+
+        The encoder takes a few seconds to settle. A viewer that joins during
+        that ramp presents frames below its arrival rate for exactly the
+        signature the deficit detector watches, and the old cooldown anchor
+        started at -60s, so the rescue could fire before the encoder was
+        healthy. The rescue now waits 15s from connect and keeps the 60s
+        rendition-switch cooldown.
+        """
+        run_js_check(self, "decode-deficit-rescue-waits-out-the-startup-ramp")
 
     def test_hidden_tab_return_recovers_playout_delay(self):
         run_js_check(self, "catch-up-arms-on-visibility-return")
